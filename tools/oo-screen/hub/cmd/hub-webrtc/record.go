@@ -364,14 +364,18 @@ func (r *recorder) open() bool {
 		r.mkv = newMKVWriter(discardWriter{})
 		return false
 	}
-	if err := os.MkdirAll(r.dir, 0o755); err != nil {
+	// SEC: запис — це кадри чужого екрана (паролі, листування). Каталог і
+	// файл — лише для власника процесу хаба, а не 0755/0644 для всіх на VPS.
+	if err := os.MkdirAll(r.dir, recordDirPerm); err != nil {
 		log.Printf("record: каталог %s не створився: %v", r.dir, err)
 		r.started = true
 		r.mkv = newMKVWriter(discardWriter{})
 		return false
 	}
 	name := fmt.Sprintf("%s-%s.mkv", safeNodeID(r.nodeID), time.Now().UTC().Format("20060102-150405"))
-	f, err := os.Create(filepath.Join(r.dir, name))
+	// O_EXCL: дві сесії однієї ноди в ту саму секунду не обнуляють запис
+	// одна одній (os.Create робив O_TRUNC), і підкладений симлінк не відкриваємо.
+	f, err := os.OpenFile(filepath.Join(r.dir, name), os.O_WRONLY|os.O_CREATE|os.O_EXCL, recordFilePerm)
 	if err != nil {
 		log.Printf("record: файл %s не створився: %v", name, err)
 		r.started = true
@@ -428,6 +432,12 @@ func avcC(sps, pps []byte) []byte {
 // safeNodeID — node_id приходить ВІД АГЕНТА, тобто ззовні, а ми робимо з нього
 // імʼя файлу. Лишаємо тільки [A-Za-z0-9._-]: інакше "../../etc/passwd" як node
 // став би шляхом, а не назвою.
+// recordDirPerm / recordFilePerm — права на записи сесій (SEC-аудит).
+const (
+	recordDirPerm  = 0o700
+	recordFilePerm = 0o600
+)
+
 func safeNodeID(id string) string {
 	out := make([]byte, 0, len(id))
 	for i := 0; i < len(id) && i < 64; i++ {
