@@ -65,6 +65,12 @@ DEFINE_GUID(OOS_AVEncVideoMaxQP,
 DEFINE_GUID(OOS_MFSampleExtension_VideoEncodeQP,
             0xb2efe478, 0xf979, 0x4c66, 0xb9,0x5e, 0xee,0x2b,0x82,0xc8,0x2f,0x36);
 
+/* IID_ICodecAPI: mingw declares it extern in strmif.h, but icodecapi.h (which
+ * would define it) redefines struct CodecAPIEventData and cannot be included
+ * alongside mfapi.h; no mingw import lib provides it either. */
+DEFINE_GUID(IID_ICodecAPI,
+            0x901db4c7, 0x31ce, 0x41a2, 0x85,0xdc, 0x8f,0xa0,0xbf,0x41,0xb8,0xda);
+
 /* CLSID of the built-in "Microsoft H264 Video Encoder MFT" (wmcodecdsp.h). We
  * define it locally rather than pulling the whole wmcodecdsp.h COBJMACROS surface
  * in. INITGUID is set above, so this also allocates the storage. */
