@@ -918,6 +918,7 @@ type stream struct {
 	// проти живого капчера, бо після select_output монітор уже інший.
 	reqW, reqH    int
 	fps           int
+	gopSeconds    int // ТЗ 1.4: інтервал IDR у секундах (GOP = gopSeconds*fps)
 	forceSoftware bool
 	logger        *slog.Logger
 
@@ -985,7 +986,7 @@ func (s *stream) openEncoder(device uintptr, gen uint64, srcW, srcH int) (*encod
 	reqW, reqH := requestedSize(s.reqW, s.reqH, srcW, srcH)
 	auto := s.reqW <= 0 || s.reqH <= 0
 	cfg := encode.Config{
-		Width: reqW, Height: reqH, FPS: s.fps, BitrateBps: bps,
+		Width: reqW, Height: reqH, FPS: s.fps, BitrateBps: bps, GOP: gopFrames(s.gopSeconds, s.fps),
 		D3DDevice: d3d, SrcWidth: srcW, SrcHeight: srcH, ForceSoftware: s.forceSoftware,
 	}
 	enc, err := encode.New(cfg)
@@ -1040,7 +1041,7 @@ func (s *stream) openEncoder(device uintptr, gen uint64, srcW, srcH int) (*encod
 			w, h, reqW, reqH)
 		enc.Close()
 		enc, err = encode.New(encode.Config{
-			Width: w, Height: h, FPS: s.fps, BitrateBps: bps,
+			Width: w, Height: h, FPS: s.fps, BitrateBps: bps, GOP: gopFrames(s.gopSeconds, s.fps),
 			D3DDevice: 0, SrcWidth: srcW, SrcHeight: srcH, ForceSoftware: true,
 		})
 		if err != nil {
@@ -1079,6 +1080,15 @@ func (s *stream) openEncoder(device uintptr, gen uint64, srcW, srcH int) (*encod
 	s.encDev = device
 	s.encGen = gen
 	return enc, w, h, software, nil
+}
+
+// gopFrames — GOP у кадрах для encode.Config; <=0 секунд -> 0 (дефолт
+// енкодера, 2*FPS).
+func gopFrames(seconds, fps int) int {
+	if seconds <= 0 {
+		return 0
+	}
+	return seconds * fps
 }
 
 // nativeSize — рідна геометрія виводу: з капчера, а без нього (стартували на
@@ -1264,6 +1274,7 @@ func main() {
 	logPath := flag.String("log", "", "шлях до файлу логу; якщо задано — увесь вивід іде туди (GUI-режим -H windowsgui без консолі, stdout нема)")
 	audioFlag := flag.Bool("audio", false, "передавати звук ПК (перекриває env OO_SCREEN_AUDIO=1)")
 	inputFlag := flag.Bool("input", false, "приймати клавіатуру й мишу від глядача (перекриває env OO_SCREEN_INPUT=1)")
+	gopSeconds := flag.Int("gop-seconds", 2, "інтервал періодичного IDR, с (ТЗ 1.4). >3 вимикає GOP-кеш хаба (gopMaxSpan=3s, gopMaxPackets=512): новий глядач чекатиме IDR через PLI/requestKeyframe")
 	flag.Parse()
 
 	// Прапорці перекривають env з тієї ж причини, що й -token вище: агента
@@ -1406,7 +1417,7 @@ func main() {
 	startBitrateBps = bitrateBps
 
 	s := &stream{
-		reqW: *width, reqH: *height, fps: effectiveFPS,
+		reqW: *width, reqH: *height, fps: effectiveFPS, gopSeconds: *gopSeconds,
 		forceSoftware: *forceSoftware, logger: logger,
 		cap: cap_, output: outIdx,
 	}
