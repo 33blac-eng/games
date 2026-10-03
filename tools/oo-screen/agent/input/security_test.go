@@ -3,8 +3,10 @@ package input
 // security_test.go — безпековий аудит інʼєкції вводу (SECURITY-AUDIT.md, SecIxx).
 
 import (
+	"errors"
 	"math"
 	"testing"
+	"unsafe"
 )
 
 // SecI01: ворожі події з дроту відкидаються ДО SendInput.
@@ -51,13 +53,75 @@ func TestSecI03CoordinatesClamped(t *testing.T) {
 	}
 }
 
-// SecI04 (KnownFAIL, документовано): протокол дозволяє будь-які scancode —
-// зокрема Win (0xE05B) — тобто Win+R і подібні комбінації інʼєктуються без
-// фільтра. Це відповідає призначенню («повний контроль»), але на рівні агента
-// немає ні allow-list, ні автоматичного відпускання затиснутих клавіш при
-// розриві сесії.
-func TestSecI04AnyKeyComboAcceptedKnownFAIL(t *testing.T) {
+// SecI04 (SEC #37): комбінації клавіш лишаються pass-through (призначення —
+// «повний контроль»), але (а) OO_AGENT_INPUT_BLOCK_KEYS блокує обрані scancode,
+// (б) усе затиснуте відпускається ReleaseAll при закритті сесії/каналу.
+func TestSecI04HeldKeysReleasedAndBlocklist(t *testing.T) {
 	if _, err := ParseEvent([]byte(`{"v":1,"type":"key","scancode":57435,"down":true}`)); err != nil {
-		t.Fatalf("Win-клавішу відкинуто (%v) — зʼявився фільтр: переверніть тест", err)
+		t.Fatalf("Win-клавішу відкинуто протоколом (%v) — pass-through за дизайном", err)
+	}
+	var h heldState
+	down := func(ev Event) Event { ev.V, ev.Down = Version, true; return ev }
+	h.track(down(Event{Kind: KindKey, Scancode: 0x1D}))   // Ctrl
+	h.track(down(Event{Kind: KindKey, Scancode: 0xE05B})) // Win
+	h.track(down(Event{Kind: KindKey, Unicode: 'a'}))     // символ
+	h.track(down(Event{Kind: KindMouseButton, Button: ButtonLeft}))
+	h.track(down(Event{Kind: KindMouseButton, Button: ButtonX2}))
+	h.track(Event{V: Version, Kind: KindMouseButton, Button: ButtonX2}) // відпущено
+	ups := h.releaseInputs()
+	if len(ups) != 4 {
+		t.Fatalf("releaseInputs=%d подій, want 4", len(ups))
+	}
+	var keyUps, leftUp int
+	for _, in := range ups {
+		switch in.typ {
+		case inputKeyboard:
+			ki := (*rawKeybdInput)(unsafe.Pointer(&in.mi))
+			if ki.flags&keyUp == 0 {
+				t.Fatalf("клавіша без keyUp: %+v", ki)
+			}
+			if ki.scan == 0x5B && ki.flags&keyExtended == 0 {
+				t.Fatal("Win відпущено без extended")
+			}
+			keyUps++
+		case inputMouse:
+			if in.mi.flags != mouseLeftUp {
+				t.Fatalf("кнопка: flags=%#x", in.mi.flags)
+			}
+			leftUp++
+		}
+	}
+	if keyUps != 3 || leftUp != 1 || len(h.releaseInputs()) != 0 {
+		t.Fatalf("keyUps=%d leftUp=%d, повторний release не порожній", keyUps, leftUp)
+	}
+
+	// ReleaseAll через Injector: шле рівно відпускання і очищає стан.
+	var sent []rawInput
+	prev := sendRaw
+	sendRaw = func(in []rawInput) error { sent = append(sent, in...); return nil }
+	t.Cleanup(func() { sendRaw = prev })
+	inj := &Injector{}
+	inj.held.track(down(Event{Kind: KindKey, Scancode: 0x38}))
+	if err := inj.ReleaseAll(); err != nil || len(sent) != 1 {
+		t.Fatalf("ReleaseAll err=%v sent=%d", err, len(sent))
+	}
+	if k, b := inj.Held(); k != 0 || b != 0 || inj.ReleaseAll() != nil || len(sent) != 1 {
+		t.Fatal("після ReleaseAll щось лишилось затиснутим")
+	}
+
+	// Блок-лист.
+	bl, err := ParseBlockedKeys("0xE05B, 0xE05C")
+	if err != nil {
+		t.Fatal(err)
+	}
+	inj.SetBlockedKeys(bl)
+	if err := inj.Inject(down(Event{Kind: KindKey, Scancode: 0xE05B})); !errors.Is(err, ErrKeyBlocked) {
+		t.Fatalf("Win не заблоковано: %v", err)
+	}
+	if inj.isBlocked(down(Event{Kind: KindKey, Scancode: 0x5B})) {
+		t.Fatal("не-extended 0x5B ([) заблоковано помилково")
+	}
+	if _, err := ParseBlockedKeys("0xE05B,zz"); err == nil {
+		t.Fatal("сміття в блок-листі прийнято")
 	}
 }

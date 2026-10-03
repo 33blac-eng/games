@@ -468,6 +468,8 @@ func wheelData(notches float64) uint32 {
 type Injector struct {
 	mu      sync.Mutex
 	surface Bounds
+	held    heldState           // SEC #37: pressed and not yet released (held.go)
+	blocked map[keyID]struct{} // OO_AGENT_INPUT_BLOCK_KEYS
 }
 
 // New reports whether input injection is possible before the first event
@@ -477,7 +479,11 @@ func New() (*Injector, error) {
 	if err := checkAvailable(); err != nil {
 		return nil, err
 	}
-	return &Injector{}, nil
+	blocked, err := blockedKeysFromEnv()
+	if err != nil {
+		return nil, err
+	}
+	return &Injector{blocked: blocked}, nil
 }
 
 // SetSurface declares which rectangle of the virtual desktop the operator's
@@ -518,5 +524,14 @@ func (in *Injector) Inject(ev Event) error {
 	if err := ev.Validate(); err != nil {
 		return err
 	}
-	return in.inject(ev)
+	if in.isBlocked(ev) {
+		return ErrKeyBlocked
+	}
+	if err := in.inject(ev); err != nil {
+		return err
+	}
+	in.mu.Lock()
+	in.held.track(ev)
+	in.mu.Unlock()
+	return nil
 }

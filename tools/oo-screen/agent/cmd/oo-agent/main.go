@@ -428,6 +428,10 @@ func dialWebRTC(hubURL string, frameInterval time.Duration, onKeyframeRequest fu
 	// bitrate_target, keyframe_request) і, для зворотної сумісності, старі
 	// текстові "resume"/"pause" за присутністю глядача. Створюємо ДО offer-а,
 	// щоб канал потрапив у SDP; hub (answerer) ловить його через OnDataChannel.
+	// SEC #37: інʼєктор створюється ДО control-каналу, щоб пауза (жодного
+	// видимого глядача) відпускала затиснуті ним клавіші й кнопки миші.
+	inj := newInputInjector()
+	onGate = releaseOnPause(inj, onGate)
 	if onGate != nil || onBitrateTarget != nil || onSelectOutput != nil {
 		ctl, dcErr := pc.CreateDataChannel("oosc-ctl", nil)
 		if dcErr != nil {
@@ -451,7 +455,7 @@ func dialWebRTC(hubURL string, frameInterval time.Duration, onKeyframeRequest fu
 	// означало б дописати вісім полів у control.Msg заради чужого протоколу.
 	// nil-інʼєктор (вимкнений прапорець, не-Windows, недосяжний SendInput) =
 	// каналу немає взагалі, і в SDP нічого не змінюється.
-	if inj := newInputInjector(); inj != nil {
+	if inj != nil {
 		in, dcErr := pc.CreateDataChannel(inputChannelLabel, nil)
 		if dcErr != nil {
 			_ = pc.Close()
@@ -462,6 +466,8 @@ func dialWebRTC(hubURL string, frameInterval time.Duration, onKeyframeRequest fu
 				logInputProblem(time.Now(), err)
 			}
 		})
+		// SEC #37: канал закрився (сесія впала/хаб пішов) — відпустити все.
+		in.OnClose(func() { releaseHeldInput(inj, "input channel closed") })
 		// Поверхня вводу лишається ВСІМ віртуальним робочим столом (дефолт
 		// input.Injector), і це точно лише поки монітор один: DXGI-виходи не
 		// віддають свій Left/Top через capture.OutputInfo, тож звузити її нема з

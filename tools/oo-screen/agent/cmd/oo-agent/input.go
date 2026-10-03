@@ -99,3 +99,35 @@ func applyFeatureFlags(audio, input bool) {
 		inputEnabled = true
 	}
 }
+
+// releaseHeldInput — SEC #37: відпустити все, що інʼєктор затиснув і не
+// відпустив (обрив сесії посеред Ctrl+перетягування). nil — нічого не робить.
+func releaseHeldInput(inj *input.Injector, why string) {
+	if inj == nil {
+		return
+	}
+	k, b := inj.Held()
+	if k == 0 && b == 0 {
+		return
+	}
+	if err := inj.ReleaseAll(); err != nil {
+		log.Printf("oo-agent: відпускання затиснутих (%s): %v", why, err)
+		return
+	}
+	log.Printf("oo-agent: відпущено %d клавіш і %d кнопок миші (%s)", k, b, why)
+}
+
+// releaseOnPause загортає onGate: пауза (жодного видимого глядача) відпускає
+// затиснуте. Канал вводу живе між агентом і хабом і переживає відхід
+// глядача, тож одного OnClose каналу мало.
+func releaseOnPause(inj *input.Injector, onGate func(bool)) func(bool) {
+	if inj == nil || onGate == nil {
+		return onGate
+	}
+	return func(resume bool) {
+		if !resume {
+			releaseHeldInput(inj, "no viewers")
+		}
+		onGate(resume)
+	}
+}
