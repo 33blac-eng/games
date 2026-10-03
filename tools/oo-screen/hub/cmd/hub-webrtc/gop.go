@@ -22,23 +22,81 @@ import (
 )
 
 const (
-	// gopMaxPackets — стеля кешу в пакетах. 512 = глибина черги глядача: більше
-	// однаково не влізе в ногу, якій ми це віддаємо.
-	gopMaxPackets = 512
-	// gopMaxSpan — стеля кешу в часі RTP. GOP агента — 2 с; довший «GOP» означає,
-	// що IDR ми пропустили, і хвіст уже не самодостатній.
-	gopMaxSpan = 3 * time.Second
+	// gopMaxPackets — запобіжна стеля кешу в ПАКЕТАХ. Основна межа тепер у
+	// байтах (gopByteBudget), а ця лише гарантує, що навіть потік із крихітних
+	// пакетів не роздує зріз вказівників. 8192 ≈ 10 с на 8 Мбіт/с (~830 пак/с).
+	gopMaxPackets = 8192
+	// gopMaxBytes — жорстка стеля кешу в БАЙТАХ на одну ноду, незалежно від
+	// бітрейту й прапорця: що б не прислав агент, більше за це хаб не тримає.
+	gopMaxBytes = 12 << 20
+	// gopMinBytes — нижня межа бюджету: на дуже низькому бітрейті один IDR
+	// усе одно важить сотні кілобайт, і бюджет «бітрейт × проміжок» його б
+	// відрізав.
+	gopMinBytes = 1 << 20
+	// gopBudgetHeadroom — множник над «бітрейт × проміжок»: IDR у кілька разів
+	// важчий за P-кадр, а кодер на сплесках виходить за ціль.
+	gopBudgetHeadroom = 2
+	// gopPacketOverhead — скільки байтів рахуємо на пакет понад payload
+	// (заголовок RTP + сама структура). Без цього потік із порожніх payload-ів
+	// не впирався б у байтову стелю зовсім.
+	gopPacketOverhead = 64
+	// gopDefaultSpan — типова стеля кешу в часі RTP. GOP агента — 2 с; довший
+	// «GOP» означає, що IDR ми пропустили, і хвіст уже не самодостатній.
+	gopDefaultSpan = 3 * time.Second
+	// gopSpanLimit — найбільший проміжок, який дозволяє OO_SCREEN_GOP_SPAN.
+	// Кеш на хвилину — це вже не «миттєвий старт», а відео хвилинної давнини;
+	// пам'ять при цьому однаково тримає gopMaxBytes.
+	gopSpanLimit = 30 * time.Second
 	// gopClockRate — та сама, що й у треку глядача (H.264, 90 кГц).
 	gopClockRate = 90000
 )
 
+// gopMaxSpan — стеля кешу в часі RTP. Налаштовується OO_SCREEN_GOP_SPAN
+// (формат time.ParseDuration), коли агент кодує з довшим GOP: ставити її треба
+// трохи БІЛЬШОЮ за GOP агента (GOP 2 с -> 3 с, GOP 8 с -> 10 с). Без змінної —
+// сьогоднішні 3 с. Змінна, а не os.Getenv на місці: тести перемикають напряму.
+var gopMaxSpan = clampGopSpan(envDuration("OO_SCREEN_GOP_SPAN", gopDefaultSpan))
+
+// clampGopSpan обрізає проміжок до [gopDefaultSpan, gopSpanLimit]: коротша за
+// типову стеля лише ламала б кеш на штатному GOP 2 с, довша за ліміт — див.
+// gopSpanLimit.
+func clampGopSpan(d time.Duration) time.Duration {
+	if d < gopDefaultSpan {
+		return gopDefaultSpan
+	}
+	if d > gopSpanLimit {
+		return gopSpanLimit
+	}
+	return d
+}
+
+// gopByteBudget — байтова стеля кешу для бітрейту bps (біт/с): бітрейт ×
+// gopMaxSpan × gopBudgetHeadroom, затиснута в [gopMinBytes, gopMaxBytes].
+// bps == 0 (бітрейт ще невідомий) — жорстка стеля: пам'ять однаково обмежена.
+func gopByteBudget(bps uint64) int {
+	if bps == 0 {
+		return gopMaxBytes
+	}
+	// float: будь-яке безглузде bps (аж до MaxUint64) просто впреться в стелю.
+	b := float64(bps) / 8 * gopMaxSpan.Seconds() * gopBudgetHeadroom
+	if b >= gopMaxBytes {
+		return gopMaxBytes
+	}
+	if b < gopMinBytes {
+		return gopMinBytes
+	}
+	return int(b)
+}
+
 // gopCache — хвіст потоку ноди від останнього ключового набору. Весь стан під
 // ns.mu (пишеться з forwardToViewers, читається з recomputeBinding).
 //
-// ponytail: стеля — кеш рахує ПАКЕТИ, а не байти, як і черга глядача. На 8
-// Мбіт/с це ~0.6 с відео, тобто менше за GOP: на такому бітрейті кеш часто
-// впирається в стелю, priming вимикається сам і лишається стара поведінка
-// (requestKeyframe). Апгрейд робиться на місці: рахувати байти й тримати ~1.5 МБ.
+// Межі (будь-яка з них -> overflow, тобто порожній кеш до наступного IDR):
+//   - байти: gopByteBudget(bps) — бітрейт ноди × проміжок, не більше gopMaxBytes;
+//   - пакети: gopMaxPackets — запобіжник;
+//   - час RTP: gopMaxSpan.
+// Пам'ять обмежена за будь-якого входу: найгірше — gopMaxBytes байтів payload-у
+// плюс зріз на gopMaxPackets вказівників.
 type gopCache struct {
 	pkts []*rtp.Packet
 	// overflow — кеш переповнився (за пакетами або за часом), тобто хвіст уже
@@ -52,7 +110,17 @@ type gopCache struct {
 	inKey bool
 	// startTS — RTP-timestamp першого пакета в кеші (межа gopMaxSpan).
 	startTS uint32
+	// bytes — скільки байтів (payload + gopPacketOverhead) зараз у кеші.
+	bytes int
+	// bps — бітрейт ноди для байтового бюджету; 0 = невідомий (жорстка стеля).
+	// Виставляє forwardToViewers через setBitrate, під ns.mu.
+	bps uint64
 }
+
+// setBitrate оновлює бітрейт, з якого рахується байтовий бюджет. Уже
+// накопичений хвіст не чіпає: якщо він тепер більший за бюджет, наступний
+// note() переведе кеш в overflow — так само чесно, як будь-яке переповнення.
+func (g *gopCache) setBitrate(bps uint64) { g.bps = bps }
 
 // note кладе черговий egress-пакет ноди у кеш. Кликати під ns.mu, ОДРАЗУ після
 // перепису seq/ts і з тим самим вказівником, що йде в черги глядачів: пакет
@@ -60,7 +128,7 @@ type gopCache struct {
 func (g *gopCache) note(pkt *rtp.Packet) {
 	key := h264KeyPart(pkt.Payload)
 	if key && !g.inKey {
-		g.pkts = g.pkts[:0]
+		g.drop()
 		g.overflow = false
 		g.startTS = pkt.Timestamp
 	}
@@ -71,12 +139,29 @@ func (g *gopCache) note(pkt *rtp.Packet) {
 	if len(g.pkts) == 0 && !key {
 		return // ще не бачили жодного ключового набору — накопичувати нема від чого
 	}
-	if len(g.pkts) >= gopMaxPackets || pkt.Timestamp-g.startTS > uint32(gopMaxSpan.Seconds()*gopClockRate) {
+	size := len(pkt.Payload) + gopPacketOverhead
+	if len(g.pkts) >= gopMaxPackets ||
+		g.bytes+size > gopByteBudget(g.bps) ||
+		pkt.Timestamp-g.startTS > uint32(gopMaxSpan.Seconds()*gopClockRate) {
 		g.overflow = true
-		g.pkts = g.pkts[:0]
+		g.drop()
 		return
 	}
 	g.pkts = append(g.pkts, pkt)
+	g.bytes += size
+}
+
+// drop спорожнює кеш і ВІДПУСКАЄ пам'ять. Просто g.pkts[:0] лишав би живими
+// вказівники на до gopMaxBytes payload-ів у хвості масиву аж до наступного
+// заповнення; великий масив після рідкісного довгого GOP не тримаємо зовсім.
+func (g *gopCache) drop() {
+	if cap(g.pkts) > 1024 {
+		g.pkts = nil
+	} else {
+		clear(g.pkts[:cap(g.pkts)])
+		g.pkts = g.pkts[:0]
+	}
+	g.bytes = 0
 }
 
 // reset викидає кеш цілком. H-07: на заміні агента вміст лишається від
@@ -84,7 +169,7 @@ func (g *gopCache) note(pkt *rtp.Packet) {
 // Порожній кеш чесніший за такий: нова нога просто чекає IDR нового агента.
 // Кликати під ns.mu, як і note/replay.
 func (g *gopCache) reset() {
-	g.pkts = g.pkts[:0]
+	g.drop()
 	g.overflow = false
 	g.inKey = false
 	g.startTS = 0

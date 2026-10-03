@@ -79,6 +79,10 @@ type viewerLeg struct {
 	// primed — нозі вже віддано кеш GOP (пункт 41), тобто картинка в неї піде
 	// без позачергового IDR. Ставить рівно recomputeBinding, під ns.mu.
 	primed bool
+	// primeSlack — скільки пакетів кешу GOP поклали в чергу при priming; на
+	// стільки поріг відставання ноги вищий за viewerQueueDepth, доки pump не
+	// розбере чергу нижче за viewerQueueDepth. Під ns.mu.
+	primeSlack int
 
 	// H-12: стан drop-to-IDR. discarding — нозі зараз НІЧОГО не кладуть у чергу,
 	// доки не прийде ключовий пакет; саме пауза в записі й дає pump-у розібрати
@@ -141,7 +145,7 @@ func addViewer(ns *nodeSession, pc *webrtc.PeerConnection, trk *webrtc.TrackLoca
 		pc:     pc,
 		trk:    trk,
 		userID: userID,
-		out:    make(chan *rtp.Packet, viewerQueueDepth),
+		out:    make(chan *rtp.Packet, viewerQueueDepth+gopMaxPackets), // + місце під кеш GOP
 		done:   make(chan struct{}),
 	}
 	// Черга звуку існує ЛИШЕ під прапорцем: без нього нога має бути бітово
@@ -274,6 +278,7 @@ func viewerPrimed(ns *nodeSession, vl *viewerLeg) bool {
 func markViewerNotReady(ns *nodeSession, vl *viewerLeg) {
 	ns.mu.Lock()
 	vl.ready, vl.live, vl.primed = false, false, false
+	vl.primeSlack = 0
 	ns.mu.Unlock()
 }
 

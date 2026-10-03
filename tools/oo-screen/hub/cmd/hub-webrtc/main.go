@@ -1569,6 +1569,10 @@ func forwardToViewers(ns *nodeSession, gen uint64, pkt *rtp.Packet) {
 
 	// Пункт 41: той самий вказівник осідає в кеші GOP — нова нога отримає його
 	// звідти, а не чекатиме наступного IDR.
+	// Бюджет у байтах — від СТЕЛІ ноди, а не поточної цілі: кодер сходить до
+	// нової цілі лише за GOP, і хвіст, набраний на старому бітрейті, не має
+	// рватися через те, що ціль щойно впала.
+	ns.gop.setBitrate(ns.ceilingBps())
 	ns.gop.note(out)
 
 	// send неблокуючий: черга повна => ця нога відстає від джерела.
@@ -1592,9 +1596,23 @@ func forwardToViewers(ns *nodeSession, gen uint64, pkt *rtp.Packet) {
 			// Ключовий набір — точка, з якої декодер уміє почати заново.
 			vl.discarding = false
 		}
-		select {
-		case vl.out <- out:
-		default:
+		// Нога, якій щойно віддали кеш GOP, має в черзі ще й той хвіст: йому
+		// дозволено лежати ПОНАД viewerQueueDepth (ємність каналу це вміщає),
+		// а поріг відставання повертається до звичного, щойно pump його розібрав.
+		limit := viewerQueueDepth + vl.primeSlack
+		if vl.primeSlack > 0 && len(vl.out) < viewerQueueDepth {
+			vl.primeSlack = 0
+			limit = viewerQueueDepth
+		}
+		var sent bool
+		if len(vl.out) < limit {
+			select {
+			case vl.out <- out:
+				sent = true
+			default:
+			}
+		}
+		if !sent {
 			now := time.Now()
 			if vl.overflowAt.IsZero() || now.Sub(vl.overflowAt) > viewerOverflowWindow {
 				vl.overflowStreak = 1 // попереднє переповнення було давно — це новий епізод
@@ -1672,9 +1690,10 @@ func recomputeBinding(ns *nodeSession) {
 // поїде одразу, тобто позачерговий IDR у агента просити не треба.
 // Кликати ЛИШЕ під ns.mu.
 //
-// Черга свіжої ноги порожня, а кеш обмежений тією ж стелею gopMaxPackets =
-// viewerQueueDepth, тож у нормі влазить цілком; якщо ні — це вже не наш
-// випадок «глядач щойно зайшов», і ногу лікує звичайний requestKeyframe.
+// Черга свіжої ноги порожня, а її ємність — viewerQueueDepth + gopMaxPackets,
+// тож кеш у нормі влазить цілком; якщо ні — це вже не наш випадок «глядач
+// щойно зайшов», і ногу лікує звичайний requestKeyframe. Скільки з цього —
+// хвіст кешу, пам'ятає vl.primeSlack (поріг відставання у forwardToViewers).
 func primeViewerLocked(ns *nodeSession, vl *viewerLeg) bool {
 	pkts := ns.gop.replay()
 	if len(pkts) == 0 {
@@ -1688,6 +1707,7 @@ func primeViewerLocked(ns *nodeSession, vl *viewerLeg) bool {
 			return false
 		}
 	}
+	vl.primeSlack = len(pkts)
 	log.Printf("gop prime [node=%s]: віддано %d кешованих пакетів від останнього IDR", ns.nodeID, len(pkts))
 	return true
 }
