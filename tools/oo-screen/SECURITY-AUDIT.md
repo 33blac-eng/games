@@ -30,37 +30,38 @@
 | 14 | Лише POST на /offer/* | main.go:770 | PASS | SecH08 |
 | 15 | CORS: у ticket-режимі ACAO = лише origin ERP | main.go:695 | PASS | SecH09 (у T1-режимі `*`, режим не для проду) |
 | 16 | Агентський токен: constant-time, невірний → 401 без створення ноди | main.go:1029 | PASS | SecH10 |
-| 17 | Один спільний агентський токен на весь парк; node обирає сам агент → будь-хто з токеном реєструє/витісняє чужу ноду й отримує ввід її глядачів; невдалий offer лишає ноду в реєстрі (ріст памʼяті) | main.go:848 | **FAIL** (високий) | SecH11 KnownFAIL. Рекомендація: токен на ноду (видає ERP, HMAC(node_id)), створювати ноду лише після успішного SetRemoteDescription |
+| 17 | Один спільний агентський токен на весь парк; node обирає сам агент → будь-хто з токеном реєструє/витісняє чужу ноду й отримує ввід її глядачів; невдалий offer лишає ноду в реєстрі (ріст памʼяті) | main.go:848 | **FIXED** (ef60492) | Токен ноди hex(HMAC-SHA256(master, node_id)), constant-time (hub/agenttoken.go, hub/cmd/hub-webrtc/agentauth.go); випуск — hub/cmd/oo-node-token. Легасі спільний токен за замовчуванням ще приймається з WARNING раз на ноду; OO_SCREEN_AGENT_AUTH=strict його вимикає (OO_SCREEN_LEGACY_AGENT_TOKEN=1 — аварійний відкат). Невдалий agent-offer прибирає створену ним ноду. SecH11 перевернуто (TestSecH11AgentTokenBoundToNode). Залишок до strict: випустити токени всім нодам |
 | 18 | /nodes лише з X-OO-Hub-Key; порожній ключ = закрито | nodes.go:57 | PASS | SecH12 |
 | 19 | session_id ренегоціації/visibility — 128 біт crypto/rand, constant-time | main.go:1430 | PASS | SecH13 |
 | 20 | Стеля глядачів на ноду (DoS памʼяттю/горутинами) | main.go:817 | **FIXED** | SecH14; коміт `5b6bcb6` (OO_SCREEN_MAX_VIEWERS, дефолт 16, 429) |
-| 21 | Глобальні ліміти: кількість нод, rate-limit /offer/viewer по IP (кожен запит = виклик ERP) | main.go:763 | **FAIL** (середній) | Немає жодного глобального ліміту чи per-IP throttle; рекомендація: rate.Limiter на IP + стеля нод |
+| 21 | Глобальні ліміти: кількість нод, rate-limit /offer/viewer по IP (кожен запит = виклик ERP) | main.go:763 | **FIXED** (a649a3a) | OO_SCREEN_MAX_NODES (дефолт 500) — нова нода понад стелю 503; per-IP token bucket на /offer/viewer і /offer/agent (OO_SCREEN_OFFER_RATE=1/с, OO_SCREEN_OFFER_BURST=10, RATE=0 вимикає); X-Forwarded-For лише від OO_SCREEN_TRUSTED_PROXIES (hub/cmd/hub-webrtc/ratelimit.go). TestSecRateLimitPerIP, TestSecMaxNodes |
 | 22 | Кеші NACK/GOP, черги глядачів обмежені; стеля тривалості сесії 120 хв | nack.go, gop.go, fanout.go:139-170 | PASS | наявні nack_test.go, sessioncap_test.go |
 | 23 | Права файлів записів (кадри чужих екранів) | record.go:369-378 | **FIXED** | SecH15; коміт `66f9961` (0700/0600, O_EXCL замість O_TRUNC) |
 | 24 | Path traversal в імені запису з node_id агента | record.go:441 | PASS | SecH16 |
 | 25 | Ретенція записів (вік/обсяг) | recordprune.go:87 | PASS | наявний recordprune_test.go |
-| 26 | /control (перемикання монітора) приймає квиток grant=view | outputs.go:106 | **FAIL** (низький) | SecH18 KnownFAIL; view-глядач змінює картинку всіх глядачів ноди. Не виправлено: ERP-консоль може слати view-квитки на /control — потрібне погодження |
+| 26 | /control (перемикання монітора) приймає квиток grant=view | outputs.go:106 | **FIXED (opt-in)** (028c18a) | Дефолт не змінено (ERP-консоль шле view-квитки); OO_SCREEN_CONTROL_REQUIRES_INPUT=1 вимагає grant=control для /control, інакше 403. SecH18 перевернуто (TestSecH18ControlGrantOptIn) |
 | 27 | Відповіді з помилкою не містять нутрощів і квитка | main.go:984, 742 | PASS | SecH19 |
-| 28 | Тіло помилки ERP повністю йде в journald | hub/ticket.go:83, main.go:744 | **FAIL** (низький) | SecT05 KnownFAIL; рекомендація: обрізати до ~200 байт і не логувати тіло 2xx-«bad json» |
+| 28 | Тіло помилки ERP повністю йде в journald | hub/ticket.go:83, main.go:744 | **FIXED** (f42e7b4) | Тіло помилки ERP обрізане до 200 символів, квиток (jti) і JWT/довгі токеноподібні рядки вирізаються; тіло 2xx «bad json/no claims» не логується (лише довжина). SecT05 перевернуто (TestSecT05ERPErrorBodyRedacted) |
 | 29 | Таймаути HTTP-сервера, заборона дефолтного токена на старті | main.go:2047, 2090 | PASS | SecH20 |
 | 30 | pprof лише за явним env на окремому слухачі | main.go:2057 | PASS | рев'ю коду; адресу треба ставити 127.0.0.1 |
 | 31 | TLS сигналінгу: хаб слухає plain HTTP `:4470` на всіх інтерфейсах (TLS — у nginx) | main.go:52 | UNVERIFIED | Безпечно лише якщо :4470 закритий firewall-ом; рекомендація: дефолт 127.0.0.1:4470 |
-| 32 | Легасі WebTransport: InsecureSkipVerify в агенті | agent/cmd/oo-agent/main.go:196 | **FAIL** (легасі) | MITM на транспорті wt; прод — webrtc. Рекомендація: certhash-пінінг або видалити wt |
-| 33 | Агентський токен у командному рядку schtask (`-token`) — видно будь-якому локальному користувачу ПК | agent/cmd/oo-agent/main.go:1273 | **FAIL** (середній) | рев'ю; разом із #17 дає захоплення будь-якої ноди. Рекомендація: файл з ACL SYSTEM/Administrators |
+| 32 | Легасі WebTransport: InsecureSkipVerify в агенті | agent/cmd/oo-agent/main.go:196 | **FIXED** (e430e3c) | Легасі wt: перевірка сертифіката за замовчуванням; самопідписаний hub-wt — пінінг -wt-cert-sha256 (CERT_HASH= хаба, base64/hex); -wt-insecure лише явно (internal/agentcred/wttls.go, TestWTTLSConfig) |
+| 33 | Агентський токен у командному рядку schtask (`-token`) — видно будь-якому локальному користувачу ПК | agent/cmd/oo-agent/main.go:1273 | **FIXED** (df67966) | Агент читає токен з -token-file (ACL SYSTEM/Administrators) або env OO_AGENT_TOKEN; -token лишено для сумісності з WARNING (internal/agentcred, TestResolveTokenOrder; agent/cmd/oo-agent/README.md). Задачі планувальника на ПК треба перевести на -token-file |
 | 34 | Локальний HTTP-перемикач агента (-switch-addr) / CSRF з браузера | agent/cmd/oo-agent/main.go:1257 | PASS | Слухача більше немає (керування — через control DataChannel); `grep Listen` в агенті порожній |
 | 35 | Валідація подій вводу на агенті: версія, NaN/Inf, межі 0..1, невідомі типи | agent/input/input.go:153 | PASS | SecI01, SecI02 |
 | 36 | Координати затиснуті в межі поверхні захоплення | agent/input/input.go:225 | PASS | SecI03 |
-| 37 | Комбінації клавіш (Win+R тощо) без фільтра; немає автовідпускання затиснутих клавіш при обриві | agent/input/input.go:183 | **FAIL** (низький, by design) | SecI04 KnownFAIL; Ctrl+Alt+Del SendInput і так не інʼєктує. Рекомендація: на закритті каналу слати key-up усім натиснутим |
+| 37 | Комбінації клавіш (Win+R тощо) без фільтра; немає автовідпускання затиснутих клавіш при обриві | agent/input/input.go:183 | **FIXED** (6b160a4) | Комбінації лишаються pass-through (by design), але: Injector відстежує затиснуті клавіші/кнопки й ReleaseAll шле key-up/button-up при закритті каналу вводу та на паузі (жодного видимого глядача); опційний блок-лист OO_AGENT_INPUT_BLOCK_KEYS (напр. 0xE05B,0xE05C) (agent/input/held.go). SecI04 перевернуто (TestSecI04HeldKeysReleasedAndBlocklist) |
 | 38 | XSS у плеєрі (innerHTML/eval з віддаленими даними) | resources/js/remote/*.js | PASS | SecJ01 (лише textContent) |
 | 39 | localStorage/sessionStorage: лише режим відображення, без квитків; сміття нормалізується | desktop-oo-webrtc.js:341-352, desktop.js:51 | PASS | SecJ02, SecJ03 |
 | 40 | Offer плеєра несе одноразовий ticket, а не довгоживучий token | desktop-oo-webrtc.js:797 | PASS | SecJ04 |
 | 41 | Захардкоджені секрети/ключі в репо | весь tools/oo-screen | PASS | `git grep` по PRIVATE KEY/AKIA/ghp_/sk-/xox/…=; знайдено лише dev-дефолт `t1-dev-token` (main.go:91, hub відмовляється стартувати з ним; агент має той самий фолбек), *.pem/*.key/.env немає |
-| 42 | Залежності з відомими CVE | go.mod | PASS (з зауваженням) | `govulncheck ./hub/... ./internal/... ./bench/... ./agent/input/...`: 0 досяжних; 4 у модулі golang.org/x/crypto v0.54.0 (ssh, openpgp) — код їх не викликає; рекомендовано підняти до ≥ v0.56.0. Агент (windows/cgo) просканувати з цього Linux не вдалось — UNVERIFIED. govulncheck сканував stdlib go1.26.8; прод, зібраний go1.26.0, може мати stdlib-CVE — зібрати свіжим тулчейном |
+| 42 | Залежності з відомими CVE | go.mod | PASS | 6929df3: golang.org/x/crypto піднято до v0.57.0 (x/net v0.58.0, x/sys v0.48.0, x/text v0.42.0). Повторний `govulncheck ./hub/... ./internal/... ./bench/... ./agent/input/...`: 0 досяжних; у модулях лишився 1 — GO-2026-5932 (x/crypto/openpgp «unmaintained», виправлення немає, код його не імпортує). Агент (windows/cgo) — UNVERIFIED. Прод збирати свіжим тулчейном (stdlib-CVE go1.26.0) |
 
 ## Підсумок
 
-- FIXED: #20 (стеля глядачів на ноду), #23 (права/O_EXCL записів).
-- FAIL (не виправлено, потребує дизайн-рішень): #17 спільний агентський токен + вибір node агентом (найвищий ризик),
-  #21 відсутні глобальні/IP-ліміти, #33 токен у командному рядку, #32 InsecureSkipVerify (легасі wt),
-  #26 /control з view-квитком, #28 тіло ERP у журналі, #37 комбінації клавіш/застряглі клавіші.
+- FIXED: #20 (стеля глядачів на ноду), #23 (права/O_EXCL записів), #17 (токен на ноду; strict — env),
+  #21 (стеля нод + per-IP rate-limit), #26 (opt-in env), #28 (редагування тіла ERP), #32 (wt: перевірка/пінінг),
+  #33 (-token-file / OO_AGENT_TOKEN), #37 (автовідпускання + блок-лист), #42 (x/crypto v0.57.0).
+- Потребує дій на розгортанні: випустити токени нод і перевести агентів на -token-file, після чого
+  OO_SCREEN_AGENT_AUTH=strict; за потреби OO_SCREEN_CONTROL_REQUIRES_INPUT=1, OO_SCREEN_TRUSTED_PROXIES.
 - UNVERIFIED: властивості квитка на боці ERP (#6, #7), TLS/експозиція :4470 (#31), CVE агента під Windows.
