@@ -367,6 +367,20 @@ export function containBox(boxW, boxH, srcW, srcH) {
 // CSS-розмір для режиму 1:1. integer=true — dpr цілий (1, 2, 3), тобто кожен
 // піксель відео лягає рівно на N×N фізичних: тоді й тільки тоді вмикаємо
 // image-rendering:pixelated (на дробовому dpr воно дає «драбину»).
+// absorbForeignStyles — 1:1 тримає знімок стилів Mesh, щоб повернути їх при
+// виході. Якщо поки діє 1:1 Mesh сам змінив якийсь стиль (значення вже не те,
+// що записали ми), це нова «оригінальна» величина — переносимо її в знімок,
+// інакше restore відкотив би Mesh до стану на момент входу в 1:1.
+// saved — знімок; written — що ми записали востаннє (null = ще нічого);
+// current — що є зараз. Мутує й повертає saved.
+export function absorbForeignStyles(saved, written, current) {
+    if (!saved || !written) return saved;
+    for (const k of Object.keys(saved)) {
+        if (k in written && current[k] !== written[k]) saved[k] = current[k];
+    }
+    return saved;
+}
+
 export function oneToOneSize(videoW, videoH, dpr) {
     const d = dpr > 0 ? dpr : 1;
     return {
@@ -422,6 +436,7 @@ export function createOoWebrtcLayer(o) {
     let dprHandler = null;
     let toggleBtn = null;
     let meshSaved = null;         // оригінальні стилі Mesh-canvas/контейнера на час 1:1
+    let meshWritten = null;       // що ми самі записали в ці стилі востаннє
 
     const session = createOoSession({
         firstFrameMs: config.firstFrameMs,
@@ -476,18 +491,24 @@ export function createOoWebrtcLayer(o) {
         const vh = video && video.videoHeight | 0;
         if (!(vw > 0 && vh > 0)) return false;
         const sz = oneToOneSize(vw, vh, currentDpr());
+        const readMesh = () => ({
+            width: meshCanvas.style.width, height: meshCanvas.style.height,
+            maxWidth: meshCanvas.style.maxWidth, maxHeight: meshCanvas.style.maxHeight,
+            overflow: container.style.overflow,
+        });
         if (!meshSaved) {
-            meshSaved = {
-                width: meshCanvas.style.width, height: meshCanvas.style.height,
-                maxWidth: meshCanvas.style.maxWidth, maxHeight: meshCanvas.style.maxHeight,
-                overflow: container.style.overflow,
-            };
+            meshSaved = readMesh();
+            meshWritten = null;
+        } else {
+            // Зміни, яких ми не писали, — від Mesh: вони й мають повернутись.
+            absorbForeignStyles(meshSaved, meshWritten, readMesh());
         }
         setStyle(meshCanvas, 'maxWidth', 'none');
         setStyle(meshCanvas, 'maxHeight', 'none');
         setStyle(meshCanvas, 'width', sz.width + 'px');
         setStyle(meshCanvas, 'height', sz.height + 'px');
         setStyle(container, 'overflow', 'auto');
+        meshWritten = readMesh(); // як браузер нормалізував наші значення
         setStyle(video, 'imageRendering', sz.integer ? 'pixelated' : 'auto');
         return true;
     }
@@ -496,6 +517,7 @@ export function createOoWebrtcLayer(o) {
         if (!meshSaved) return;
         const s0 = meshSaved;
         meshSaved = null;
+        meshWritten = null;
         try {
             meshCanvas.style.width = s0.width;
             meshCanvas.style.height = s0.height;

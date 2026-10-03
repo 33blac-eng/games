@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import {
     containBox, oneToOneSize, mapClientToRemote, normalizeDisplayMode,
     loadDisplayMode, saveDisplayMode, DISPLAY_FIT, DISPLAY_1X1,
+    absorbForeignStyles,
 } from '../desktop-oo-webrtc.js';
 
 // contain: пропорції збігаються — без лєтербоксу
@@ -42,5 +43,20 @@ const broken = { getItem() { throw new Error('denied'); }, setItem() { throw new
 assert.equal(loadDisplayMode(broken), DISPLAY_FIT);
 saveDisplayMode('1:1', broken); // не кидає
 assert.equal(loadDisplayMode(null), DISPLAY_FIT);
+
+// 1:1: зміни стилів, яких ми не писали (Mesh), потрапляють у знімок
+{
+    const saved = { width: '800px', height: '', maxWidth: '100%', maxHeight: '', overflow: '' };
+    const written = { width: '960px', height: '540px', maxWidth: 'none', maxHeight: 'none', overflow: 'auto' };
+    // Mesh змінив maxHeight (ми потім перепишемо його на 'none')
+    const current = { ...written, maxHeight: '90vh' };
+    absorbForeignStyles(saved, written, current);
+    assert.equal(saved.maxHeight, '90vh');
+    assert.equal(saved.width, '800px');      // наше — знімок не чіпаємо
+    assert.equal(saved.maxWidth, '100%');
+    // ще нічого не записано — знімок без змін
+    const s2 = { width: 'a' };
+    assert.equal(absorbForeignStyles(s2, null, { width: 'b' }).width, 'a');
+}
 
 console.log('display-mapping: ok');
