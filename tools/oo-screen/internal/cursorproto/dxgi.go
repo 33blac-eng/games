@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"image"
 	"image/png"
+	"sync"
 	"time"
 )
 
@@ -100,7 +101,7 @@ func BuildShape(rgba []byte, w, h, hx, hy int) (Shape, error) {
 	for {
 		img := &image.NRGBA{Pix: rgba, Stride: w * 4, Rect: image.Rect(0, 0, w, h)}
 		var buf bytes.Buffer
-		enc := png.Encoder{CompressionLevel: png.BestCompression}
+		enc := png.Encoder{CompressionLevel: png.BestCompression, BufferPool: shapePNGPool}
 		if err := enc.Encode(&buf, img); err != nil {
 			return Shape{}, err
 		}
@@ -163,3 +164,16 @@ func (c *Coalescer) Reset() {
 		c.cur, c.pending = cur, true
 	}
 }
+
+// shapePNGPool reuses png.Encoder state (zlib writer, ~0.8 MB) across shapes;
+// sync.Pool keeps it safe for concurrent BuildShape calls.
+type pngPool struct{ p sync.Pool }
+
+func (b *pngPool) Get() *png.EncoderBuffer {
+	eb, _ := b.p.Get().(*png.EncoderBuffer)
+	return eb
+}
+
+func (b *pngPool) Put(eb *png.EncoderBuffer) { b.p.Put(eb) }
+
+var shapePNGPool = &pngPool{}

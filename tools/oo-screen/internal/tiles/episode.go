@@ -17,10 +17,42 @@ const (
 	DefaultMinInterval = 2 * time.Second
 )
 
+// pngBufferPool reuses png.Encoder's internal state (zlib writer, row
+// buffers, ~1.2 MB) across tiles: without it every tile paid for a fresh
+// flate compressor, ~90 % of an episode's CPU. sync.Pool makes it safe for
+// concurrent encoders.
+type pngBufferPool struct{ p sync.Pool }
+
+func (b *pngBufferPool) Get() *png.EncoderBuffer {
+	eb, _ := b.p.Get().(*png.EncoderBuffer)
+	return eb
+}
+
+func (b *pngBufferPool) Put(eb *png.EncoderBuffer) { b.p.Put(eb) }
+
+var (
+	pngPool = &pngBufferPool{}
+	// tileScratch — the NRGBA conversion buffer and the output buffer, reused
+	// per call; only the returned PNG bytes are freshly allocated.
+	tileScratch = sync.Pool{New: func() any { return new(tileBufs) }}
+)
+
+type tileBufs struct {
+	pix []byte
+	out bytes.Buffer
+}
+
 // EncodePNG encodes the w x h tile at (x,y) of a BGRA image as an opaque
 // RGB PNG (Go's encoder writes colour type 2 for fully opaque NRGBA).
+// Safe for concurrent use.
 func EncodePNG(img Image, x, y, w, h int, level png.CompressionLevel) ([]byte, error) {
-	dst := image.NewNRGBA(image.Rect(0, 0, w, h))
+	tb := tileScratch.Get().(*tileBufs)
+	defer tileScratch.Put(tb)
+	n := w * h * 4
+	if cap(tb.pix) < n {
+		tb.pix = make([]byte, n)
+	}
+	dst := &image.NRGBA{Pix: tb.pix[:n], Stride: w * 4, Rect: image.Rect(0, 0, w, h)}
 	for r := 0; r < h; r++ {
 		src := img.Pix[(y+r)*img.Stride+x*4:]
 		d := dst.Pix[r*dst.Stride:]
@@ -29,12 +61,12 @@ func EncodePNG(img Image, x, y, w, h int, level png.CompressionLevel) ([]byte, e
 			d[s], d[s+1], d[s+2], d[s+3] = src[s+2], src[s+1], src[s], 0xFF
 		}
 	}
-	var buf bytes.Buffer
-	enc := png.Encoder{CompressionLevel: level}
-	if err := enc.Encode(&buf, dst); err != nil {
+	tb.out.Reset()
+	enc := png.Encoder{CompressionLevel: level, BufferPool: pngPool}
+	if err := enc.Encode(&tb.out, dst); err != nil {
 		return nil, err
 	}
-	return buf.Bytes(), nil
+	return bytes.Clone(tb.out.Bytes()), nil
 }
 
 // Stats of one built episode.
