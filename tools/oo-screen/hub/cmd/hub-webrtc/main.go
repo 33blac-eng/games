@@ -408,14 +408,9 @@ func newRegistry() *registry {
 // getOrCreate повертає nodeSession для node, створюючи його за відсутності.
 // Використовує agent-нога (publisher реєструється) та viewer-нога у НЕ
 // ticket-режимі (T1: viewer може прийти раніше за агента й чекати).
+// nil — досягнуто стелі maxNodes (SEC #21).
 func (r *registry) getOrCreate(nodeID string) *nodeSession {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	ns := r.nodes[nodeID]
-	if ns == nil {
-		ns = &nodeSession{nodeID: nodeID}
-		r.nodes[nodeID] = ns
-	}
+	ns, _ := r.getOrCreateNew(nodeID)
 	return ns
 }
 
@@ -427,6 +422,9 @@ func (r *registry) getOrCreateNew(nodeID string) (*nodeSession, bool) {
 	ns := r.nodes[nodeID]
 	if ns != nil {
 		return ns, false
+	}
+	if len(r.nodes) >= maxNodes {
+		return nil, false
 	}
 	ns = &nodeSession{nodeID: nodeID}
 	r.nodes[nodeID] = ns
@@ -757,7 +755,11 @@ func authorizeViewer(req offerReq) (*nodeSession, *hub.TicketClaims, int, string
 		if !tokenMatches(req.Token) {
 			return nil, nil, http.StatusUnauthorized, "bad token"
 		}
-		return reg.getOrCreate(agentNodeIDEnv), nil, 0, ""
+		ns := reg.getOrCreate(agentNodeIDEnv)
+		if ns == nil {
+			return nil, nil, http.StatusServiceUnavailable, "too many nodes"
+		}
+		return ns, nil, 0, ""
 	}
 
 	// hardening (blocker-2): static-token гілка для viewer у проді
@@ -881,6 +883,11 @@ func handleOffer(leg string) http.HandlerFunc {
 				return
 			}
 			ns, agentCreated = reg.getOrCreateNew(node)
+			if ns == nil {
+				log.Printf("offer/agent [node=%s]: стеля нод %d (OO_SCREEN_MAX_NODES) — відмова", node, maxNodes)
+				http.Error(w, "too many nodes", http.StatusServiceUnavailable)
+				return
+			}
 			// Стартовий бітрейт агента = стеля адаптації (bitrate.go). Старий
 			// агент поля не шле — лишається фолбек startBitrateBps.
 			if req.Bitrate > 0 {
@@ -2130,8 +2137,9 @@ func main() {
 	}
 
 	mux := http.NewServeMux()
-	mux.HandleFunc("/offer/agent", handleOffer("agent"))
-	mux.HandleFunc("/offer/viewer", handleOffer("viewer"))
+	// SEC #21: per-IP rate-limit (ratelimit.go) — кожен viewer-offer це виклик ERP.
+	mux.HandleFunc("/offer/agent", rateLimited(offerLimiter, handleOffer("agent")))
+	mux.HandleFunc("/offer/viewer", rateLimited(offerLimiter, handleOffer("viewer")))
 	mux.HandleFunc("/control", handleControl)
 	// F-39: глядач каже «моя вкладка прихована/знову видима» — хаб на цей час
 	// не шле йому відео, а коли приховані ВСІ, ставить агента на паузу.
