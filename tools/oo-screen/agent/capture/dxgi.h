@@ -70,6 +70,23 @@ typedef struct {
      * identical to the previous frame, but the composited cursor moved. */
     int32_t mouse_only;
     uint32_t accumulated_frames;
+
+    /* Gap #2 (RESEARCH-leaders.md): what DXGI says changed in this frame.
+     * rects_valid=0 means DXGI gave no metadata for a real present, so the
+     * whole output must be assumed dirty (dirty_area is then the full area).
+     * Move-rect area counts the DESTINATION rectangles. Areas are clipped to
+     * the output and summed (DXGI rects of one kind do not overlap). */
+    int32_t rects_valid;
+    int32_t dirty_count;
+    int32_t move_count;
+    int64_t dirty_area;
+    int64_t move_area;
+
+    /* 1 when nothing visible changed: zero dirty AND zero move rects (or no
+     * present at all) AND the pointer position/visibility/shape are the same
+     * as last frame. Such a frame is NOT converted: the NV12 texture still
+     * holds the previous image and y/uv are NULL. The consumer should skip it. */
+    int32_t no_change;
 } oos_frame;
 
 /* Creates the pipeline for output `output_idx` of adapter 0.

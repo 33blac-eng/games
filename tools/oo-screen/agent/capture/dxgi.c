@@ -83,6 +83,13 @@ struct oos_cap {
      * oos_gdi_next, consumed and cleared by convert_out. */
     int32_t cursor_in_bgra;
 
+    /* Gap #2: scratch for GetFrameMoveRects/GetFrameDirtyRects, and whether
+     * c->bgra holds a real desktop image yet (a no-op frame is only a no-op
+     * relative to something we already converted). */
+    uint8_t *meta;
+    uint32_t meta_cap;
+    int32_t have_image;
+
     int32_t mapped;
     D3D11_MAPPED_SUBRESOURCE map;
 
@@ -220,6 +227,7 @@ static HRESULT make_dupl(oos_cap *c)
     HRESULT hr = c->out1->lpVtbl->DuplicateOutput(c->out1,
                                                   (IUnknown *)c->dev, &c->dupl);
     if (FAILED(hr)) return hr;
+    c->have_image = 0;  /* fresh duplication: never call its first frame a no-op */
     c->dupl->lpVtbl->GetDesc(c->dupl, &dd);
     c->width = (int32_t)dd.ModeDesc.Width;
     c->height = (int32_t)dd.ModeDesc.Height;
@@ -550,6 +558,62 @@ static int composite_cursor(oos_cap *c)
 static int convert_out(oos_cap *c, oos_frame *frame, int32_t mouse_only,
                        uint32_t accumulated, char *err, int32_t err_len);
 
+typedef struct {
+    int32_t valid, dirty_count, move_count;
+    int64_t dirty_area, move_area;
+} oos_rects;
+
+static int64_t clipped_area(const RECT *r, int32_t w, int32_t h)
+{
+    LONG l = r->left < 0 ? 0 : r->left, t = r->top < 0 ? 0 : r->top;
+    LONG rr = r->right > w ? w : r->right, b = r->bottom > h ? h : r->bottom;
+    if (rr <= l || b <= t) return 0;
+    return (int64_t)(rr - l) * (int64_t)(b - t);
+}
+
+/* Reads move + dirty rects for the frame currently acquired (must run before
+ * ReleaseFrame). On any failure the frame is reported as fully dirty, which is
+ * always safe: the worst case is encoding a frame we could have skipped. */
+static void read_rects(oos_cap *c, const DXGI_OUTDUPL_FRAME_INFO *fi, oos_rects *r)
+{
+    UINT need = fi->TotalMetadataBufferSize, used = 0, used2 = 0;
+    int64_t full = (int64_t)c->width * (int64_t)c->height, sum = 0;
+    HRESULT hr;
+    UINT i;
+    memset(r, 0, sizeof(*r));
+    if (fi->LastPresentTime.QuadPart == 0) {  /* pointer-only update: no image change */
+        r->valid = 1;
+        return;
+    }
+    if (need == 0) goto unknown;
+    if (c->meta_cap < need) {
+        uint8_t *p = (uint8_t *)realloc(c->meta, need);
+        if (!p) goto unknown;
+        c->meta = p; c->meta_cap = need;
+    }
+    hr = c->dupl->lpVtbl->GetFrameMoveRects(c->dupl, need,
+            (DXGI_OUTDUPL_MOVE_RECT *)c->meta, &used);
+    if (FAILED(hr)) goto unknown;
+    r->move_count = (int32_t)(used / sizeof(DXGI_OUTDUPL_MOVE_RECT));
+    for (i = 0; i < (UINT)r->move_count; i++)
+        sum += clipped_area(&((DXGI_OUTDUPL_MOVE_RECT *)c->meta)[i].DestinationRect,
+                            c->width, c->height);
+    r->move_area = sum > full ? full : sum;
+    hr = c->dupl->lpVtbl->GetFrameDirtyRects(c->dupl, need - used,
+            (RECT *)(c->meta + used), &used2);
+    if (FAILED(hr)) goto unknown;
+    r->dirty_count = (int32_t)(used2 / sizeof(RECT));
+    sum = 0;
+    for (i = 0; i < (UINT)r->dirty_count; i++)
+        sum += clipped_area(&((RECT *)(c->meta + used))[i], c->width, c->height);
+    r->dirty_area = sum > full ? full : sum;
+    r->valid = 1;
+    return;
+unknown:
+    memset(r, 0, sizeof(*r));
+    r->dirty_area = full;
+}
+
 int oos_next(oos_cap *c, uint32_t timeout_ms, oos_frame *frame,
              char *err, int32_t err_len)
 {
@@ -557,6 +621,9 @@ int oos_next(oos_cap *c, uint32_t timeout_ms, oos_frame *frame,
     IDXGIResource *res = NULL;
     ID3D11Texture2D *tex = NULL;
     HRESULT hr;
+    oos_rects rects;
+    int32_t prev_visible, prev_x, prev_y, noop;
+    int st;
 
     if (!c) { set_err(err, err_len, "no capture", E_POINTER); return OOS_ERROR; }
     if (!c->dupl) {
@@ -576,6 +643,10 @@ int oos_next(oos_cap *c, uint32_t timeout_ms, oos_frame *frame,
         return classify(hr);
     }
 
+    /* Gap #2: dirty/move rects are only readable while the frame is held. */
+    read_rects(c, &fi, &rects);
+    prev_visible = c->cur_visible; prev_x = c->cur_x; prev_y = c->cur_y;
+
     /* Pointer position first: it is valid even on a mouse-only update. */
     if (fi.LastMouseUpdateTime.QuadPart != 0) {
         c->cur_visible = fi.PointerPosition.Visible ? 1 : 0;
@@ -585,6 +656,31 @@ int oos_next(oos_cap *c, uint32_t timeout_ms, oos_frame *frame,
     if (fi.PointerShapeBufferSize > 0) {
         HRESULT shr = fetch_shape(c, fi.PointerShapeBufferSize);
         if (FAILED(shr)) c->have_shape = 0;
+    }
+
+    /* The cursor is composited into the image, so a pointer move IS a pixel
+     * change. Only a frame with zero dirty AND zero move rects and an
+     * unchanged pointer (position, visibility, shape) is a real no-op. */
+    noop = c->have_image && rects.valid &&
+           rects.dirty_count == 0 && rects.move_count == 0 &&
+           fi.PointerShapeBufferSize == 0 &&
+           c->cur_visible == prev_visible &&
+           (!c->cur_visible || (c->cur_x == prev_x && c->cur_y == prev_y));
+    if (noop) {
+        SAFE_RELEASE(res);
+        c->dupl->lpVtbl->ReleaseFrame(c->dupl);
+        memset(frame, 0, sizeof(*frame));
+        frame->width = c->width;
+        frame->height = c->height;
+        frame->cursor_visible = c->cur_visible;
+        frame->cursor_shape_type = c->have_shape ? (int32_t)c->shape_info.Type : OOS_CUR_NONE;
+        frame->cursor_x = c->cur_x;
+        frame->cursor_y = c->cur_y;
+        frame->mouse_only = (fi.LastPresentTime.QuadPart == 0) ? 1 : 0;
+        frame->accumulated_frames = fi.AccumulatedFrames;
+        frame->rects_valid = 1;
+        frame->no_change = 1;
+        return OOS_OK;
     }
 
     hr = res->lpVtbl->QueryInterface(res, &OOS_IID_ID3D11Texture2D, (void **)&tex);
@@ -602,9 +698,19 @@ int oos_next(oos_cap *c, uint32_t timeout_ms, oos_frame *frame,
     SAFE_RELEASE(tex);
     c->dupl->lpVtbl->ReleaseFrame(c->dupl);
 
-    return convert_out(c, frame,
-                       (fi.LastPresentTime.QuadPart == 0) ? 1 : 0,
-                       fi.AccumulatedFrames, err, err_len);
+    c->have_image = 1;
+
+    st = convert_out(c, frame,
+                     (fi.LastPresentTime.QuadPart == 0) ? 1 : 0,
+                     fi.AccumulatedFrames, err, err_len);
+    if (st == OOS_OK) {
+        frame->rects_valid = rects.valid;
+        frame->dirty_count = rects.dirty_count;
+        frame->move_count = rects.move_count;
+        frame->dirty_area = rects.dirty_area;
+        frame->move_area = rects.move_area;
+    }
+    return st;
 }
 
 /* Everything after a fresh desktop image lands in c->bgra: composite the
@@ -783,6 +889,11 @@ int oos_gdi_next(oos_cap *c, oos_frame *frame, char *err, int32_t err_len)
                                       NULL, bits, (UINT)(c->width * 4), 0);
     /* mouse_only=0: this is a full desktop image. */
     st = convert_out(c, frame, 0, 0, err, err_len);
+    if (st == OOS_OK) {
+        c->have_image = 1;
+        /* Full desktop image: everything counts as changed. */
+        frame->dirty_area = (int64_t)c->width * (int64_t)c->height;
+    }
 
 done:
     if (old) SelectObject(mem, old);
@@ -819,6 +930,7 @@ void oos_close(oos_cap *c)
     SAFE_RELEASE(c->ctx);
     SAFE_RELEASE(c->dev);
     if (c->shape) free(c->shape);
+    if (c->meta) free(c->meta);
     free(c);
 }
 

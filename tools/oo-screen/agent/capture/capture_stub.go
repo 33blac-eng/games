@@ -53,6 +53,13 @@ type NV12Frame struct {
 	MouseOnly         bool
 	AccumulatedFrames uint32
 
+	RectsValid bool
+	DirtyRects int
+	MoveRects  int
+	DirtyArea  int64
+	MoveArea   int64
+	NoChange   bool
+
 	Captured       time.Time
 	AcquireConvert time.Duration
 }

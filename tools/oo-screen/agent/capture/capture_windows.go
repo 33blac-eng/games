@@ -130,6 +130,21 @@ type NV12Frame struct {
 	// AccumulatedFrames is how many presents DXGI coalesced into this one.
 	AccumulatedFrames uint32
 
+	// Gap #2 (RESEARCH-leaders.md): DXGI dirty/move-rect metadata.
+	// RectsValid=false means DXGI gave no metadata for a real present, so the
+	// whole output counts as dirty (DirtyArea is then the full area). Areas are
+	// in pixels, clipped to the output; MoveArea counts destination rects.
+	RectsValid bool
+	DirtyRects int
+	MoveRects  int
+	DirtyArea  int64
+	MoveArea   int64
+	// NoChange: zero dirty and move rects AND the pointer did not move or
+	// change shape — the composited image is identical to the previous one.
+	// Such a frame carries no planes and no texture; skip it (and do not
+	// treat it as motion).
+	NoChange bool
+
 	// Captured is when NextFrame started the acquire that produced this frame.
 	Captured time.Time
 	// AcquireConvert is AcquireNextFrame + cursor composite + Blt + readback.
@@ -566,23 +581,23 @@ func (c *Capturer) copyOut(f *C.oos_frame, start time.Time) *NV12Frame {
 	alignedH := (h + 1) &^ 1
 	chromaRows := alignedH / 2
 
+	if f.no_change != 0 {
+		// Nothing to show: the NV12 texture still holds the previous image.
+		fr := &NV12Frame{Width: w, Height: h, TextureGen: c.gen}
+		fillMeta(fr, f, start)
+		return fr
+	}
+
 	if f.y == nil {
 		// Zero-copy mode: nothing was read back, the NV12 lives on the GPU.
-		return &NV12Frame{
-			Width:             w,
-			Height:            h,
-			Texture:           uintptr(C.oos_nv12_texture(c.c)),
-			TextureGen:        c.gen,
-			CursorVisible:     f.cursor_visible != 0,
-			CursorComposited:  f.cursor_composited != 0,
-			CursorShape:       CursorShapeType(f.cursor_shape_type),
-			CursorX:           int(f.cursor_x),
-			CursorY:           int(f.cursor_y),
-			MouseOnly:         f.mouse_only != 0,
-			AccumulatedFrames: uint32(f.accumulated_frames),
-			Captured:          start,
-			AcquireConvert:    time.Since(start),
+		fr := &NV12Frame{
+			Width:      w,
+			Height:     h,
+			Texture:    uintptr(C.oos_nv12_texture(c.c)),
+			TextureGen: c.gen,
 		}
+		fillMeta(fr, f, start)
+		return fr
 	}
 
 	ySize := yPitch * h
@@ -599,23 +614,35 @@ func (c *Capturer) copyOut(f *C.oos_frame, start time.Time) *NV12Frame {
 	copy(c.y, unsafe.Slice((*byte)(unsafe.Pointer(f.y)), ySize))
 	copy(c.uv, unsafe.Slice((*byte)(unsafe.Pointer(f.uv)), uvSize))
 
-	return &NV12Frame{
-		Width:             w,
-		Height:            h,
-		Y:                 c.y,
-		UV:                c.uv,
-		YStride:           yPitch,
-		UVStride:          uvPitch,
-		CursorVisible:     f.cursor_visible != 0,
-		CursorComposited:  f.cursor_composited != 0,
-		CursorShape:       CursorShapeType(f.cursor_shape_type),
-		CursorX:           int(f.cursor_x),
-		CursorY:           int(f.cursor_y),
-		MouseOnly:         f.mouse_only != 0,
-		AccumulatedFrames: uint32(f.accumulated_frames),
-		Captured:          start,
-		AcquireConvert:    time.Since(start),
+	fr := &NV12Frame{
+		Width:    w,
+		Height:   h,
+		Y:        c.y,
+		UV:       c.uv,
+		YStride:  yPitch,
+		UVStride: uvPitch,
 	}
+	fillMeta(fr, f, start)
+	return fr
+}
+
+// fillMeta copies the cursor/DXGI metadata shared by every copyOut branch.
+func fillMeta(fr *NV12Frame, f *C.oos_frame, start time.Time) {
+	fr.CursorVisible = f.cursor_visible != 0
+	fr.CursorComposited = f.cursor_composited != 0
+	fr.CursorShape = CursorShapeType(f.cursor_shape_type)
+	fr.CursorX = int(f.cursor_x)
+	fr.CursorY = int(f.cursor_y)
+	fr.MouseOnly = f.mouse_only != 0
+	fr.AccumulatedFrames = uint32(f.accumulated_frames)
+	fr.RectsValid = f.rects_valid != 0
+	fr.DirtyRects = int(f.dirty_count)
+	fr.MoveRects = int(f.move_count)
+	fr.DirtyArea = int64(f.dirty_area)
+	fr.MoveArea = int64(f.move_area)
+	fr.NoChange = f.no_change != 0
+	fr.Captured = start
+	fr.AcquireConvert = time.Since(start)
 }
 
 // Close releases the duplication, the pipeline and the D3D11 device.

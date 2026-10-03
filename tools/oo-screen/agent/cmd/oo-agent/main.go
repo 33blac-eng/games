@@ -36,10 +36,11 @@ import (
 
 	"github.com/organicoils/oo-screen/agent/capture"
 	"github.com/organicoils/oo-screen/agent/encode"
-	"github.com/organicoils/oo-screen/internal/h264"
 	"github.com/organicoils/oo-screen/internal/control"
 	"github.com/organicoils/oo-screen/internal/envelope"
+	"github.com/organicoils/oo-screen/internal/h264"
 	"github.com/organicoils/oo-screen/internal/refine"
+	"github.com/organicoils/oo-screen/internal/textmode"
 )
 
 const (
@@ -1599,9 +1600,13 @@ func main() {
 		refines    int // скільки refine-кадрів закодовано (ТЗ P4)
 		// refiner — автомат refine (internal/refine): коли рух стих, ще раз
 		// кодуємо останній кадр із нижчим QP. Лише апаратний D3D-шлях.
-		refiner      = refine.New(refine.Config{MinGap: frameInterval})
-		refineErrLog sync.Once
-		throttled    int // скільки кадрів викинув бюджет CPU софт-енкодера
+		refiner = refine.New(refine.Config{MinGap: frameInterval})
+		// Gap #2: сигнал «текстовий режим» з площі dirty/move rects. Поки
+		// лише лог; споживач (QP/FPS-політика) — наступний крок.
+		textDet         = textmode.New(textmode.Config{})
+		noChangeSkipped int64
+		refineErrLog    sync.Once
+		throttled       int // скільки кадрів викинув бюджет CPU софт-енкодера
 		// s.lastFrame — останній захоплений кадр, джерело keepalive. Тримаємо
 		// саме вказівник капчера, без копії: у zero-copy режимі це його
 		// персистентна Blt-текстура, у CPU-режимі — його ж scratch-буфери
@@ -1931,9 +1936,40 @@ loop:
 		still := false
 		refineQP := 0
 		switch {
+		case err == nil && frame.NoChange:
+			// Gap #2: DXGI віддав кадр без dirty/move rects і без руху курсору —
+			// картинка та сама. НЕ кодуємо і НЕ вважаємо рухом: таймер refine
+			// має йти далі. lastFrame не чіпаємо (у no-op кадру нема площин).
+			// Але такий кадр «з'їв» дедлайн очікування, тож refine/keepalive,
+			// що вже назріли, обслуговуємо тут само.
+			noChangeSkipped++
+			if s.lastFrame == nil || gatePaused.Load() {
+				continue
+			}
+			if qp, due := refiner.Due(time.Now()); due && queued.Load() == 0 {
+				frame = s.lastFrame
+				still = true
+				refineQP = qp
+			} else if time.Since(lastAdmitAt) >= keepaliveAfter {
+				frame = s.lastFrame
+				keepalives++
+				still = true
+			} else {
+				continue
+			}
 		case err == nil:
 			s.lastFrame = frame
 			refiner.Motion(time.Now()) // новий кадр = рух: refine, що йшов, перериваємо
+			if textDet != nil {
+				text, flipped := textDet.Update(
+					capture.ChangedFraction(frame),
+					textmode.Fraction(frame.MoveArea, frame.Width, frame.Height))
+				if flipped {
+					c, m := textDet.Smoothed()
+					log.Printf("oo-agent: text mode=%v (changed≈%.3f moved≈%.3f, no-op skipped=%d)",
+						text, c, m, noChangeSkipped)
+				}
+			}
 		case ctx.Err() != nil:
 			break loop // зупиняють агента, а не просто екран стоїть
 		case refineWait && errors.Is(err, context.DeadlineExceeded):
