@@ -94,6 +94,9 @@ type OutputInfo struct {
 
 func Outputs() ([]OutputInfo, error) { return nil, ErrNotAvailable }
 
+// OutputRect mirrors the Windows function.
+func OutputRect(idx int) (left, top, w, h int, err error) { return 0, 0, 0, 0, ErrNotAvailable }
+
 func (c *Capturer) Size() (int, int) { return 0, 0 }
 
 func (c *Capturer) NextFrame(ctx context.Context) (*NV12Frame, error) {

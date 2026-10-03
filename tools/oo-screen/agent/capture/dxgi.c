@@ -323,6 +323,29 @@ int oos_output_info(int32_t idx, int32_t *width, int32_t *height, int32_t *prima
     return OOS_OK;
 }
 
+/* DesktopCoordinates виходу idx — де він лежить на віртуальному робочому
+ * столі. Для шару курсора: GetCursorInfo дає позицію в координатах
+ * віртуального столу, а DXGI — відносно виходу. Як і oos_output_info, без
+ * дуплікації й без стану капчера — можна кликати з будь-якої горутини. */
+int oos_output_rect(int32_t idx, int32_t *left, int32_t *top, int32_t *right, int32_t *bottom)
+{
+    IDXGIAdapter1 *a = NULL;
+    IDXGIOutput *o = NULL;
+    DXGI_OUTPUT_DESC od;
+
+    if (!left || !top || !right || !bottom || idx < 0) return OOS_ERROR;
+    if (FAILED(default_adapter(&a))) return OOS_ERROR;
+    if (a->lpVtbl->EnumOutputs(a, (UINT)idx, &o) != S_OK) { SAFE_RELEASE(a); return OOS_ERROR; }
+    if (FAILED(o->lpVtbl->GetDesc(o, &od))) { SAFE_RELEASE(o); SAFE_RELEASE(a); return OOS_ERROR; }
+    SAFE_RELEASE(o);
+    SAFE_RELEASE(a);
+    *left = (int32_t)od.DesktopCoordinates.left;
+    *top = (int32_t)od.DesktopCoordinates.top;
+    *right = (int32_t)od.DesktopCoordinates.right;
+    *bottom = (int32_t)od.DesktopCoordinates.bottom;
+    return OOS_OK;
+}
+
 int oos_open(int32_t output_idx, oos_cap **out, char *err, int32_t err_len)
 {
     static const D3D_FEATURE_LEVEL levels[] = {

@@ -924,7 +924,7 @@ func main() {
 	if *cursorLayerFlag {
 		cursorLayerEnabled = true
 		capture.SetCursorLayer(true)
-		go cursorPub.Run(nil)
+		go runCursorPoller(nil)
 	}
 
 	// GUI-режим (-H windowsgui) не має консолі, тож log за замовчуванням у
@@ -1590,7 +1590,7 @@ loop:
 		// Шар курсора: позицію/форму DXGI віддає з КОЖНИМ кадром, і саме
 		// NoChange-кадри (рух миші без змін картинки) тут найчастіші.
 		if err == nil {
-			observeCursor(frame, s.cap)
+			observeCursor(frame, s.cap, s.output)
 		}
 		// A-01: капчер міг пережити ACCESS_LOST і жити вже на іншому девайсі.
 		if dev, gen := s.cap.Device(), s.cap.Generation(); encoderStale(dev, gen, s.encDev, s.encGen) {

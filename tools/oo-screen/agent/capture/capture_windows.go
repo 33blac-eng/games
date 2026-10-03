@@ -275,6 +275,17 @@ type OutputInfo struct {
 	Primary bool `json:"primary"`
 }
 
+// OutputRect returns output idx's DesktopCoordinates (left, top, width,
+// height) on the virtual desktop. Like Outputs it touches no Capturer state,
+// so it is safe from any goroutine (the cursor poller uses it).
+func OutputRect(idx int) (left, top, w, h int, err error) {
+	var l, t, r, b C.int32_t
+	if C.oos_output_rect(C.int32_t(idx), &l, &t, &r, &b) != C.OOS_OK {
+		return 0, 0, 0, 0, fmt.Errorf("capture: output %d: cannot read DXGI_OUTPUT_DESC", idx)
+	}
+	return int(l), int(t), int(r - l), int(b - t), nil
+}
+
 // Outputs enumerates adapter 0's outputs. Nothing is duplicated and no D3D11
 // device is created, so this is cheap enough to call per offer.
 func Outputs() ([]OutputInfo, error) {

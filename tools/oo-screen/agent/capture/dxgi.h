@@ -158,6 +158,10 @@ int32_t oos_output_count(void);
  * without opening a duplication. OOS_OK or OOS_ERROR. */
 int oos_output_info(int32_t idx, int32_t *width, int32_t *height, int32_t *primary);
 
+/* DesktopCoordinates of output `idx` on adapter 0 (virtual-desktop pixels),
+ * without opening a duplication. OOS_OK or OOS_ERROR. */
+int oos_output_rect(int32_t idx, int32_t *left, int32_t *top, int32_t *right, int32_t *bottom);
+
 #ifdef __cplusplus
 }
 #endif

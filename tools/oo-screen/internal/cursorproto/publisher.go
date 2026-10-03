@@ -45,6 +45,10 @@ type Publisher struct {
 	mu   sync.Mutex
 	sink Sink
 	co   Coalescer
+	// posVisible — the visibility last asked for by ObservePos, before
+	// ANDing with "a shape is known" (so a late first shape can show it).
+	posVisible bool
+	havePos    bool
 
 	haveSeq bool
 	lastSeq uint32
@@ -92,12 +96,7 @@ func (p *Publisher) ClearSink(s Sink) {
 func (p *Publisher) Observe(s Sample, shape func() (RawShape, bool)) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	if !p.haveSeq || s.ShapeSeq != p.lastSeq {
-		if raw, ok := shape(); ok {
-			p.setShapeLocked(raw)
-			p.lastSeq, p.haveSeq = s.ShapeSeq, true
-		}
-	}
+	p.observeShapeLocked(s.ShapeSeq, shape)
 	p.co.Offer(Pos{
 		Visible: s.Visible && p.shapeID != 0,
 		ShapeID: p.shapeID,
@@ -105,6 +104,53 @@ func (p *Publisher) Observe(s Sample, shape func() (RawShape, bool)) {
 		Y:       int32(s.Y + p.hotY),
 		FrameW:  clampU16(s.FrameW),
 		FrameH:  clampU16(s.FrameH),
+	})
+	p.flushLocked()
+}
+
+// ObserveShape is Observe without the position: the frame loop calls it
+// while a Poller owns positions.
+func (p *Publisher) ObserveShape(seq uint32, shape func() (RawShape, bool)) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.observeShapeLocked(seq, shape) && p.havePos {
+		// the hotspot moved with the shape: re-offer the last position
+		// (X/Y on the wire are the hotspot, so they do not change)
+		cur := p.co.cur
+		cur.Visible = p.posVisible && p.shapeID != 0
+		cur.ShapeID = p.shapeID
+		p.co.Offer(cur)
+	}
+	p.flushLocked()
+}
+
+func (p *Publisher) observeShapeLocked(seq uint32, shape func() (RawShape, bool)) bool {
+	if p.haveSeq && seq == p.lastSeq {
+		return false
+	}
+	raw, ok := shape()
+	if !ok {
+		return false
+	}
+	p.setShapeLocked(raw)
+	p.lastSeq, p.haveSeq = seq, true
+	return true
+}
+
+// ObservePos offers a pointer position given as the HOTSPOT (OS pointer
+// position, not DXGI's image corner) in frame pixels. Visible is ANDed with
+// "a shape is known", same as Observe.
+func (p *Publisher) ObservePos(visible bool, x, y, frameW, frameH int) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.posVisible, p.havePos = visible, true
+	p.co.Offer(Pos{
+		Visible: visible && p.shapeID != 0,
+		ShapeID: p.shapeID,
+		X:       int32(x),
+		Y:       int32(y),
+		FrameW:  clampU16(frameW),
+		FrameH:  clampU16(frameH),
 	})
 	p.flushLocked()
 }
