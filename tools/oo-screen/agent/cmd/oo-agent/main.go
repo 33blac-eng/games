@@ -2064,6 +2064,9 @@ loop:
 				swPol = swlimit.New(swlimit.Config{
 					MaxFPS: softwareFPSCap(runtime.NumCPU(), s.encW*s.encH, s.fps),
 					Cores:  runtime.NumCPU(),
+					// Софт-шлях не масштабує: щабель Scale лише «вдавав» би падіння
+					// навантаження (ewma×area) і затискав би відновлення FPS.
+					Scales: []swlimit.Scale{{Num: 1, Den: 1}},
 				})
 			}
 			gap := softwareFrameGap(runtime.NumCPU(), s.encW*s.encH, s.fps)

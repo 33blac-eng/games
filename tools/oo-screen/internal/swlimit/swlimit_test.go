@@ -119,3 +119,24 @@ func TestBudgetShareByCores(t *testing.T) {
 		t.Fatal("budget must grow with cores")
 	}
 }
+
+// Без драбини роздільності (софт-шлях не скейлить) FPS відновлюється за
+// реальним навантаженням, без штучного множника від «уявного» Scale.
+func TestSingleScaleRecoversFPS(t *testing.T) {
+	p := New(Config{MaxFPS: 30, Cores: 4, Scales: []Scale{{1, 1}}})
+	now := time.Unix(0, 0)
+	for i := 0; i < 400; i++ { // перевантаження: до MinFPS
+		now = now.Add(100 * time.Millisecond)
+		p.Observe(80*time.Millisecond, now)
+	}
+	if p.FPS() != 10 || p.Scale() != (Scale{1, 1}) {
+		t.Fatalf("fps=%d scale=%v", p.FPS(), p.Scale())
+	}
+	for i := 0; i < 2000; i++ { // кодування подешевшало: 5 мс
+		now = now.Add(100 * time.Millisecond)
+		p.Observe(5*time.Millisecond, now)
+	}
+	if p.FPS() != 30 {
+		t.Fatalf("fps=%d, want 30 after load dropped", p.FPS())
+	}
+}
