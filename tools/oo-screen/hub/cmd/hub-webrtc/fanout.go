@@ -135,6 +135,13 @@ type viewerLeg struct {
 
 	// audioDropped — кадри, викинуті через переповнену чергу (атомарно).
 	audioDropped uint64
+
+	// tilesOut — черга текстових тайлів (tiles.go); nil, поки глядач не
+	// відкрив канал "oosc-tiles" (і завжди без OO_SCREEN_TILES). Пишеться
+	// під ns.mu, не закривається. tilesSent/tilesDropped — атомарно.
+	tilesOut     chan []byte
+	tilesSent    uint64
+	tilesDropped uint64
 }
 
 // addViewer реєструє нову viewer-ногу ноди й піднімає її pump. Нога ще НЕ live:

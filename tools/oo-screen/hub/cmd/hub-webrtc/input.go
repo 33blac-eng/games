@@ -133,9 +133,10 @@ func judgeInput(data []byte, ticket, grant string, lim *rate.Limiter, now time.T
 	return inputAccept, m.Event, ""
 }
 
-// attachViewerInput вішає канал вводу на viewer-ногу. Кличеться ЛИШЕ під
-// прапорцем і ЛИШЕ для ноги з тікетом (див. setupViewerLeg).
-func attachViewerInput(ns *nodeSession, vl *viewerLeg, pc *webrtc.PeerConnection, ticket, grant string) {
+// viewerInputHandler — обробник каналу вводу ноги. Кличеться ЛИШЕ під
+// прапорцем і ЛИШЕ для ноги з тікетом; setupViewerLeg кличе його
+// зі спільного OnDataChannel (pion тримає лише один такий колбек на PC).
+func viewerInputHandler(ns *nodeSession, vl *viewerLeg, ticket, grant string) func(*webrtc.DataChannel) {
 	lim := rate.NewLimiter(inputRatePerSec, inputBurst)
 	// Окремий обмежувач САМОГО ЛОГА: відкинуті події — це рівно той випадок,
 	// коли їх багато, і writeln на кожну перетворив би захист від флуду на
@@ -147,10 +148,7 @@ func attachViewerInput(ns *nodeSession, vl *viewerLeg, pc *webrtc.PeerConnection
 	// щоб причина знайшлась із першого `journalctl | grep input`.
 	noChanLim := rate.NewLimiter(rate.Every(30*time.Second), 1)
 
-	pc.OnDataChannel(func(dc *webrtc.DataChannel) {
-		if dc.Label() != inputChannelLabel {
-			return
-		}
+	return func(dc *webrtc.DataChannel) {
 		log.Printf("input: viewer channel open [node=%s]", ns.nodeID)
 		dc.OnMessage(func(msg webrtc.DataChannelMessage) {
 			now := time.Now()
@@ -174,7 +172,7 @@ func attachViewerInput(ns *nodeSession, vl *viewerLeg, pc *webrtc.PeerConnection
 				dropViewer(ns, vl, "input: "+why)
 			}
 		})
-	})
+	}
 }
 
 // sendInputToAgent пише подію в канал вводу агента ЦІЄЇ ноди. Немає каналу

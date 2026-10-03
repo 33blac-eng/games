@@ -255,6 +255,10 @@ type nodeSession struct {
 	// на Failed/Closed канали обнуляються лише якщо вони ще його.
 	agentChanPC *webrtc.PeerConnection
 
+	// tiles — кеш текстових тайлів поточного епізоду (tiles.go). Порожній
+	// і невживаний без OO_SCREEN_TILES.
+	tiles tilesCache
+
 	// generation — покоління агентської ноги ЦІЄЇ ноди; гейтить старий read
 	// loop при replace. Доступ лише атомарно (&ns.generation).
 	generation uint64
@@ -1118,6 +1122,7 @@ func setupAgentLeg(ns *nodeSession, pc *webrtc.PeerConnection) error {
 	// Control-DataChannel від агента (on-demand гейтинг). Коли відкриється —
 	// одразу шлемо поточний стан присутності глядача, щоб агент, який щойно
 	// (пере)підключився, миттєво знав: кодувати чи простоювати.
+	tilesOn := tilesEnabled // знімок прапорця: колбеки живуть довше за виклик
 	pc.OnDataChannel(func(dc *webrtc.DataChannel) {
 		switch dc.Label() {
 		case "oosc-ctl":
@@ -1143,6 +1148,18 @@ func setupAgentLeg(ns *nodeSession, pc *webrtc.PeerConnection) error {
 			ns.agentInput, ns.agentChanPC = dc, pc
 			ns.mu.Unlock()
 			log.Printf("input: agent channel open [node=%s]", ns.nodeID)
+		case tilesLabel:
+			// Текстові тайли (tiles.go) — лише під OO_SCREEN_TILES.
+			if !tilesOn {
+				return
+			}
+			log.Printf("tiles: agent channel open [node=%s]", ns.nodeID)
+			dc.OnMessage(func(msg webrtc.DataChannelMessage) {
+				if msg.IsString {
+					return
+				}
+				onAgentTiles(ns, msg.Data)
+			})
 		}
 	})
 
@@ -1274,6 +1291,9 @@ func setupAgentLeg(ns *nodeSession, pc *webrtc.PeerConnection) error {
 				ns.agentCtrl, ns.agentInput, ns.agentChanPC = nil, nil, nil
 			}
 			ns.mu.Unlock()
+			if gone && tilesOn {
+				agentTilesGone(ns)
+			}
 			if gone {
 				// Логуємо ОБОВ'ЯЗКОВО: це єдиний слід втрати публікатора.
 				// OnICEConnectionStateChange нижче пише лише стан ICE, а це
@@ -1371,6 +1391,9 @@ func setupViewerLeg(ns *nodeSession, pc *webrtc.PeerConnection, claims *hub.Tick
 	// Канал вводу (input.go) — ЛИШЕ під прапорцем І ЛИШЕ для ноги з квитком.
 	// Без прапорця OnDataChannel не ставиться взагалі: канал, який відкриє
 	// браузер, лишиться без обробника, і жодна подія нікуди не поїде.
+	// Канали глядача. pion тримає ОДИН OnDataChannel на PeerConnection,
+	// тож обробники збираються тут і диспетчеризуються за міткою.
+	var onInput func(*webrtc.DataChannel)
 	if inputEnabled && ticket != "" {
 		// grant із квитка — рівень дозволу, який визначив ЕРП. Порожній
 		// claims (T1-режим) дає порожній grant, і канал вводу такій нозі не
@@ -1379,7 +1402,18 @@ func setupViewerLeg(ns *nodeSession, pc *webrtc.PeerConnection, claims *hub.Tick
 		if claims != nil {
 			grant = claims.Grant
 		}
-		attachViewerInput(ns, vl, pc, ticket, grant)
+		onInput = viewerInputHandler(ns, vl, ticket, grant)
+	}
+	tilesOn := tilesEnabled
+	if onInput != nil || tilesOn {
+		pc.OnDataChannel(func(dc *webrtc.DataChannel) {
+			switch {
+			case dc.Label() == inputChannelLabel && onInput != nil:
+				onInput(dc)
+			case dc.Label() == tilesLabel && tilesOn:
+				viewerTilesHandler(ns, vl, dc)
+			}
+		})
 	}
 
 	pc.OnConnectionStateChange(func(s webrtc.PeerConnectionState) {
