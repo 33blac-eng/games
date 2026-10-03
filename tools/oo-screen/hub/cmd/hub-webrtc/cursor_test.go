@@ -251,7 +251,7 @@ func TestCursorRelayEndToEnd(t *testing.T) {
 	bdc.OnMessage(func(m webrtc.DataChannelMessage) { got <- append([]byte(nil), m.Data...) })
 	hubV.OnDataChannel(func(dc *webrtc.DataChannel) {
 		if dc.Label() == cursorproto.ChannelLabel {
-			viewerRelayHandler(ns, dc, cursorRelayConfig())
+			viewerRelayHandler(ns, hubV, dc, cursorRelayConfig())
 		}
 	})
 	signalPair(t, browser, hubV)
@@ -274,5 +274,35 @@ func TestCursorRelayEndToEnd(t *testing.T) {
 	p, err := cursorproto.DecodePos(recv())
 	if err != nil || p.X != 42 {
 		t.Fatalf("pos: %+v %v", p, err)
+	}
+}
+
+// One viewer leg opening many 'oosc-cursor' channels must not take every
+// viewer slot of the node: the relay accepts one channel per owner.
+func TestRelayOneChannelPerViewerLeg(t *testing.T) {
+	cfg := cursorRelayConfig()
+	cfg.maxViewers = 3
+	r := newDCRelay(cfg)
+	legA, legB := new(int), new(int)
+	a1, a2 := newSink(), newSink()
+	if !r.addViewerOwned(legA, a1) {
+		t.Fatal("first channel of leg A refused")
+	}
+	if r.addViewerOwned(legA, a2) || r.addViewerOwned(legA, newSink()) {
+		t.Fatal("second channel of the same leg accepted")
+	}
+	if !r.addViewerOwned(legB, newSink()) {
+		t.Fatal("leg B starved by leg A's extra channels")
+	}
+	r.removeViewer(a2) // never admitted: must not free leg A's slot
+	if r.addViewerOwned(legA, newSink()) {
+		t.Fatal("removing a rejected channel freed the leg's slot")
+	}
+	r.removeViewer(a1)
+	if !r.addViewerOwned(legA, a2) {
+		t.Fatal("leg A cannot reopen after its channel closed")
+	}
+	if n := r.viewerCount(); n != 2 {
+		t.Fatalf("viewers = %d, want 2", n)
 	}
 }

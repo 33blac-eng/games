@@ -59,7 +59,11 @@ type dcRelay struct {
 	cfg     relayConfig
 	lim     *rate.Limiter
 	mu      sync.Mutex
-	viewers map[relaySink]struct{}
+	viewers map[relaySink]any // sink -> власник (viewer-нога)
+	// owners — один канал на власника: інакше одна viewer-нога, відкривши
+	// N каналів 'oosc-cursor', зайняла б усі maxViewers місць ноди (і
+	// множила б трафік ретрансляції на себе).
+	owners  map[any]relaySink
 	sticky  map[byte][]byte
 	order   []byte // порядок липких ключів (форма раніше за позицію)
 	dropped uint64
@@ -69,7 +73,8 @@ func newDCRelay(cfg relayConfig) *dcRelay {
 	return &dcRelay{
 		cfg:     cfg,
 		lim:     rate.NewLimiter(rate.Limit(cfg.ratePerSec), cfg.burst),
-		viewers: map[relaySink]struct{}{},
+		viewers: map[relaySink]any{},
+		owners:  map[any]relaySink{},
 		sticky:  map[byte][]byte{},
 	}
 }
@@ -143,13 +148,22 @@ func (r *dcRelay) sendTo(s relaySink, msg []byte, essential bool) bool {
 
 // addViewer приймає глядача (false — стелю вичерпано) і одразу віддає йому
 // липкий стан, щоб курсор з'явився без чекання на наступну зміну форми.
-func (r *dcRelay) addViewer(s relaySink) bool {
+func (r *dcRelay) addViewer(s relaySink) bool { return r.addViewerOwned(s, s) }
+
+// addViewerOwned — addViewer з власником: другий канал того самого власника
+// (поки перший живий) не приймається.
+func (r *dcRelay) addViewerOwned(owner any, s relaySink) bool {
 	r.mu.Lock()
+	if prev, ok := r.owners[owner]; ok && prev != s {
+		r.mu.Unlock()
+		return false
+	}
 	if _, ok := r.viewers[s]; !ok && len(r.viewers) >= r.cfg.maxViewers {
 		r.mu.Unlock()
 		return false
 	}
-	r.viewers[s] = struct{}{}
+	r.viewers[s] = owner
+	r.owners[owner] = s
 	replay := make([][]byte, 0, len(r.order))
 	for _, k := range r.order {
 		replay = append(replay, r.sticky[k])
@@ -163,7 +177,12 @@ func (r *dcRelay) addViewer(s relaySink) bool {
 
 func (r *dcRelay) removeViewer(s relaySink) {
 	r.mu.Lock()
-	delete(r.viewers, s)
+	if owner, ok := r.viewers[s]; ok {
+		if r.owners[owner] == s {
+			delete(r.owners, owner)
+		}
+		delete(r.viewers, s)
+	}
 	r.mu.Unlock()
 }
 
@@ -214,11 +233,12 @@ func attachAgentRelay(ns *nodeSession, dc *webrtc.DataChannel, cfg relayConfig) 
 
 // viewerRelayHandler підписує канал глядача (відкритий браузером, ловиться
 // спільним диспетчером OnDataChannel viewer-ноги) на ретранслятор ноди.
-func viewerRelayHandler(ns *nodeSession, dc *webrtc.DataChannel, cfg relayConfig) {
+// owner — viewer-нога (її PeerConnection): один канал на ногу.
+func viewerRelayHandler(ns *nodeSession, owner any, dc *webrtc.DataChannel, cfg relayConfig) {
 	r := relayFor(ns, cfg)
 	open := func() {
-		if !r.addViewer(dc) {
-			log.Printf("relay %s: стеля глядачів [node=%s] — канал закрито", cfg.label, ns.nodeID)
+		if !r.addViewerOwned(owner, dc) {
+			log.Printf("relay %s: стеля глядачів або дубль каналу [node=%s] — канал закрито", cfg.label, ns.nodeID)
 			_ = dc.Close()
 		}
 	}

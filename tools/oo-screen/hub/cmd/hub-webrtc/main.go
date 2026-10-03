@@ -1420,7 +1420,7 @@ func setupViewerLeg(ns *nodeSession, pc *webrtc.PeerConnection, claims *hub.Tick
 		case dc.Label() == tilesLabel && tilesOn:
 			viewerTilesHandler(ns, vl, dc)
 		case dc.Label() == cursorproto.ChannelLabel:
-			viewerRelayHandler(ns, dc, cursorRelayConfig())
+			viewerRelayHandler(ns, pc, dc, cursorRelayConfig())
 		}
 	})
 
