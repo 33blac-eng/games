@@ -812,6 +812,12 @@ func handleOffer(leg string) http.HandlerFunc {
 				http.Error(w, msg, status)
 				return
 			}
+			// SEC: стеля глядачів на ноду. Без неї кожна viewer-нога = PeerConnection,
+			// черга й дві горутини без жодної межі (DoS памʼяттю/CPU хаба).
+			if viewerCapReached(ns) {
+				http.Error(w, "too many viewers for node", http.StatusTooManyRequests)
+				return
+			}
 			legProfile = ns.videoProfile()
 			// Агент є, а профілю немає — це «не знаю, що я тобі віддам».
 			// Мовчки підставити дефолт означало б домовитись про Main і
@@ -984,6 +990,23 @@ var (
 func internalError(w http.ResponseWriter, where string, err error) {
 	log.Printf("offer: %s: %v", where, err)
 	http.Error(w, "internal error", http.StatusInternalServerError)
+}
+
+// maxViewersPerNode — стеля одночасних viewer-ніг однієї ноди (SEC-аудит).
+// Env OO_SCREEN_MAX_VIEWERS перекриває; невалідне/нульове — дефолт 16.
+var maxViewersPerNode = func() int {
+	if v, err := strconv.Atoi(os.Getenv("OO_SCREEN_MAX_VIEWERS")); err == nil && v > 0 {
+		return v
+	}
+	return 16
+}()
+
+// viewerCapReached — чи вже досягнуто стелі глядачів ноди.
+func viewerCapReached(ns *nodeSession) bool {
+	ns.mu.Lock()
+	n := len(ns.viewers)
+	ns.mu.Unlock()
+	return n >= maxViewersPerNode
 }
 
 // maxOfferBody — стеля тіла /offer/* і /control (SDP ~ 3–10 КБ; 256 КБ = запас).
