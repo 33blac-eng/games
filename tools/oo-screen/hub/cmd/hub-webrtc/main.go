@@ -1817,6 +1817,14 @@ func recomputeBinding(ns *nodeSession) {
 			vl.primed = primeViewerLocked(ns, vl)
 		}
 	}
+	// B3: кеш наповнює лише forwardToViewers, а той без живого глядача (чи без
+	// агента) нічого не пише. Тобто кеш ноди, на яку зараз ніхто не дивиться,
+	// — це вже застарілий хвіст: віддати його наступному глядачеві означало б
+	// показати давній кадр, а тримати — до gopMaxBytes пам'яті на кожну таку
+	// ноду (88 % залишкової купи в soak). Відпускаємо одразу.
+	if !hasLiveViewerLocked(ns) {
+		ns.gop.reset()
+	}
 }
 
 // primeViewerLocked віддає новій нозі кеш GOP ноди. true = картинка в неї

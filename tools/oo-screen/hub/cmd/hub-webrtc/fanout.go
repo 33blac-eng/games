@@ -238,6 +238,9 @@ func removeViewer(ns *nodeSession, vl *viewerLeg) bool {
 	vl.ready, vl.live = false, false
 	left := len(ns.viewers)
 	ns.viewerCount.Store(int32(left))
+	if !hasLiveViewerLocked(ns) {
+		ns.gop.reset() // B3: див. recomputeBinding — кеш без глядачів застаріває
+	}
 	ns.mu.Unlock()
 	if !ok {
 		return false
