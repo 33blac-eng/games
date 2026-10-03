@@ -251,3 +251,23 @@ func TestLegCongestionPreLoss(t *testing.T) {
 		t.Fatalf("протухла нога врахована: %+v", sig)
 	}
 }
+
+// Стала затримка, що з'явилась посеред сесії (rtt-200ms у стенді), + 1%
+// рівномірних втрат: черги немає, після першого зрізу приріст не спадає —
+// стає базою, і контролер не їде до підлоги.
+func TestStepDelayRebasesAfterUselessCut(t *testing.T) {
+	c := bitrateCtl{target: 8_000_000, startBps: 8_000_000, fastUp: true}
+	now := t0
+	cuts := 0
+	for i := 0; i < 30; i++ {
+		now = now.Add(time.Second)
+		prev := c.target
+		c, _ = c.stepSig(0.005, 200*time.Millisecond, congSignals{preLoss: 0.01}, now)
+		if c.target < prev {
+			cuts++
+		}
+	}
+	if cuts > 2 || c.target < 5_000_000 {
+		t.Fatalf("стала затримка: %d зрізів, ціль %d", cuts, c.target)
+	}
+}

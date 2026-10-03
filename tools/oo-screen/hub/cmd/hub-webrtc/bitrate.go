@@ -202,6 +202,10 @@ const (
 	congRises      = 2                     // скільки зростань ПОСПІЛЬ до сигналу
 	congRateMargin = 0.9                   // запас під доставлену швидкість
 	congCutMin     = 0.5                   // найглибший один крок
+	// Перебазування (queueExcess): через стільки після зрізу черга мала б
+	// спасти хоча б до цієї частки, інакше це не наша черга.
+	congRebaseAfter = 4 * time.Second
+	congRebaseFrac  = 0.8
 )
 
 // congSignals — додаткові входи контролера з НАЙГІРШОЇ ноги (legCongestion у
@@ -228,6 +232,29 @@ func congestion(excess time.Duration, s congSignals, lowRising bool) (bool, floa
 		f = rttDownFactor
 	}
 	return true, f
+}
+
+// queueExcess — приріст, який B4 вважає ЧЕРГОЮ. Заміряно (rtt-200ms у
+// RESULTS-network.md, «Після виправлень P0»): стала затримка, що зʼявилась
+// посеред сесії (зміна маршруту; у стенді — реле вмикає RTT 200 мс), плюс
+// рівномірні 1% втрат виглядали як «черга + NACK», і B4 різав 8 -> 1.85
+// Мбіт/с, хоча черги немає. Відмінність черги від сталої затримки: черга,
+// яку наливаємо МИ, після зрізу спадає. Тому якщо через congRebaseAfter
+// після зрізу по B4 приріст не впав нижче congRebaseFrac від приросту в
+// момент зрізу — це не наша черга, і він стає локальною базою (delayBase).
+// База опускається, щойно приріст падає нижче неї. Ціна хиби — один зріз.
+func (c bitrateCtl) queueExcess(excess time.Duration, now time.Time) (bitrateCtl, time.Duration) {
+	if excess < c.delayBase {
+		c.delayBase = excess
+	}
+	if !c.congCutAt.IsZero() && now.Sub(c.congCutAt) >= congRebaseAfter {
+		if c.congCutExcess >= congDelayMin && float64(excess) >= float64(c.congCutExcess)*congRebaseFrac {
+			c.delayBase = excess
+		}
+		c.congCutAt = time.Time{}
+	}
+	c.lastQx = excess - c.delayBase
+	return c, c.lastQx
 }
 
 // rttLowTrend — тренд затримки з НИЖЧИМ порогом: зростання на congRiseStep
@@ -402,8 +429,14 @@ type bitrateCtl struct {
 	lowRef    time.Duration
 	lowRises  int
 	lossyRuns int
+	lastQx    time.Duration
 	// upRun — швидких підйомів поспіль без зрізу (розгін кроку, fastUpStep).
 	upRun int
+	// delayBase — локальна база черги для сигналів B4 (див. queueExcess);
+	// congCutAt/congCutExcess — момент і приріст останнього зрізу по B4.
+	delayBase     time.Duration
+	congCutAt     time.Time
+	congCutExcess time.Duration
 
 	// textMode — ЗАГЛУШКА під контентно-залежну стелю (contentCeiling). Нічим не
 	// виставляється й у step() не входить; агента не чіпаємо.
@@ -661,18 +694,22 @@ func (c bitrateCtl) stepSig(lossFrac float64, rttExcess time.Duration, sig congS
 	c, excess := c.pushRTT(rttExcess)
 	c, rttRising := c.rttTrend(excess, now)
 	c, rttHigh := c.rttLevel(excess)
-	c, lowRising := c.rttLowTrend(excess)
+	c, qx := c.queueExcess(excess, now)
+	c, lowRising := c.rttLowTrend(qx)
 	// Черга є і NACK-и є, але до затору ще не дотягує — підйом не пускаємо.
 	// Якщо так стоїть congRises RR поспіль — це вже затор: ціль трохи вища за
 	// стелю дає рівно такий стійкий «невеликий» preLoss, і сіра зона тримала б
 	// її над стелею безкінечно (спіймано моделлю стелі в bitrate_cong_test.go).
-	queueLossy := excess >= congDelayMin && sig.preLoss > lossLowFrac
+	queueLossy := qx >= congDelayMin && sig.preLoss > lossLowFrac
 	if queueLossy {
 		c.lossyRuns++
 	} else {
 		c.lossyRuns = 0
 	}
-	cong, congF := congestion(excess, sig, lowRising || c.lossyRuns >= congRises)
+	cong, congF := congestion(qx, sig, lowRising || c.lossyRuns >= congRises)
+	if cong {
+		c.congAt = now
+	}
 
 	next, up, fast := c.target, false, false
 	switch {
@@ -804,6 +841,11 @@ func (c bitrateCtl) stepSig(lossFrac float64, rttExcess time.Duration, sig congS
 		c.upRun = 0
 		c.cutFrom = c.target // рівень, де був затор: межа швидкого режиму
 		c.probeLvl = c.target
+		// Перший зріз епізоду: наступні в межах congRebaseAfter вікно не
+		// переставляють, інакше дебаунс 2 с < 4 с не дав би перевірці відбутись.
+		if c.congAt.Equal(now) && c.congCutAt.IsZero() {
+			c.congCutAt, c.congCutExcess = now, c.lastQx
+		}
 		if backoff {
 			// Невдала проба: межею наступної стає рівень, на який відкотились
 			// (перевірено чистий), а не той, що провалився, — інакше кожна
