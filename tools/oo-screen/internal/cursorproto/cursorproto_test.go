@@ -1,8 +1,8 @@
 package cursorproto
 
 import (
-	"encoding/binary"
 	"bytes"
+	"encoding/binary"
 	"encoding/hex"
 	"errors"
 	"image/png"

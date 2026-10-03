@@ -468,7 +468,7 @@ func wheelData(notches float64) uint32 {
 type Injector struct {
 	mu      sync.Mutex
 	surface Bounds
-	held    heldState           // SEC #37: pressed and not yet released (held.go)
+	held    heldState          // SEC #37: pressed and not yet released (held.go)
 	blocked map[keyID]struct{} // OO_AGENT_INPUT_BLOCK_KEYS
 }
 

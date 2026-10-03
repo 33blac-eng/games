@@ -95,6 +95,7 @@ func gopByteBudget(bps uint64) int {
 //   - байти: gopByteBudget(bps) — бітрейт ноди × проміжок, не більше gopMaxBytes;
 //   - пакети: gopMaxPackets — запобіжник;
 //   - час RTP: gopMaxSpan.
+//
 // Пам'ять обмежена за будь-якого входу: найгірше — gopMaxBytes байтів payload-у
 // плюс зріз на gopMaxPackets вказівників.
 type gopCache struct {

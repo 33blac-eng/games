@@ -28,10 +28,10 @@ const (
 )
 
 var (
-	ErrBadMagic       = errors.New("envelope: bad magic")
-	ErrBadVersion     = errors.New("envelope: unknown version")
-	ErrPayloadTooBig  = errors.New("envelope: payload exceeds 8MiB")
-	ErrShortHeader    = errors.New("envelope: short header")
+	ErrBadMagic      = errors.New("envelope: bad magic")
+	ErrBadVersion    = errors.New("envelope: unknown version")
+	ErrPayloadTooBig = errors.New("envelope: payload exceeds 8MiB")
+	ErrShortHeader   = errors.New("envelope: short header")
 )
 
 type Frame struct {

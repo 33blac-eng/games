@@ -41,11 +41,7 @@ jobs:
         run: go test -race -count=1 ./...
       - name: gofmt (CRLF-tolerant)
         # Sources use CRLF; ci/gofmt-check.sh strips CR before gofmt -l so only
-        # real formatting issues fail. Non-blocking until the files it currently
-        # reports (agent/input/input.go, hub/cmd/hub-webrtc/{gop,main}.go,
-        # internal/envelope/envelope.go, internal/h264/annexb.go) are gofmt'd;
-        # then delete continue-on-error.
-        continue-on-error: true
+        # real formatting issues fail.
         run: ./ci/gofmt-check.sh
 
   windows-cross:
