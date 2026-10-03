@@ -29,6 +29,34 @@ oo-agent -transport webrtc -hub http://127.0.0.1:4470/offer/agent -fps 60 -bitra
 Windows-only (build tag). `main_stub.go` тримає `GOOS=linux go build ./agent/...`
 зеленим.
 
+## Токен агента (SEC #17, #33)
+
+Хаб приймає **токен ноди**: `hex(HMAC-SHA256(master, node_id))`. Випускає його
+`oo-node-token` на хабі (master — `OO_SCREEN_AGENT_SECRET`, без нього —
+`OO_SCREEN_T1_TOKEN`):
+
+```
+OO_SCREEN_AGENT_SECRET=... go run ./hub/cmd/oo-node-token -node <node_id> > agent.token
+```
+
+Агент читає токен (перший знайдений):
+
+1. `-token-file C:\ProgramData\oo-screen\agent.token` — **рекомендовано**;
+2. env `OO_AGENT_TOKEN`;
+3. `-token <рядок>` — лише сумісність: видно в командному рядку schtask будь-
+   якому локальному користувачу, агент пише WARNING;
+4. env `OO_SCREEN_T1_TOKEN` (легасі).
+
+ACL файла — лише SYSTEM і Administrators:
+
+```
+icacls C:\ProgramData\oo-screen\agent.token /inheritance:r /grant:r SYSTEM:R Administrators:F
+```
+
+Задача планувальника: `oo-agent.exe -node <node_id> -token-file C:\ProgramData\oo-screen\agent.token ...`
+(без `-token`). Відсутній чи порожній `-token-file` — агент не стартує (а не
+тихо падає на слабше джерело).
+
 ## Admission-політика (§5.5)
 
 Один активний `send` за раз (`inFlight` atomic-прапорець, встановлюється

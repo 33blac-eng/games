@@ -36,6 +36,7 @@ import (
 
 	"github.com/organicoils/oo-screen/agent/capture"
 	"github.com/organicoils/oo-screen/agent/encode"
+	"github.com/organicoils/oo-screen/internal/agentcred"
 	"github.com/organicoils/oo-screen/internal/control"
 	"github.com/organicoils/oo-screen/internal/envelope"
 	"github.com/organicoils/oo-screen/internal/h264"
@@ -151,9 +152,10 @@ func encoderPLID(headers []byte) (string, error) {
 // dialWebRTC, який стартує після main() встановив значення.
 var nodeID string
 
-// cliToken — токен, переданий прапорцем -token (перекриває env). Дозволяє
-// запускати агента напряму зі schtask без .cmd-обгортки, що ставить env — а
-// саме та обгортка відкривала видиме вікно cmd.exe на екрані працівника.
+// cliToken — токен агента, обраний у main() з -token-file / OO_AGENT_TOKEN /
+// -token / OO_SCREEN_T1_TOKEN (internal/agentcred, SEC #33). -token лишено для
+// сумісності, але він видно в командному рядку schtask будь-якому локальному
+// користувачу — тому -token-file.
 var cliToken string
 
 // startBitrateBps — фактичне значення -bitrate, з яким підняли агента. Їде в
@@ -165,10 +167,8 @@ func authToken() string {
 	if cliToken != "" {
 		return cliToken
 	}
-	if v := os.Getenv("OO_SCREEN_T1_TOKEN"); v != "" {
-		return v
-	}
-	return "t1-dev-token"
+	tok, _, _ := agentcred.ResolveToken("", "", os.Getenv)
+	return tok
 }
 
 // ---------------------------------------------------------------------------
@@ -1279,7 +1279,8 @@ func main() {
 	output := flag.Int("output", 0, "індекс DXGI-виводу (монітора) на старті; неіснуючий клампиться до 0")
 	node := flag.String("node", "", "mesh node_id цього ПК (webrtc): hub реєструє publisher-а під ним і маршрутизує viewer-ів сюди; порожнє = старий T1-режим (node з env на hub)")
 	forceSoftware := flag.Bool("force-software", false, "пропустити апаратний енум і взяти софтверний Microsoft H264 MFT (CPU NV12 sync-шлях) — для відтворення софт-шляху на машині з hw-енкодером")
-	tokenFlag := flag.String("token", "", "hub-токен агента (перекриває env OO_SCREEN_T1_TOKEN); дозволяє запуск напряму зі schtask без .cmd-обгортки")
+	tokenFlag := flag.String("token", "", "ЗАСТАРІЛО (видно в командному рядку): hub-токен агента; замість нього -token-file або env OO_AGENT_TOKEN")
+	tokenFile := flag.String("token-file", "", "файл із hub-токеном агента (ACL: лише SYSTEM/Administrators); перекриває OO_AGENT_TOKEN і -token")
 	logPath := flag.String("log", "", "шлях до файлу логу; якщо задано — увесь вивід іде туди (GUI-режим -H windowsgui без консолі, stdout нема)")
 	audioFlag := flag.Bool("audio", false, "передавати звук ПК (перекриває env OO_SCREEN_AUDIO=1)")
 	inputFlag := flag.Bool("input", false, "приймати клавіатуру й мишу від глядача (перекриває env OO_SCREEN_INPUT=1)")
@@ -1318,7 +1319,16 @@ func main() {
 		log.Fatalf("oo-agent: %v", err)
 	}
 
-	cliToken = *tokenFlag
+	// SEC #33: токен — з файлу/env, -token лише для сумісності.
+	tok, tokSrc, tokErr := agentcred.ResolveToken(*tokenFlag, *tokenFile, os.Getenv)
+	if tokErr != nil {
+		log.Fatalf("oo-agent: %v", tokErr)
+	}
+	if tokSrc == agentcred.SourceFlag {
+		log.Printf("oo-agent: WARNING — токен переданий -token і видно в командному рядку процесу; перейди на -token-file (див. README)")
+	}
+	log.Printf("oo-agent: токен агента з %s", tokSrc)
+	cliToken = tok
 
 	nodeID = *node
 
