@@ -222,12 +222,12 @@ func TestStepDelayStrongEvidenceLimited(t *testing.T) {
 	}
 }
 
-func TestFastUpDefaultOn(t *testing.T) {
-	if !fastRecoveryDefault {
-		t.Skip("OO_SCREEN_BITRATE_FASTUP=0 у середовищі")
+func TestFastUpDefaultOff(t *testing.T) {
+	if fastRecoveryDefault {
+		t.Skip("OO_SCREEN_BITRATE_FASTUP=1 у середовищі")
 	}
-	if !newBitrateCtl(8_000_000).fastUp {
-		t.Fatal("B5: fastUp має бути увімкнено за замовчуванням")
+	if newBitrateCtl(8_000_000).fastUp {
+		t.Fatal("fastUp має бути opt-in (OO_SCREEN_BITRATE_FASTUP=1)")
 	}
 }
 

@@ -507,8 +507,11 @@ type bitrateCtl struct {
 // B5 (TZ-GENERAL P0): заміряно, що «швидкий» режим був швидким лише після
 // хвилини чистоти (fastUpAfter 15 с + cutFromExpire 60 с): після стелі 2/4
 // Мбіт/с — 57-58 с до 90% від 8 Мбіт/с, без FASTUP — ~185 с. Тепер:
-//   - FASTUP УВІМКНЕНО за замовчуванням (OO_SCREEN_BITRATE_FASTUP=0 — стара
-//     поведінка);
+//   - FASTUP — opt-in (OO_SCREEN_BITRATE_FASTUP=1). Був увімкнений за
+//     замовчуванням, але перезамір на стенді з «живим енкодером»
+//     (RESULTS-network.md) показав: проби швидкого режиму доходять до самої
+//     стелі, і на 8M фриз 2.6 -> 4.7 с/хв, на 4M декодовні 92.8 -> 90.0%.
+//     Ручки нижче — для ввімкненого режиму;
 //   - fastUpAfter 15 -> 5 с, крок до +50% раз на 2 с;
 //   - cutFromExpire 60 -> 4 с, АЛЕ з подвоєнням за кожну невдалу пробу (до
 //     cutFromExpireMax) і з відступом на рівень до проби (probeFrom), якщо
@@ -556,9 +559,9 @@ const (
 	probeBackoffDebounce = time.Second
 )
 
-// fastRecoveryDefault — env-ручка; читається в newBitrateCtl. B5: дефолт
-// УВІМКНЕНО, "0" вимикає.
-var fastRecoveryDefault = os.Getenv("OO_SCREEN_BITRATE_FASTUP") != "0"
+// fastRecoveryDefault — env-ручка; читається в newBitrateCtl. Дефолт ВИМКНЕНО
+// ("1" вмикає): див. вище, чому швидкий режим знову opt-in.
+var fastRecoveryDefault = os.Getenv("OO_SCREEN_BITRATE_FASTUP") == "1"
 
 // overshoot — висота проби над probeLvl з урахуванням невдалих.
 func (c bitrateCtl) overshoot() float64 {
