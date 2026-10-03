@@ -32,7 +32,9 @@ package main
 import (
 	"bytes"
 	"encoding/binary"
+	"errors"
 	"fmt"
+	"io/fs"
 	"log"
 	"os"
 	"path/filepath"
@@ -366,18 +368,18 @@ func (r *recorder) open() bool {
 	}
 	// SEC: запис — це кадри чужого екрана (паролі, листування). Каталог і
 	// файл — лише для власника процесу хаба, а не 0755/0644 для всіх на VPS.
-	if err := os.MkdirAll(r.dir, recordDirPerm); err != nil {
+	if err := ensureRecordDir(r.dir); err != nil {
 		log.Printf("record: каталог %s не створився: %v", r.dir, err)
 		r.started = true
 		r.mkv = newMKVWriter(discardWriter{})
 		return false
 	}
-	name := fmt.Sprintf("%s-%s.mkv", safeNodeID(r.nodeID), time.Now().UTC().Format("20060102-150405"))
 	// O_EXCL: дві сесії однієї ноди в ту саму секунду не обнуляють запис
-	// одна одній (os.Create робив O_TRUNC), і підкладений симлінк не відкриваємо.
-	f, err := os.OpenFile(filepath.Join(r.dir, name), os.O_WRONLY|os.O_CREATE|os.O_EXCL, recordFilePerm)
+	// одна одній (os.Create робив O_TRUNC), і підкладений симлінк не відкриваємо;
+	// зайняте імʼя — не відмова, а наступний суфікс.
+	f, err := createRecordFile(r.dir, r.nodeID, time.Now())
 	if err != nil {
-		log.Printf("record: файл %s не створився: %v", name, err)
+		log.Printf("record: файл сесії ноди %s не створився: %v", r.nodeID, err)
 		r.started = true
 		r.mkv = newMKVWriter(discardWriter{})
 		return false
@@ -429,15 +431,64 @@ func avcC(sps, pps []byte) []byte {
 	return append(b, pps...)
 }
 
-// safeNodeID — node_id приходить ВІД АГЕНТА, тобто ззовні, а ми робимо з нього
-// імʼя файлу. Лишаємо тільки [A-Za-z0-9._-]: інакше "../../etc/passwd" як node
-// став би шляхом, а не назвою.
 // recordDirPerm / recordFilePerm — права на записи сесій (SEC-аудит).
 const (
 	recordDirPerm  = 0o700
 	recordFilePerm = 0o600
 )
 
+// recordNameAttempts — скільки суфіксів пробуємо, коли імʼя вже зайняте (O_EXCL).
+const recordNameAttempts = 100
+
+// recordDirChmodWarned — щоб невдалий Chmod каталогу журналювався один раз.
+var recordDirChmodWarned atomic.Bool
+
+// ensureRecordDir створює каталог записів і ЗВУЖУЄ права вже наявного: MkdirAll
+// не чіпає каталог, створений колись як 0755, а в ньому лежать кадри чужих екранів.
+func ensureRecordDir(dir string) error {
+	if err := os.MkdirAll(dir, recordDirPerm); err != nil {
+		return err
+	}
+	fi, err := os.Stat(dir)
+	if err != nil {
+		return err
+	}
+	if fi.Mode().Perm()&^recordDirPerm != 0 {
+		if err := os.Chmod(dir, recordDirPerm); err != nil && recordDirChmodWarned.CompareAndSwap(false, true) {
+			log.Printf("record: права каталогу %s (%v) не звузились до %o: %v", dir, fi.Mode().Perm(), recordDirPerm, err)
+		}
+	}
+	return nil
+}
+
+// createRecordFile відкриває новий файл сесії з O_EXCL. Перша спроба —
+// "<node>-<UTC>.mkv"; якщо зайнято (друга сесія тієї ж ноди в ту саму секунду),
+// далі "<node>-<UTC>-2.mkv", "-3"... Розширення лишається .mkv, а лексикографічний
+// порядок у межах секунди — порядком створення до "-9" (прибирання все одно
+// сортує за mtime, див. recordprune.go).
+func createRecordFile(dir, node string, now time.Time) (*os.File, error) {
+	base := fmt.Sprintf("%s-%s", safeNodeID(node), now.UTC().Format("20060102-150405"))
+	var err error
+	for i := 1; i <= recordNameAttempts; i++ {
+		name := base + ".mkv"
+		if i > 1 {
+			name = fmt.Sprintf("%s-%d.mkv", base, i)
+		}
+		var f *os.File
+		f, err = os.OpenFile(filepath.Join(dir, name), os.O_WRONLY|os.O_CREATE|os.O_EXCL, recordFilePerm)
+		if err == nil {
+			return f, nil
+		}
+		if !errors.Is(err, fs.ErrExist) {
+			return nil, err
+		}
+	}
+	return nil, err
+}
+
+// safeNodeID — node_id приходить ВІД АГЕНТА, тобто ззовні, а ми робимо з нього
+// імʼя файлу. Лишаємо тільки [A-Za-z0-9._-]: інакше "../../etc/passwd" як node
+// став би шляхом, а не назвою.
 func safeNodeID(id string) string {
 	out := make([]byte, 0, len(id))
 	for i := 0; i < len(id) && i < 64; i++ {

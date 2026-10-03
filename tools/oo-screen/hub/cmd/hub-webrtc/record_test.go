@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -457,5 +458,52 @@ func TestMKVReadableWithoutClose(t *testing.T) {
 	}
 	if s.width != 640 || s.height != 480 {
 		t.Fatalf("заголовок недописаного файлу нечитабельний: %dx%d", s.width, s.height)
+	}
+}
+
+// Каталог, створений колись як 0755, звужується до 0700 при наступному записі.
+func TestRecordDirTightensExistingPerms(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "rec")
+	if err := os.Mkdir(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(dir, 0o755); err != nil { // umask не має вплинути на вихідний стан
+		t.Fatal(err)
+	}
+	if err := ensureRecordDir(dir); err != nil {
+		t.Fatal(err)
+	}
+	fi, err := os.Stat(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if runtime.GOOS != "windows" && fi.Mode().Perm() != recordDirPerm {
+		t.Fatalf("права каталогу %v, хочу %o", fi.Mode().Perm(), recordDirPerm)
+	}
+}
+
+// Дві (і більше) сесії однієї ноди в ту саму секунду дають РІЗНІ файли, і
+// жоден не обнулює інший; імена лишаються .mkv з префіксом ноди.
+func TestRecordFileUniqueWithinSameSecond(t *testing.T) {
+	dir := t.TempDir()
+	now := time.Date(2026, 10, 3, 12, 0, 0, 0, time.UTC)
+	seen := map[string]bool{}
+	for i := 0; i < 5; i++ {
+		f, err := createRecordFile(dir, "PC-1", now)
+		if err != nil {
+			t.Fatalf("спроба %d: %v", i, err)
+		}
+		name := filepath.Base(f.Name())
+		f.Close()
+		if seen[name] {
+			t.Fatalf("імʼя %s повторилось", name)
+		}
+		seen[name] = true
+		if !strings.HasPrefix(name, "PC-1-20261003-120000") || filepath.Ext(name) != ".mkv" {
+			t.Fatalf("неочікуване імʼя %s", name)
+		}
+	}
+	if !seen["PC-1-20261003-120000.mkv"] || !seen["PC-1-20261003-120000-2.mkv"] {
+		t.Fatalf("очікувані імена відсутні: %v", seen)
 	}
 }
