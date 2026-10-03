@@ -34,6 +34,7 @@ import {
     findMeshCanvas,
 } from './desktop-oo.js';
 import { createTileOverlay, TILES_LABEL } from './oo-text-tiles.js';
+import { applyLowLatency, createStatsOverlay } from './desktop-oo-stats.js';
 import {
     CURSOR_CHANNEL_LABEL,
     createCursorLayer,
@@ -458,6 +459,7 @@ export function createOoWebrtcLayer(o) {
     let textTiles = null;         // STAGE3-444 B: canvas з lossless тайлами тексту (config.textTiles)
     let tilesChannel = null;
     let cursorLayer = null;       // config.cursorLayer: окремий курсор (desktop-oo-cursor.js)
+    let statsOverlay = null;      // getStats()-оверлей (Ctrl+Alt+S); config.statsOverlay === false — вимкнено
 
     const session = createOoSession({
         firstFrameMs: config.firstFrameMs,
@@ -636,6 +638,9 @@ export function createOoWebrtcLayer(o) {
         if (video) video.addEventListener('resize', () => syncGeometry()); // зміна videoWidth/Height
         watchDpr();
         makeToggle();
+        if (config.statsOverlay !== false && !statsOverlay) {
+            statsOverlay = createStatsOverlay({ container, doc, getPc: () => pc });
+        }
     }
 
     // ── фолбек ───────────────────────────────────────────────────────────────
@@ -657,6 +662,7 @@ export function createOoWebrtcLayer(o) {
         if (resizeObserver) { try { resizeObserver.disconnect(); } catch (e) { /* ignore */ } resizeObserver = null; }
         if (attrObserver) { try { attrObserver.disconnect(); } catch (e) { /* ignore */ } attrObserver = null; }
         unwatchDpr();
+        if (statsOverlay) { try { statsOverlay.destroy(); } catch (e) { /* ignore */ } statsOverlay = null; }
         if (toggleBtn) { if (toggleBtn.parentNode) { try { toggleBtn.parentNode.removeChild(toggleBtn); } catch (e) { /* ignore */ } } toggleBtn = null; }
         // Mesh-canvas має повернутись до свого розміру ДО того, як ним знову
         // керує Mesh (фолбек), інакше його мапінг пішов би від нашого 1:1.
@@ -870,6 +876,9 @@ export function createOoWebrtcLayer(o) {
             // поки його не розглушать (setMuted нижче). Ніхто не має несподівано
             // почути чужий кабінет.
             if (ev.track && ev.track.kind !== 'video') return;
+            // Low latency: мінімальний jitter-буфер (config.lowLatency, за замовч. true).
+            // Feature-detect усередині — Firefox просто пропускає.
+            if (config.lowLatency !== false) applyLowLatency([ev.receiver]);
             video.srcObject = (ev.streams && ev.streams[0]) || new MediaStream([ev.track]);
             const p = video.play();
             if (p && typeof p.catch === 'function') p.catch(() => { /* autoplay muted — не має падати */ });
