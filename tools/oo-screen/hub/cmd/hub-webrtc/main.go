@@ -92,6 +92,16 @@ func envOr(k, def string) string {
 
 const defaultToken = "t1-dev-token"
 
+// srtpReplayWindow — вікно SRTP/SRTCP replay protection (B6). Змінна, а не
+// константа, лише щоб bench міг зняти «до» тим самим бінарем
+// (OO_SCREEN_SRTP_REPLAY_WINDOW=64); у проді env не задається.
+var srtpReplayWindow = func() uint {
+	if v, err := strconv.Atoi(os.Getenv("OO_SCREEN_SRTP_REPLAY_WINDOW")); err == nil && v > 0 {
+		return uint(v)
+	}
+	return 1024
+}()
+
 var token = envOr("OO_SCREEN_T1_TOKEN", defaultToken)
 
 // listenAddr — адреса HTTP-сигналінгу. Дефолт той самий :4470, тож ні бенчі, ні
@@ -674,6 +684,14 @@ func newAPI(profile string) (*webrtc.API, error) {
 	}
 
 	se := webrtc.SettingEngine{}
+	// B6: вікно захисту від повтору SRTP/SRTCP — 1024 (як у libwebrtc) на ОБОХ
+	// ногах: newAPI спільний для агента і глядачів. Дефолт pion — 64 пакети:
+	// на нозі агент->хаб NACK-ретрансмісія приходить через RTT + опит NACK
+	// (100 мс у pion), тобто через сотні пакетів IDR-пачки, і SRTP-шар хаба
+	// мовчки її відкидав як «повтор» — кадр лишався дірявим для ВСІХ глядачів
+	// ноди. Замір: bench/RESULTS-hub.md, «### B6–B7».
+	se.SetSRTPReplayProtectionWindow(srtpReplayWindow)
+	se.SetSRTCPReplayProtectionWindow(srtpReplayWindow)
 	// Базово — host-кандидати по UDP, як і було. H-19: TCP додається лише тоді,
 	// коли для нього ЯВНО задано порт (див. applyICETCPMux нижче); порожній env
 	// лишає рівно колишню поведінку.

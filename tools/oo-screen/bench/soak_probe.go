@@ -98,7 +98,14 @@ func main() {
 		fmt.Println("interceptors:", err)
 		os.Exit(2)
 	}
-	api := webrtc.NewAPI(webrtc.WithMediaEngine(m), webrtc.WithInterceptorRegistry(ir))
+	// B6: вікно SRTP/SRTCP replay — 1024, як у libwebrtc. Дефолт pion 64:
+	// NACK-ретрансмісія, що приходить через >64 пакети (800 пак/с x RTT +
+	// опит NACK), мовчки відкидається SRTP-шаром — проба бачила б втрату,
+	// якої браузер не має (bench/RESULTS-network.md, «Пастки»).
+	se := webrtc.SettingEngine{}
+	se.SetSRTPReplayProtectionWindow(1024)
+	se.SetSRTCPReplayProtectionWindow(1024)
+	api := webrtc.NewAPI(webrtc.WithMediaEngine(m), webrtc.WithInterceptorRegistry(ir), webrtc.WithSettingEngine(se))
 	pc, err := api.NewPeerConnection(webrtc.Configuration{})
 	if err != nil {
 		fmt.Println("pc:", err)

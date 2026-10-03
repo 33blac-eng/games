@@ -16,6 +16,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"os/exec"
@@ -113,6 +114,13 @@ func main() {
 	queueMs := flag.Int("queue-ms", 100, "черга вузького місця, мс при -cap")
 	nackIvl := flag.Duration("nack-interval", 100*time.Millisecond, "інтервал NACK-генератора viewer-а (дефолт pion 100 мс)")
 	fastup := flag.Bool("fastup", false, "OO_SCREEN_BITRATE_FASTUP=1 на хабі")
+	// B6: вади на нозі АГЕНТ->хаб (друге реле + MITM сигналінгу агента).
+	// Медіа агента йде через Uplink реле, RTCP хаба (NACK/PLI) — Downlink;
+	// втрати — обидва боки, як -loss. Нога хаб->глядач при цьому чиста,
+	// якщо -loss не задано.
+	agentLoss := flag.Float64("agent-loss", 0, "рівномірні втрати на нозі агент<->хаб, 0..1")
+	agentRTT := flag.Duration("agent-rtt", 0, "доданий RTT на нозі агент<->хаб")
+	hubEnv := flag.String("hub-env", "", "додаткові env хаба через кому (K=V,K=V)")
 	flag.Parse()
 
 	if *logdir == "" {
@@ -143,6 +151,12 @@ func main() {
 	if *fastup {
 		env = append(env, "OO_SCREEN_BITRATE_FASTUP=1")
 	}
+	if *hubEnv != "" {
+		env = append(env, strings.Split(*hubEnv, ",")...)
+	}
+	res.Args["agent_loss"] = *agentLoss
+	res.Args["agent_rtt_ms"] = agentRTT.Milliseconds()
+	res.Args["hub_env"] = *hubEnv
 	hub := exec.Command(*hubBin)
 	hub.Env = env
 	hub.Dir = filepath.Dir(*hubBin)
@@ -179,9 +193,70 @@ func main() {
 	defer kill(hub)
 	waitTCP(*port)
 
+	// --- реле агента: агент шле offer на MITM, той переписує кандидатів на
+	// сокети реле і пересилає хабу. Без -agent-loss/-agent-rtt — напряму.
+	clean := impair.Config{}
+	hubAgentURL := fmt.Sprintf("http://127.0.0.1:%d/offer/agent", *port)
+	agentURL := hubAgentURL
+	var apx *impair.Proxy
+	if *agentLoss > 0 || *agentRTT > 0 {
+		var err error
+		apx, err = impair.NewProxy(clean, clean, time.Now().UnixNano()+7)
+		must(err)
+		defer apx.Close()
+		ln, err := net.Listen("tcp", "127.0.0.1:0")
+		must(err)
+		defer ln.Close()
+		go http.Serve(ln, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			var req map[string]any
+			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+				http.Error(w, err.Error(), 400)
+				return
+			}
+			sdp, _ := req["sdp"].(string)
+			osdp, err := impair.Rewrite(sdp, apx.Up)
+			if err != nil {
+				http.Error(w, err.Error(), 400)
+				return
+			}
+			req["sdp"] = osdp
+			body, _ := json.Marshal(req)
+			resp, err := http.Post(hubAgentURL, "application/json", bytes.NewReader(body))
+			if err != nil {
+				http.Error(w, err.Error(), 502)
+				return
+			}
+			rb, _ := io.ReadAll(resp.Body)
+			resp.Body.Close()
+			if resp.StatusCode != 200 {
+				w.WriteHeader(resp.StatusCode)
+				w.Write(rb)
+				return
+			}
+			var ans map[string]any
+			if err := json.Unmarshal(rb, &ans); err != nil {
+				http.Error(w, err.Error(), 502)
+				return
+			}
+			asdp, _ := ans["sdp"].(string)
+			if err := apx.LearnHub(asdp); err != nil {
+				http.Error(w, err.Error(), 502)
+				return
+			}
+			if ans["sdp"], err = impair.Rewrite(asdp, apx.Down); err != nil {
+				http.Error(w, err.Error(), 502)
+				return
+			}
+			jb, _ := json.Marshal(ans)
+			w.Header().Set("Content-Type", "application/json")
+			w.Write(jb)
+		}))
+		agentURL = "http://" + ln.Addr().String() + "/offer/agent"
+	}
+
 	// --- агент ---
 	ag := exec.Command(*agentBin)
-	ag.Env = append(os.Environ(), "OO_SCREEN_T1_TOKEN="+benchToken, fmt.Sprintf("OO_SCREEN_HUB_URL=http://127.0.0.1:%d/offer/agent", *port),
+	ag.Env = append(os.Environ(), "OO_SCREEN_T1_TOKEN="+benchToken, "OO_SCREEN_HUB_URL="+agentURL,
 		"OO_CORPUS_LADDER="+*ladder)
 	agLog, _ := os.Create(filepath.Join(*logdir, "agent.log"))
 	defer agLog.Close()
@@ -202,7 +277,6 @@ func main() {
 	time.Sleep(3 * time.Second)
 
 	// --- реле + viewer ---
-	clean := impair.Config{}
 	px, err := impair.NewProxy(clean, clean, time.Now().UnixNano())
 	if err != nil {
 		log.Fatal(err)
@@ -334,12 +408,21 @@ func main() {
 	time.Sleep(time.Until(t0))
 	px.Downlink.Set(down)
 	px.Uplink.Set(up)
+	if apx != nil {
+		ac := impair.Config{Loss: *agentLoss, Delay: *agentRTT / 2}
+		apx.Downlink.Set(ac)
+		apx.Uplink.Set(ac)
+	}
 	d0, _, _ := px.Stats.Snapshot()
 	nack0 := nackPkts.Load()
 	pli0 := pliPkts.Load()
 	time.Sleep(*imp)
 	px.Downlink.Set(clean)
 	px.Uplink.Set(clean)
+	if apx != nil {
+		apx.Downlink.Set(clean)
+		apx.Uplink.Set(clean)
+	}
 	pliImp := pliPkts.Load() - pli0
 	time.Sleep(*post)
 	time.Sleep(time.Second) // хвости ретрансмісій

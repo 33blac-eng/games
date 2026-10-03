@@ -163,6 +163,11 @@ func newWebRTCAPI() (*webrtc.API, error) {
 	}
 	se := webrtc.SettingEngine{}
 	se.SetNetworkTypes([]webrtc.NetworkType{webrtc.NetworkTypeUDP4, webrtc.NetworkTypeUDP6})
+	// B6: агент медіа не приймає (лише шле RTP; datachannel — SCTP, не SRTP),
+	// але отримує SRTCP від хаба (NACK, PLI, RR/REMB). Вікно 1024 — як у
+	// хаба і libwebrtc, щоб пізній чи переставлений RTCP не відкидався мовчки.
+	se.SetSRTPReplayProtectionWindow(1024)
+	se.SetSRTCPReplayProtectionWindow(1024)
 	return webrtc.NewAPI(webrtc.WithMediaEngine(m), webrtc.WithInterceptorRegistry(i), webrtc.WithSettingEngine(se)), nil
 }
 
