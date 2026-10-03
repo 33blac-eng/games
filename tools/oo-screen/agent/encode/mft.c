@@ -1,3 +1,5 @@
+//go:build windows
+
 /* mft.c — hardware Media Foundation H.264 encoder (Ф0, plan §5.1/§5.2/§5.5).
  *
  * Pipeline:

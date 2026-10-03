@@ -1,3 +1,5 @@
+//go:build windows
+
 /* dxgi.c — DXGI Desktop Duplication + cursor composite + GPU BGRA->NV12.
  *
  * Pipeline, created once and reused for every frame (Ф0 plan §4):
