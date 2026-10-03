@@ -114,18 +114,24 @@ func TestSecT04ERPBodyBounded(t *testing.T) {
 	}
 }
 
-// SecT05 (KnownFAIL, низький): у помилці consume (а далі в журнал хаба) їде
-// ВСЕ тіло відповіді ERP без обрізання. Якщо ERP колись віддзеркалить квиток
-// чи внутрішні дані — вони потраплять у journald.
-func TestSecT05ERPErrorBodyLoggedVerbatimKnownFAIL(t *testing.T) {
+// SecT05 (FIXED, SEC #28): тіло помилки ERP у помилці consume (а далі в
+// журналі хаба) обрізане до 200 символів і без квитка/токеноподібних рядків.
+func TestSecT05ERPErrorBodyRedacted(t *testing.T) {
+	long := "echo:jti-SECRET " + strings.Repeat("x", 1000) + " eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjMifQ.c2lnbmF0dXJlLXNpZw"
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(403)
-		_, _ = w.Write([]byte("echo:jti-SECRET"))
+		_, _ = w.Write([]byte(long))
 	}))
 	defer srv.Close()
 	_, err := ConsumeTicket(srv.URL, "k", "jti-SECRET")
-	if err == nil || !strings.Contains(err.Error(), "jti-SECRET") {
-		t.Fatalf("err=%v — тіло ERP більше не потрапляє в помилку: переверніть тест", err)
+	if err == nil || strings.Contains(err.Error(), "jti-SECRET") {
+		t.Fatalf("err=%v — квиток у помилці", err)
+	}
+	if len(err.Error()) > 300 {
+		t.Fatalf("помилка не обрізана: %d байт", len(err.Error()))
+	}
+	if got := redactBody("a eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjMifQ.c2lnbmF0dXJlLXNpZw b", ""); strings.Contains(got, "eyJ") {
+		t.Fatalf("JWT не вирізано: %q", got)
 	}
 }
 
