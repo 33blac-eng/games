@@ -37,7 +37,7 @@ import (
 func main() {
 	log.SetFlags(log.Ltime | log.Lmicroseconds)
 	if len(os.Args) < 2 {
-		fmt.Fprintln(os.Stderr, "usage: hubbench erp|scale|ttff|baseline|agent|watch|soak [flags]")
+		fmt.Fprintln(os.Stderr, "usage: hubbench erp|scale|ttff|baseline|agent|watch|latwatch|soak [flags]")
 		os.Exit(2)
 	}
 	cmd, args := os.Args[1], os.Args[2:]
@@ -46,6 +46,8 @@ func main() {
 		cmdERP(args)
 	case "scale":
 		cmdScale(args)
+	case "latwatch":
+		cmdLatWatch(args)
 	case "ttff":
 		cmdTTFF(args)
 	case "baseline":
@@ -412,6 +414,7 @@ func cmdAgent(args []string) {
 	var c common
 	c.register(fs)
 	node := fs.String("node", "rc", "node_id")
+	sendlog := fs.String("sendlog", "", "писати (хеш payload, час) кожного пакета у файл — для latwatch")
 	fs.Parse(args)
 	t0 := time.Now()
 	cor, err := loadCorpus(c.corpusPath)
@@ -419,8 +422,16 @@ func cmdAgent(args []string) {
 		log.Fatal(err)
 	}
 	api, _ := newAPI(cor.profile)
-	if _, err := startAgent(api, cor, c.hub, c.token, *node, nil, true); err != nil {
+	a, err := startAgent(api, cor, c.hub, c.token, *node, nil, true)
+	if err != nil {
 		log.Fatal(err)
+	}
+	if *sendlog != "" {
+		fl, err := newFileSendLog(*sendlog)
+		if err != nil {
+			log.Fatal(err)
+		}
+		a.setFileLog(fl)
 	}
 	fmt.Printf("{\"ev\":\"agent_streaming\",\"t\":%d,\"start\":%d}\n", time.Now().UnixNano(), t0.UnixNano())
 	select {}

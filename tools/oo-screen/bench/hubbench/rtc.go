@@ -181,7 +181,10 @@ type agent struct {
 	pli      atomic.Int64
 	stop     chan struct{}
 	stopOnce sync.Once
+	flog     atomic.Pointer[fileSendLog] // latwatch: лог відправки у файл
 }
+
+func (a *agent) setFileLog(l *fileSendLog) { a.flog.Store(l) }
 
 func startAgent(api *webrtc.API, c *corpus, hub, token, node string, sent *sendLog, honorPLI bool) (*agent, error) {
 	pc, err := api.NewPeerConnection(webrtc.Configuration{})
@@ -268,6 +271,9 @@ func (a *agent) run() {
 		for _, p := range pk.Packetize(au.Data, 1500) {
 			if a.sent != nil {
 				a.sent.put(p.Payload, time.Now().UnixNano())
+			}
+			if fl := a.flog.Load(); fl != nil {
+				fl.put(payloadHash(p.Payload), time.Now().UnixNano())
 			}
 			if err := a.track.WriteRTP(p); err != nil {
 				return

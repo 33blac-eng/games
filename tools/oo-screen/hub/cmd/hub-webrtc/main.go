@@ -33,6 +33,7 @@ import (
 	"net/url"
 	"os"
 	"os/signal"
+	"runtime"
 	"sort"
 	"strconv"
 	"strings"
@@ -1735,6 +1736,7 @@ func forwardToViewers(ns *nodeSession, gen uint64, pkt *rtp.Packet) {
 	out := &rtp.Packet{Header: pkt.Header, Payload: pkt.Payload}
 	out.SequenceNumber = outSeq
 	out.Timestamp = outTS
+	fanoutLatMark(outSeq, time.Now())
 
 	// Пункт 41: той самий вказівник осідає в кеші GOP — нова нога отримає його
 	// звідти, а не чекатиме наступного IDR.
@@ -2233,6 +2235,12 @@ func main() {
 	// сигналінгу: /debug/pprof віддає дампи горутин і профілі, і на проді він
 	// не має бути досяжний з того ж порту, що й /offer/*. Порожній env = вимкнено.
 	if addr := os.Getenv("OO_SCREEN_PPROF_ADDR"); addr != "" {
+		// B7: профілі мʼютексів і блокувань — лише разом із pprof і за явним
+		// OO_SCREEN_PPROF_CONTENTION=1 (вони мають ціну на кожен Lock/park).
+		if os.Getenv("OO_SCREEN_PPROF_CONTENTION") == "1" {
+			runtime.SetMutexProfileFraction(5)
+			runtime.SetBlockProfileRate(int(10 * time.Microsecond))
+		}
 		go func() {
 			log.Printf("pprof on %s (діагностика; НЕ вмикати на публічному інтерфейсі)", addr)
 			log.Printf("pprof exited: %v", http.ListenAndServe(addr, nil))

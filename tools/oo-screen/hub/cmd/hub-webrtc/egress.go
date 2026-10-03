@@ -206,7 +206,14 @@ func (e *egressConn) sendTo(batch []egressPkt, idx []int, to netip.AddrPort, scr
 		for _, j := range idx[k:end] {
 			scratch = append(scratch, *batch[j].buf...)
 		}
-		if err := writeGSO(e.c, scratch, seg, to); err != nil {
+		err := writeGSO(e.c, scratch, seg, to)
+		if err == nil && fanoutLatOn {
+			now := time.Now().UnixNano()
+			for _, j := range idx[k:end] {
+				fanoutLatSent(*batch[j].buf, now)
+			}
+		}
+		if err != nil {
 			// Ядро/драйвер не вміє — вимикаємо GSO назавжди і шлемо ту
 			// саму серію по пакету: жоден пакет не губиться через спробу.
 			if e.gso.Swap(false) {
@@ -224,7 +231,9 @@ func (e *egressConn) sendTo(batch []egressPkt, idx []int, to netip.AddrPort, scr
 func (e *egressConn) write(b []byte, to netip.AddrPort) {
 	if _, err := e.c.WriteToUDPAddrPort(b, to); err != nil {
 		e.noteErr(err)
+		return
 	}
+	fanoutLatSent(b, time.Now().UnixNano())
 }
 
 func (e *egressConn) noteErr(err error) {
