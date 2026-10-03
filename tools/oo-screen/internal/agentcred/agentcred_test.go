@@ -1,6 +1,10 @@
 package agentcred
 
 import (
+	"bytes"
+	"crypto/sha256"
+	"encoding/base64"
+	"encoding/hex"
 	"os"
 	"path/filepath"
 	"testing"
@@ -38,5 +42,38 @@ func TestResolveTokenOrder(t *testing.T) {
 	}
 	if _, _, err := ResolveToken("cli", empty+".missing", get); err == nil {
 		t.Fatal("відсутній файл прийнято — тихий фолбек на слабше джерело")
+	}
+}
+
+// SEC #32: дефолт — повна перевірка; пін — точний збіг відбитка; insecure — лише явно.
+func TestWTTLSConfig(t *testing.T) {
+	c := WTTLSConfig("hub.example:4460", []string{"a"}, nil, false)
+	if c.InsecureSkipVerify || c.ServerName != "hub.example" || c.VerifyPeerCertificate != nil {
+		t.Fatalf("дефолт без перевірки: %+v", c)
+	}
+	if !WTTLSConfig("h:1", nil, nil, true).InsecureSkipVerify {
+		t.Fatal("-wt-insecure не вимкнув перевірку")
+	}
+	der := []byte("fake-cert-der")
+	sum := sha256.Sum256(der)
+	pin, err := ParsePin(base64.StdEncoding.EncodeToString(sum[:]))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p2, err := ParsePin(hex.EncodeToString(sum[:])); err != nil || !bytes.Equal(p2, pin) {
+		t.Fatalf("hex-пін: %v", err)
+	}
+	if _, err := ParsePin("abcd"); err == nil {
+		t.Fatal("короткий пін прийнято")
+	}
+	c = WTTLSConfig("h:1", nil, pin, false)
+	if err := c.VerifyPeerCertificate([][]byte{der}, nil); err != nil {
+		t.Fatalf("свій сертифікат відхилено: %v", err)
+	}
+	if err := c.VerifyPeerCertificate([][]byte{[]byte("evil")}, nil); err == nil {
+		t.Fatal("чужий сертифікат прийнято")
+	}
+	if err := c.VerifyPeerCertificate(nil, nil); err == nil {
+		t.Fatal("порожній ланцюг прийнято")
 	}
 }

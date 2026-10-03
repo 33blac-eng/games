@@ -26,6 +26,10 @@ oo-agent -transport webrtc -hub http://127.0.0.1:4470/offer/agent -fps 60 -bitra
 неіснуючий індекс клампиться до 0, а не валить агента), `-switch-addr`
 (локальний HTTP для перемикання монітора, див. нижче).
 
+Легасі `wt` (SEC #32): сертифікат hub-wt перевіряється за замовчуванням.
+Самопідписаний hub-wt — `-wt-cert-sha256 <CERT_HASH з виводу hub-wt>` (base64
+або hex); `-wt-insecure` вимикає перевірку (лише стенд).
+
 Windows-only (build tag). `main_stub.go` тримає `GOOS=linux go build ./agent/...`
 зеленим.
 

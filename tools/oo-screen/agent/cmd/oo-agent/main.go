@@ -10,7 +10,6 @@ import (
 	"bufio"
 	"bytes"
 	"context"
-	"crypto/tls"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -158,6 +157,13 @@ var nodeID string
 // користувачу — тому -token-file.
 var cliToken string
 
+// wtCertPin / wtInsecure — TLS легасі-транспорту wt (SEC #32), з прапорців
+// -wt-cert-sha256 / -wt-insecure.
+var (
+	wtCertPin  []byte
+	wtInsecure bool
+)
+
 // startBitrateBps — фактичне значення -bitrate, з яким підняли агента. Їде в
 // offer, щоб hub рахував стелю bitrate_target від нього, а не від свого
 // дефолту. Читається лише з dialWebRTC, який стартує після main() присвоїв.
@@ -195,10 +201,9 @@ type wtTransport struct {
 }
 
 func dialWT(hubAddr string, onKeyframeRequest func(), onBitrateTarget func(uint64), onSelectOutput func(int)) (*wtTransport, error) {
-	tlsConf := &tls.Config{
-		InsecureSkipVerify: true, // T1/T2: самопідписаний сертифікат hub-wt
-		NextProtos:         []string{agentALPN},
-	}
+	// SEC #32: перевірка сертифіката за замовчуванням; самопідписаний hub-wt —
+	// через пінінг -wt-cert-sha256 (його CERT_HASH=), -wt-insecure — лише стенд.
+	tlsConf := agentcred.WTTLSConfig(hubAddr, []string{agentALPN}, wtCertPin, wtInsecure)
 	dialCtx, cancel := context.WithTimeout(context.Background(), dialTimeout)
 	defer cancel()
 	conn, err := quic.DialAddr(dialCtx, hubAddr, tlsConf, &quic.Config{})
@@ -1280,6 +1285,8 @@ func main() {
 	node := flag.String("node", "", "mesh node_id цього ПК (webrtc): hub реєструє publisher-а під ним і маршрутизує viewer-ів сюди; порожнє = старий T1-режим (node з env на hub)")
 	forceSoftware := flag.Bool("force-software", false, "пропустити апаратний енум і взяти софтверний Microsoft H264 MFT (CPU NV12 sync-шлях) — для відтворення софт-шляху на машині з hw-енкодером")
 	tokenFlag := flag.String("token", "", "ЗАСТАРІЛО (видно в командному рядку): hub-токен агента; замість нього -token-file або env OO_AGENT_TOKEN")
+	wtPin := flag.String("wt-cert-sha256", "", "wt: SHA-256 сертифіката hub-wt (hex або base64 з його CERT_HASH=) — пінінг самопідписаного сертифіката")
+	wtInsecureFlag := flag.Bool("wt-insecure", false, "wt: НЕ перевіряти сертифікат hub-wt (лише стенд; MITM)")
 	tokenFile := flag.String("token-file", "", "файл із hub-токеном агента (ACL: лише SYSTEM/Administrators); перекриває OO_AGENT_TOKEN і -token")
 	logPath := flag.String("log", "", "шлях до файлу логу; якщо задано — увесь вивід іде туди (GUI-режим -H windowsgui без консолі, stdout нема)")
 	audioFlag := flag.Bool("audio", false, "передавати звук ПК (перекриває env OO_SCREEN_AUDIO=1)")
@@ -1329,6 +1336,18 @@ func main() {
 	}
 	log.Printf("oo-agent: токен агента з %s", tokSrc)
 	cliToken = tok
+
+	if *wtPin != "" {
+		pin, perr := agentcred.ParsePin(*wtPin)
+		if perr != nil {
+			log.Fatalf("oo-agent: %v", perr)
+		}
+		wtCertPin = pin
+	}
+	wtInsecure = *wtInsecureFlag
+	if wtInsecure && wtCertPin == nil && *transportKind == "wt" {
+		log.Printf("oo-agent: WARNING — -wt-insecure: сертифікат hub-wt не перевіряється (лише стенд)")
+	}
 
 	nodeID = *node
 
