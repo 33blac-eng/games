@@ -74,8 +74,29 @@ func newAPI(profile string) (*webrtc.API, error) {
 	if debugPkts > 0 {
 		i.Add(rawLogFactory{})
 	}
-	if err := webrtc.RegisterDefaultInterceptors(m, i); err != nil {
-		return nil, err
+	// Набір pion за замовчуванням, але без stats-interceptor (B7): вимірювач
+	// GetStats не кличе, а stats на КОЖЕН прийнятий пакет кожної з N ніг бере
+	// мʼютекс і time.Now() — це ціна клієнта, яка інакше осідає в «затримці
+	// хаба» (клієнт на 2 ядрах приймає ту саму IDR-пачку N разів). NACK, RR/SR
+	// і TWCC лишаються — їх веде й браузер, і хаб має бачити ту саму картину.
+	// HUBBENCH_PION_STATS=1 — повний дефолтний набір.
+	if os.Getenv("HUBBENCH_PION_STATS") == "1" {
+		if err := webrtc.RegisterDefaultInterceptors(m, i); err != nil {
+			return nil, err
+		}
+	} else {
+		if err := webrtc.ConfigureNack(m, i); err != nil {
+			return nil, err
+		}
+		if err := webrtc.ConfigureRTCPReports(i); err != nil {
+			return nil, err
+		}
+		if err := webrtc.ConfigureSimulcastExtensionHeaders(m); err != nil {
+			return nil, err
+		}
+		if err := webrtc.ConfigureTWCCSender(m, i); err != nil {
+			return nil, err
+		}
 	}
 	se := webrtc.SettingEngine{}
 	se.SetNetworkTypes([]webrtc.NetworkType{webrtc.NetworkTypeUDP4})
