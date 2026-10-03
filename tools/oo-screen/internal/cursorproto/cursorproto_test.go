@@ -2,6 +2,7 @@ package cursorproto
 
 import (
 	"bytes"
+	"encoding/hex"
 	"errors"
 	"image/png"
 	"testing"
@@ -178,6 +179,22 @@ func TestFromDXGIColor(t *testing.T) {
 	}
 	if _, _, ok := FromDXGI(9, 1, 1, 4, []byte{0, 0, 0, 0}); ok {
 		t.Error("accepted unknown kind")
+	}
+}
+
+// TestGoldenVectors pins the wire bytes; the same hex is asserted by the
+// player's node test (total-erp-app/resources/js/remote/__tests__/cursor-layer.test.mjs).
+func TestGoldenVectors(t *testing.T) {
+	pos := EncodePos(Pos{Visible: true, ShapeID: 0x01020304, X: -2, Y: 300, FrameW: 1920, FrameH: 1080})
+	if got := hex.EncodeToString(pos); got != "4301010004030201feffffff2c01000080073804" {
+		t.Fatalf("pos golden: %s", got)
+	}
+	sh, err := EncodeShape(Shape{ID: 7, Format: FormatRGBA, W: 1, H: 1, Data: []byte{1, 2, 3, 4}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := hex.EncodeToString(sh); got != "4302000007000000010001000000000001020304" {
+		t.Fatalf("shape golden: %s", got)
 	}
 }
 

@@ -34,6 +34,11 @@ import {
     findMeshCanvas,
 } from './desktop-oo.js';
 import { createTileOverlay, TILES_LABEL } from './oo-text-tiles.js';
+import {
+    CURSOR_CHANNEL_LABEL,
+    createCursorLayer,
+    resolveCursorRole,
+} from './desktop-oo-cursor.js';
 
 export { OO_STATE_CONNECTING, OO_STATE_LIVE, OO_STATE_FALLBACK, OO_STATE_CLOSED };
 
@@ -406,6 +411,18 @@ export function mapClientToRemote(clientX, clientY, rect, srcW, srcH) {
     return { x, y };
 }
 
+// Зворотний мапінг для шару курсора: піксель віддаленого кадру (x,y у
+// srcW×srcH) → точка відносно лівого верхнього кута rect (той самий contain-
+// бокс, що й mapClientToRemote). scale — CSS-пікселів на піксель кадру
+// (оверлей курсора масштабується разом із картинкою). null — нема геометрії.
+export function mapRemoteToClient(x, y, rect, srcW, srcH) {
+    if (!rect || !(srcW > 0) || !(srcH > 0)) return null;
+    const b = containBox(rect.width, rect.height, srcW, srcH);
+    if (!(b.width > 0) || !(b.height > 0)) return null;
+    const scale = b.width / srcW;
+    return { x: b.x + x * scale, y: b.y + y * (b.height / srcH), scale };
+}
+
 export function createOoWebrtcLayer(o) {
     const opts = o || {};
     const container = opts.container;
@@ -440,6 +457,7 @@ export function createOoWebrtcLayer(o) {
     let meshWritten = null;       // що ми самі записали в ці стилі востаннє
     let textTiles = null;         // STAGE3-444 B: canvas з lossless тайлами тексту (config.textTiles)
     let tilesChannel = null;
+    let cursorLayer = null;       // config.cursorLayer: окремий курсор (desktop-oo-cursor.js)
 
     const session = createOoSession({
         firstFrameMs: config.firstFrameMs,
@@ -549,6 +567,7 @@ export function createOoWebrtcLayer(o) {
             textTiles.place(mr.left - cr.left + container.scrollLeft, mr.top - cr.top + container.scrollTop,
                 mr.width, mr.height);
         }
+        if (cursorLayer) cursorLayer.relayout();
     }
 
     // Зміна dpr (перетяг вікна на інший монітор, Ctrl+/-) ResizeObserver не
@@ -642,6 +661,7 @@ export function createOoWebrtcLayer(o) {
         // Mesh-canvas має повернутись до свого розміру ДО того, як ним знову
         // керує Mesh (фолбек), інакше його мапінг пішов би від нашого 1:1.
         restoreMesh();
+        if (cursorLayer) { try { cursorLayer.destroy(); } catch (e) { /* ignore */ } cursorLayer = null; }
         if (abort) { try { abort.abort(); } catch (e) { /* ignore */ } abort = null; }
         if (video) {
             if (rvfcHandle && typeof video.cancelVideoFrameCallback === 'function') {
@@ -774,6 +794,41 @@ export function createOoWebrtcLayer(o) {
         }
     }
 
+    function attachCursorChannel(peer, gen) {
+        let dc;
+        try {
+            dc = peer.createDataChannel(CURSOR_CHANNEL_LABEL);
+        } catch (e) { return; } // без курсора, але відео живе
+        dc.binaryType = 'arraybuffer';
+        if (cursorLayer) { try { cursorLayer.destroy(); } catch (e) { /* ignore */ } }
+        const layer = createCursorLayer({
+            doc,
+            container,
+            role: resolveCursorRole(config),
+            // Ввід ловить Mesh-canvas (відео — pointer-events:none).
+            targets: () => [meshCanvas, container],
+            place: (p) => {
+                if (!video || !p) return null;
+                const srcW = p.frameW || video.videoWidth;
+                const srcH = p.frameH || video.videoHeight;
+                const vr = video.getBoundingClientRect();
+                const cr = container.getBoundingClientRect();
+                const m = mapRemoteToClient(p.x, p.y, vr, srcW, srcH);
+                if (!m) return null;
+                return {
+                    x: vr.left - cr.left + container.scrollLeft + m.x,
+                    y: vr.top - cr.top + container.scrollTop + m.y,
+                    scale: m.scale,
+                };
+            },
+        });
+        cursorLayer = layer;
+        dc.onmessage = (ev) => {
+            if (!session.isCurrent(gen) || cursorLayer !== layer) return;
+            layer.onMessage(ev.data);
+        };
+    }
+
     async function connect(gen) {
         const peer = new RTCPeerConnection({ iceServers: config.iceServers || [] });
         pc = peer;
@@ -796,6 +851,11 @@ export function createOoWebrtcLayer(o) {
                 textTiles.onMessage(ev.data);
             };
         }
+        // Шар курсора — ЛИШЕ під config.cursorLayer (типово вимкнено; агентові
+        // потрібен -cursor-layer). Канал відкриває браузер ДО offer-а, хаб ловить
+        // його спільним диспетчером OnDataChannel viewer-ноги (як input/tiles).
+        // Без прапорця offer бітово той самий, що й раніше.
+        if (config.cursorLayer) attachCursorChannel(peer, gen);
 
         peer.ontrack = (ev) => {
             if (!session.isCurrent(gen) || !video) return;
