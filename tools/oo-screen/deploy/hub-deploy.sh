@@ -60,6 +60,11 @@ UNIT="${args[1]}"
 [[ "$TIMEOUT" =~ ^[0-9]+$ && "$SMOKE_PORT" =~ ^[0-9]+$ ]] || die "--timeout і --smoke-port мають бути числами"
 [[ "$UNIT" =~ ^[A-Za-z0-9@._-]+$ ]] || die "дивне імʼя юніта: $UNIT"
 [[ "$REMOTE_DIR" =~ ^/[A-Za-z0-9/._-]+$ ]] || die "дивний --remote-dir: $REMOTE_DIR"
+# Повторний аудит: host починається з «-» -> ssh/scp прочитали б його як опцію
+# (-oProxyCommand=...); лапки в --health-url розірвали б '...' у віддаленій команді.
+[[ "$HOST" =~ ^[A-Za-z0-9_][A-Za-z0-9@._:-]*$ ]] || die "дивний ssh-host: $HOST"
+url_re='^https?://[]A-Za-z0-9._:/%?=&+[-]+$'
+[[ "$HEALTH_URL" =~ $url_re ]] || die "дивний --health-url: $HEALTH_URL"
 
 # ---- локальна перевірка збірки ----
 BIN="$DIST/hub-linux-amd64"
@@ -101,10 +106,13 @@ fi
 # Хаб не має -version; натомість піднімаємо НОВИЙ бінар (з одноразовим T1-токеном,
 # бо дефолтний хаб відмовляється приймати) на
 # 127.0.0.1:SMOKE_PORT (ICE на SMOKE_PORT+1, щоб не зачепити робочий 4544) і чекаємо /healthz.
-smoke="cd '$REMOTE_DIR' && OO_SCREEN_T1_TOKEN=smoke-$RANDOM$RANDOM$RANDOM OO_SCREEN_HUB_ADDR=127.0.0.1:$SMOKE_PORT OO_SCREEN_ICE_PORT=$((SMOKE_PORT + 1)) OO_SCREEN_RECORD=0 \
-timeout 15 './$NEW' >/tmp/oo-hub-smoke.log 2>&1 & pid=\$!; ok=1; \
+# Журнал пробного старту — mktemp, а не фіксований /tmp/oo-hub-smoke.log: туди
+# інший користувач VPS міг підкласти симлінк і отримати перезапис чужого файла.
+smoke="cd '$REMOTE_DIR' && slog=\$(mktemp) || exit 1; \
+OO_SCREEN_T1_TOKEN=smoke-$RANDOM$RANDOM$RANDOM OO_SCREEN_HUB_ADDR=127.0.0.1:$SMOKE_PORT OO_SCREEN_ICE_PORT=$((SMOKE_PORT + 1)) OO_SCREEN_RECORD=0 \
+timeout 15 './$NEW' >\"\$slog\" 2>&1 & pid=\$!; ok=1; \
 for i in 1 2 3 4 5 6 7 8 9 10; do sleep 1; if curl -fsS -m 2 http://127.0.0.1:$SMOKE_PORT/healthz >/dev/null 2>&1; then ok=0; break; fi; done; \
-kill \$pid 2>/dev/null; wait \$pid 2>/dev/null; [ \$ok -eq 0 ] || { tail -20 /tmp/oo-hub-smoke.log >&2; exit 1; }"
+kill \$pid 2>/dev/null; wait \$pid 2>/dev/null; [ \$ok -eq 0 ] || tail -20 \"\$slog\" >&2; rm -f \"\$slog\"; [ \$ok -eq 0 ]"
 if [[ $DRY -eq 1 ]]; then
 	log "[dry-run] пробний старт $NEW на 127.0.0.1:$SMOKE_PORT"
 else
