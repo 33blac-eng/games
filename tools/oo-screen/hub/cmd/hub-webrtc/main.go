@@ -95,6 +95,9 @@ const defaultToken = "t1-dev-token"
 // srtpReplayWindow — вікно SRTP/SRTCP replay protection (B6). Змінна, а не
 // константа, лише щоб bench міг зняти «до» тим самим бінарем
 // (OO_SCREEN_SRTP_REPLAY_WINDOW=64); у проді env не задається.
+// iceSockBuf — SO_RCVBUF/SO_SNDBUF спільного ICE UDP mux (B7).
+const iceSockBuf = 8 << 20
+
 var srtpReplayWindow = func() uint {
 	if v, err := strconv.Atoi(os.Getenv("OO_SCREEN_SRTP_REPLAY_WINDOW")); err == nil && v > 0 {
 		return uint(v)
@@ -586,7 +589,23 @@ func applyICEUDPMux(se *webrtc.SettingEngine) error {
 			iceMux.err = fmt.Errorf("ICE UDP mux :%d: %w", icePort, err)
 			return
 		}
-		mux := webrtc.NewICEUDPMux(nil, conn)
+		// B7: буфери сокета. Через цей ОДИН сокет іде весь вхід процесу:
+		// медіа КОЖНОГО агента плюс RTCP усіх глядачів. Дефолт ядра
+		// (rmem_default ≈ 208 КБ) менший за одну IDR-пачку 8 Мбіт/с, тож
+		// ядро мовчки викидало пакети агента (замір: +161 drop на сокеті
+		// mux за 20 с на 1×16) — далі NACK, ретрансмісія через ~100 мс і
+		// хвіст p99 у ВСІХ глядачів ноди. Ядро обріже запит до rmem_max/
+		// wmem_max; помилка тут не фатальна — це лише запас.
+		_ = conn.SetReadBuffer(iceSockBuf)
+		_ = conn.SetWriteBuffer(iceSockBuf)
+		// B7: один писар (+ GSO на Linux) замість N pump-ів, що б'ються за
+		// fdMutex цього сокета, — див. egress.go. OO_SCREEN_EGRESS=direct
+		// повертає прямий запис (порівняльний замір, аварійний відкат).
+		var pc net.PacketConn = conn
+		if os.Getenv("OO_SCREEN_EGRESS") != "direct" {
+			pc = newEgressConn(conn)
+		}
+		mux := webrtc.NewICEUDPMux(nil, pc)
 		iceMux.apply = func(se *webrtc.SettingEngine) { se.SetICEUDPMux(mux) }
 		log.Printf("ICE UDP mux слухає :%d (один сокет на всі ноги)", icePort)
 	})
@@ -679,7 +698,7 @@ func newAPI(profile string) (*webrtc.API, error) {
 	}
 
 	i := &interceptor.Registry{}
-	if err := webrtc.RegisterDefaultInterceptors(m, i); err != nil {
+	if err := registerHubInterceptors(m, i); err != nil {
 		return nil, err
 	}
 
