@@ -24,6 +24,9 @@ type Proxy struct {
 
 	downQ, upQ *sched
 	Stats      *RTPStats
+	// RTCPDown — скільки (S)RTCP-пакетів прийшло від hub-а (NACK, PLI, RR,
+	// SR...). Зашифрований SRTCP не розібрати, тож це верхня межа NACK-ів.
+	RTCPDown atomic.Int64
 }
 
 // NewProxy слухає два сокети на 0.0.0.0 і запускає насоси.
@@ -104,6 +107,9 @@ func (p *Proxy) pump(in *net.UDPConn, from, to *atomic.Pointer[net.UDPAddr], l *
 		now := time.Now()
 		if down {
 			p.Stats.Ingress(b, now)
+			if !IsRTP(b) {
+				p.RTCPDown.Add(1)
+			}
 		}
 		at, why := l.Decide(now, n)
 		if why != Delivered {

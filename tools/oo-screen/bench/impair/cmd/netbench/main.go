@@ -408,7 +408,9 @@ func main() {
 	time.Sleep(time.Until(t0))
 	px.Downlink.Set(down)
 	px.Uplink.Set(up)
+	var rtcp0 int64
 	if apx != nil {
+		rtcp0 = apx.RTCPDown.Load()
 		ac := impair.Config{Loss: *agentLoss, Delay: *agentRTT / 2}
 		apx.Downlink.Set(ac)
 		apx.Uplink.Set(ac)
@@ -422,6 +424,8 @@ func main() {
 	if apx != nil {
 		apx.Downlink.Set(clean)
 		apx.Uplink.Set(clean)
+		res.Args["agent_rtcp_imp"] = apx.RTCPDown.Load() - rtcp0
+		fmt.Printf("agent leg: hub->agent RTCP during impairment: %d\n", apx.RTCPDown.Load()-rtcp0)
 	}
 	pliImp := pliPkts.Load() - pli0
 	time.Sleep(*post)
