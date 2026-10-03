@@ -25,6 +25,8 @@ import (
 	"sync"
 	"time"
 	"unsafe"
+
+	"github.com/organicoils/oo-screen/internal/h264"
 )
 
 // Typed errors. Callers switch on these, never on strings.
@@ -360,6 +362,11 @@ func (e *Encoder) drainLocked(buf *C.char, timeoutMS int) ([]AU, error) {
 			C.oos_enc_headers(e.e, &hp, &hl)
 			if hl > 0 {
 				e.headers = C.GoBytes(unsafe.Pointer(hp), C.int(hl))
+				// ТЗ 1.3 / P3 — UNVERIFIED на залізі: явний BT.709 limited у
+				// VUI кешованого SPS. Профіль/рівень не змінюються.
+				if rw, err := h264.RewriteAnnexBSPSColourBT709(e.headers); err == nil {
+					e.headers = rw
+				}
 			}
 			if !hasSPS(data) && len(e.headers) > 0 {
 				merged := make([]byte, 0, len(e.headers)+len(data))
@@ -367,6 +374,12 @@ func (e *Encoder) drainLocked(buf *C.char, timeoutMS int) ([]AU, error) {
 				merged = append(merged, data...)
 				data = merged
 				e.headersInjected++
+			} else if hasSPS(data) {
+				// Інбенд-SPS від MFT — той самий перепис (UNVERIFIED на залізі).
+				// Помилка розбору -> AU іде як є, потік не ламаємо.
+				if rw, err := h264.RewriteAnnexBSPSColourBT709(data); err == nil {
+					data = rw
+				}
 			}
 		}
 		out = append(out, AU{
