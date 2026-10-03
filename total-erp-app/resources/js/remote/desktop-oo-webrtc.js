@@ -324,6 +324,73 @@ export function labelFor(mode) {
  * @param {Function} o.onStateChange(state, reason)
  * @returns {{destroy: Function, state: Function, generation: Function}}
  */
+// ── режим показу (TZ 1.1 / P6) ─────────────────────────────────────────────
+// 'fit' — підігнати під бокс Mesh-canvas, ЗБЕРІГАЮЧИ пропорції (contain).
+// '1:1' — один піксель відео = один фізичний піксель екрана:
+//         CSS-розмір = videoWidth/dpr × videoHeight/dpr, контейнер скролиться.
+// Раніше було object-fit:fill + CSS-розмір з canvas — браузер масштабував
+// кадр вдруге (і без урахування dpr), звідси мило й криві пропорції.
+export const DISPLAY_FIT = 'fit';
+export const DISPLAY_1X1 = '1:1';
+export const DISPLAY_STORAGE_KEY = 'oo-screen-display-mode';
+
+export function normalizeDisplayMode(m) {
+    return m === DISPLAY_1X1 ? DISPLAY_1X1 : DISPLAY_FIT;
+}
+
+export function loadDisplayMode(storage) {
+    try {
+        const st = storage !== undefined ? storage : (typeof localStorage !== 'undefined' ? localStorage : null);
+        return normalizeDisplayMode(st ? st.getItem(DISPLAY_STORAGE_KEY) : null);
+    } catch (e) { return DISPLAY_FIT; }
+}
+
+export function saveDisplayMode(mode, storage) {
+    try {
+        const st = storage !== undefined ? storage : (typeof localStorage !== 'undefined' ? localStorage : null);
+        if (st) st.setItem(DISPLAY_STORAGE_KEY, normalizeDisplayMode(mode));
+    } catch (e) { /* приватне вікно / заблоковане сховище — живемо без пам'яті */ }
+}
+
+// Бокс, у який object-fit:contain реально кладе кадр усередині елемента
+// boxW×boxH (з лєтербоксом). Координати — відносно лівого верхнього кута боксу.
+export function containBox(boxW, boxH, srcW, srcH) {
+    if (!(boxW > 0) || !(boxH > 0) || !(srcW > 0) || !(srcH > 0)) {
+        return { x: 0, y: 0, width: Math.max(0, boxW || 0), height: Math.max(0, boxH || 0) };
+    }
+    const scale = Math.min(boxW / srcW, boxH / srcH);
+    const width = srcW * scale;
+    const height = srcH * scale;
+    return { x: (boxW - width) / 2, y: (boxH - height) / 2, width, height };
+}
+
+// CSS-розмір для режиму 1:1. integer=true — dpr цілий (1, 2, 3), тобто кожен
+// піксель відео лягає рівно на N×N фізичних: тоді й тільки тоді вмикаємо
+// image-rendering:pixelated (на дробовому dpr воно дає «драбину»).
+export function oneToOneSize(videoW, videoH, dpr) {
+    const d = dpr > 0 ? dpr : 1;
+    return {
+        width: videoW / d,
+        height: videoH / d,
+        integer: Math.abs(d - Math.round(d)) < 1e-6,
+    };
+}
+
+// clientX/clientY → піксель віддаленого екрана. rect — getBoundingClientRect()
+// елемента з картинкою; srcW×srcH — розмір віддаленого кадру. Враховує
+// лєтербокс від contain. null — клік у чорну смугу (нікуди слати).
+export function mapClientToRemote(clientX, clientY, rect, srcW, srcH) {
+    if (!rect || !(srcW > 0) || !(srcH > 0)) return null;
+    const b = containBox(rect.width, rect.height, srcW, srcH);
+    if (!(b.width > 0) || !(b.height > 0)) return null;
+    const lx = clientX - rect.left - b.x;
+    const ly = clientY - rect.top - b.y;
+    if (lx < 0 || ly < 0 || lx > b.width || ly > b.height) return null;
+    const x = Math.min(srcW - 1, Math.floor(lx * srcW / b.width));
+    const y = Math.min(srcH - 1, Math.floor(ly * srcH / b.height));
+    return { x, y };
+}
+
 export function createOoWebrtcLayer(o) {
     const opts = o || {};
     const container = opts.container;
@@ -350,6 +417,11 @@ export function createOoWebrtcLayer(o) {
     let disconnectGrace = null;   // §MAJOR-6
     let hiddenKeepalive = null;   // §MAJOR-7
     let visibilityHandler = null; // §MAJOR-7
+    let displayMode = normalizeDisplayMode(config.displayMode || loadDisplayMode());
+    let dprQuery = null;          // TZ 1.1: matchMedia на поточний dpr
+    let dprHandler = null;
+    let toggleBtn = null;
+    let meshSaved = null;         // оригінальні стилі Mesh-canvas/контейнера на час 1:1
 
     const session = createOoSession({
         firstFrameMs: config.firstFrameMs,
@@ -370,7 +442,7 @@ export function createOoWebrtcLayer(o) {
         v.setAttribute('muted', '');
         v.setAttribute('playsinline', '');
         // pointer-events:none — НЕ косметика (див. шапку файла).
-        v.style.cssText = 'position:absolute;pointer-events:none;z-index:5;object-fit:fill;background:transparent;';
+        v.style.cssText = 'position:absolute;pointer-events:none;z-index:5;object-fit:contain;background:transparent;';
         const cs = doc.defaultView && doc.defaultView.getComputedStyle(container);
         if (cs && cs.position === 'static') container.style.position = 'relative';
         container.appendChild(v);
@@ -381,14 +453,125 @@ export function createOoWebrtcLayer(o) {
     // боксу Mesh-canvas, а не від контейнера (Mesh лєтербоксить картинку, і
     // «розтягнути на контейнер» дало б зсув між тим, що видно, і тим, куди
     // клікає користувач).
+    //
+    // TZ 1.1: input і далі ловить Mesh-canvas і сам мапить клік через СВІЙ
+    // rect → canvas.width/height. Тому в режимі 1:1 ми міняємо CSS-розмір
+    // саме Mesh-canvas (а відео просто їде за ним): так мапінг Mesh лишається
+    // правильним без жодного нашого перерахунку. Відео всередині цього боксу
+    // — contain: якщо пропорції кадру хаба й canvas збігаються (норма),
+    // лєтербоксу нема і піксель під курсором = піксель, куди піде клік.
+    function setStyle(el, prop, val) {
+        // Пишемо лише при зміні: інакше MutationObserver(style) → syncGeometry
+        // → знову запис → нескінченна петля.
+        if (el.style[prop] !== val) el.style[prop] = val;
+    }
+
+    function currentDpr() {
+        const w = doc.defaultView;
+        return (w && w.devicePixelRatio > 0) ? w.devicePixelRatio : 1;
+    }
+
+    function applyOneToOne() {
+        const vw = video && video.videoWidth | 0;
+        const vh = video && video.videoHeight | 0;
+        if (!(vw > 0 && vh > 0)) return false;
+        const sz = oneToOneSize(vw, vh, currentDpr());
+        if (!meshSaved) {
+            meshSaved = {
+                width: meshCanvas.style.width, height: meshCanvas.style.height,
+                maxWidth: meshCanvas.style.maxWidth, maxHeight: meshCanvas.style.maxHeight,
+                overflow: container.style.overflow,
+            };
+        }
+        setStyle(meshCanvas, 'maxWidth', 'none');
+        setStyle(meshCanvas, 'maxHeight', 'none');
+        setStyle(meshCanvas, 'width', sz.width + 'px');
+        setStyle(meshCanvas, 'height', sz.height + 'px');
+        setStyle(container, 'overflow', 'auto');
+        setStyle(video, 'imageRendering', sz.integer ? 'pixelated' : 'auto');
+        return true;
+    }
+
+    function restoreMesh() {
+        if (!meshSaved) return;
+        const s0 = meshSaved;
+        meshSaved = null;
+        try {
+            meshCanvas.style.width = s0.width;
+            meshCanvas.style.height = s0.height;
+            meshCanvas.style.maxWidth = s0.maxWidth;
+            meshCanvas.style.maxHeight = s0.maxHeight;
+            container.style.overflow = s0.overflow;
+        } catch (e) { /* ignore */ }
+    }
+
     function syncGeometry() {
         if (!video) return;
+        if (displayMode === DISPLAY_1X1) {
+            applyOneToOne();
+        } else {
+            restoreMesh();
+            setStyle(video, 'imageRendering', 'auto');
+        }
         const mr = meshCanvas.getBoundingClientRect();
         const cr = container.getBoundingClientRect();
-        video.style.left = (mr.left - cr.left + container.scrollLeft) + 'px';
-        video.style.top = (mr.top - cr.top + container.scrollTop) + 'px';
-        video.style.width = mr.width + 'px';
-        video.style.height = mr.height + 'px';
+        setStyle(video, 'left', (mr.left - cr.left + container.scrollLeft) + 'px');
+        setStyle(video, 'top', (mr.top - cr.top + container.scrollTop) + 'px');
+        setStyle(video, 'width', mr.width + 'px');
+        setStyle(video, 'height', mr.height + 'px');
+    }
+
+    // Зміна dpr (перетяг вікна на інший монітор, Ctrl+/-) ResizeObserver не
+    // ловить. matchMedia на ПОТОЧНЕ значення спрацьовує раз — перевішуємо.
+    function watchDpr() {
+        unwatchDpr();
+        const w = doc.defaultView;
+        if (!w || typeof w.matchMedia !== 'function') return;
+        try {
+            dprQuery = w.matchMedia('(resolution: ' + currentDpr() + 'dppx)');
+            dprHandler = () => { syncGeometry(); watchDpr(); };
+            if (typeof dprQuery.addEventListener === 'function') dprQuery.addEventListener('change', dprHandler);
+            else if (typeof dprQuery.addListener === 'function') dprQuery.addListener(dprHandler);
+        } catch (e) { dprQuery = null; dprHandler = null; }
+    }
+
+    function unwatchDpr() {
+        if (dprQuery && dprHandler) {
+            try {
+                if (typeof dprQuery.removeEventListener === 'function') dprQuery.removeEventListener('change', dprHandler);
+                else if (typeof dprQuery.removeListener === 'function') dprQuery.removeListener(dprHandler);
+            } catch (e) { /* ignore */ }
+        }
+        dprQuery = null;
+        dprHandler = null;
+    }
+
+    function setDisplayMode(m) {
+        displayMode = normalizeDisplayMode(m);
+        saveDisplayMode(displayMode);
+        if (toggleBtn) toggleBtn.textContent = displayMode === DISPLAY_1X1 ? '100 %' : 'Підігнати';
+        syncGeometry();
+        return displayMode;
+    }
+
+    // Кнопка-перемикач. На відміну від <video>, вона СВІДОМО ловить кліки —
+    // вона маленька, у куті й не перекриває робочу область Mesh по суті.
+    // config.displayToggle === false — без кнопки (UI дає свою через API).
+    function makeToggle() {
+        if (config.displayToggle === false || toggleBtn) return;
+        const b = doc.createElement('button');
+        b.type = 'button';
+        b.className = 'oo-screen-display-toggle';
+        b.title = 'Режим показу: підігнати / 1:1';
+        b.style.cssText = 'position:absolute;top:4px;right:4px;z-index:6;font:12px sans-serif;padding:2px 6px;opacity:.7;cursor:pointer;';
+        b.textContent = displayMode === DISPLAY_1X1 ? '100 %' : 'Підігнати';
+        b.addEventListener('click', (ev) => {
+            ev.preventDefault();
+            ev.stopPropagation();
+            setDisplayMode(displayMode === DISPLAY_1X1 ? DISPLAY_FIT : DISPLAY_1X1);
+        });
+        container.appendChild(b);
+        toggleBtn = b;
     }
 
     function watchGeometry() {
@@ -401,6 +584,9 @@ export function createOoWebrtcLayer(o) {
             attrObserver = new MutationObserver(() => syncGeometry());
             attrObserver.observe(meshCanvas, { attributes: true, attributeFilter: ['width', 'height', 'style', 'class'] });
         }
+        if (video) video.addEventListener('resize', () => syncGeometry()); // зміна videoWidth/Height
+        watchDpr();
+        makeToggle();
     }
 
     // ── фолбек ───────────────────────────────────────────────────────────────
@@ -421,6 +607,11 @@ export function createOoWebrtcLayer(o) {
         if (geometryTimer !== null) { clearTimeout(geometryTimer); geometryTimer = null; }
         if (resizeObserver) { try { resizeObserver.disconnect(); } catch (e) { /* ignore */ } resizeObserver = null; }
         if (attrObserver) { try { attrObserver.disconnect(); } catch (e) { /* ignore */ } attrObserver = null; }
+        unwatchDpr();
+        if (toggleBtn) { if (toggleBtn.parentNode) { try { toggleBtn.parentNode.removeChild(toggleBtn); } catch (e) { /* ignore */ } } toggleBtn = null; }
+        // Mesh-canvas має повернутись до свого розміру ДО того, як ним знову
+        // керує Mesh (фолбек), інакше його мапінг пішов би від нашого 1:1.
+        restoreMesh();
         if (abort) { try { abort.abort(); } catch (e) { /* ignore */ } abort = null; }
         if (video) {
             if (rvfcHandle && typeof video.cancelVideoFrameCallback === 'function') {
@@ -444,7 +635,9 @@ export function createOoWebrtcLayer(o) {
 
     function doFallback() {
         // Спершу повертаємо Mesh-картинку, потім знімаємо OO-шар — зворотний
-        // порядок дає видиму дірку, у яку встигають клікнути.
+        // порядок дає видиму дірку, у яку встигають клікнути. Розмір
+        // Mesh-canvas (режим 1:1) повертаємо ще раніше — до того, як Mesh малює.
+        restoreMesh();
         unpauseMesh();
         teardownOo();
     }
@@ -632,10 +825,14 @@ export function createOoWebrtcLayer(o) {
         // тестовий тон хаба, кнопка вмикала б людині не кабінет, а пищалку.
         // Стартовий стан завжди muted, тож замовчування = тиша.
         setMuted(m) { if (video) video.muted = m !== false; },
+        // TZ 1.1: 'fit' | '1:1'; зберігається в localStorage.
+        getDisplayMode: () => displayMode,
+        setDisplayMode,
         destroy(reason) {
             if (destroyed) return;
             destroyed = true;
             session.close(session.current(), reason || 'destroy');
+            restoreMesh();
             unpauseMesh();
             teardownOo();
         },
