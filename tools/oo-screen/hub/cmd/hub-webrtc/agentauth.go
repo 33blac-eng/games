@@ -16,6 +16,7 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"unicode"
 
 	"github.com/organicoils/oo-screen/hub"
 )
@@ -43,6 +44,9 @@ var legacyWarned sync.Map
 
 // agentAuthorized — чи має право tok зареєструвати агента ноди node.
 func agentAuthorized(node, tok string) bool {
+	if !validAgentNodeID(node) {
+		return false
+	}
 	if hub.NodeTokenValid(agentMaster(), node, tok) {
 		return true
 	}
@@ -55,6 +59,24 @@ func agentAuthorized(node, tok string) bool {
 	}
 	if _, seen := legacyWarned.LoadOrStore(node, struct{}{}); !seen {
 		log.Printf("WARNING offer/agent [node=%s]: агент на СПІЛЬНОМУ легасі-токені — випусти токен ноди (oo-node-token) і увімкни OO_SCREEN_AGENT_AUTH=strict", node)
+	}
+	return true
+}
+
+// maxAgentNodeID — стеля довжини node_id (байт).
+const maxAgentNodeID = 256
+
+// validAgentNodeID — повторний аудит #17: надто довгий id і керівні символи
+// (ін'єкція рядків у журнал через "[node=%s]") відкидаються до перевірки
+// токена. Порожній id лишається: це T1/одновузловий сумісний режим.
+func validAgentNodeID(node string) bool {
+	if len(node) > maxAgentNodeID {
+		return false
+	}
+	for _, r := range node {
+		if unicode.IsControl(r) || r == unicode.ReplacementChar {
+			return false
+		}
 	}
 	return true
 }
