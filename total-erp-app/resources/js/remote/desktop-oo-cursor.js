@@ -73,11 +73,24 @@ export function decodeCursorMessage(data) {
         if (s.w < 1 || s.h < 1 || s.w > CURSOR_MAX_DIM || s.h > CURSOR_MAX_DIM) return null;
         if (s.hotX >= s.w || s.hotY >= s.h) return null;
         if (s.format === FORMAT_RGBA) { if (s.data.length !== s.w * s.h * 4) return null; }
-        else if (s.format === FORMAT_PNG) { if (s.data.length < 8) return null; }
+        else if (s.format === FORMAT_PNG) { if (!pngHeaderMatches(s.data, s.w, s.h)) return null; }
         else return null;
         return s;
     }
     return null;
+}
+
+// pngHeaderMatches — дзеркало cursorproto.checkPNGHeader: сигнатура PNG і
+// IHDR з тими самими w×h, що й заголовок форми. Інакше 30-байтний PNG міг би
+// заявити 65535×65535 — і декодер браузера (img / CSS cursor) виділяв би
+// пам'ять під IHDR, а не під задекларовані ≤256×256 (decompression bomb).
+const PNG_SIG = [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a];
+export function pngHeaderMatches(d, w, h) {
+    if (!d || d.length < 29) return false;
+    for (let i = 0; i < 8; i++) if (d[i] !== PNG_SIG[i]) return false;
+    const dv = new DataView(d.buffer, d.byteOffset, d.byteLength);
+    if (dv.getUint32(8) !== 13 || d[12] !== 0x49 || d[13] !== 0x48 || d[14] !== 0x44 || d[15] !== 0x52) return false;
+    return dv.getUint32(16) === w && dv.getUint32(20) === h;
 }
 
 function base64(bytes) {

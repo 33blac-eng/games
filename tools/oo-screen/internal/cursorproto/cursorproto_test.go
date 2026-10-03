@@ -1,6 +1,7 @@
 package cursorproto
 
 import (
+	"encoding/binary"
 	"bytes"
 	"encoding/hex"
 	"errors"
@@ -223,5 +224,38 @@ func TestCoalescer(t *testing.T) {
 	c.Offer(Pos{Visible: true, X: 3})
 	if _, ok := c.Due(t0.Add(CoalesceInterval)); !ok {
 		t.Fatal("reset did not resend")
+	}
+}
+
+// A PNG whose IHDR disagrees with the declared size is a decompression bomb
+// for the player's decoder (it allocates by IHDR): refused at encode, decode
+// and hub Validate.
+func TestShapePNGHeaderMustMatchDeclaredSize(t *testing.T) {
+	good, err := BuildShape(rgba(16, 16, 0), 16, 16, 0, 0)
+	if err != nil || good.Format != FormatPNG {
+		t.Fatalf("build: %v", err)
+	}
+	msg, err := EncodeShape(good)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := Validate(msg); err != nil {
+		t.Fatalf("good shape refused: %v", err)
+	}
+	bomb := append([]byte(nil), msg...)
+	binary.BigEndian.PutUint32(bomb[ShapeHeader+16:], 65535)
+	binary.BigEndian.PutUint32(bomb[ShapeHeader+20:], 65535)
+	if err := Validate(bomb); !errors.Is(err, ErrDims) {
+		t.Fatalf("IHDR 65535x65535 declared 16x16: got %v", err)
+	}
+	notPNG := append([]byte(nil), msg...)
+	notPNG[ShapeHeader+1] = 'X'
+	if err := Validate(notPNG); !errors.Is(err, ErrFormat) {
+		t.Fatalf("bad signature: got %v", err)
+	}
+	s := good
+	s.Data = bomb[ShapeHeader:]
+	if _, err := EncodeShape(s); err == nil {
+		t.Fatal("EncodeShape accepted mismatched IHDR")
 	}
 }

@@ -168,7 +168,7 @@ func checkShape(format byte, w, h, hx, hy, dataLen int, id uint32) error {
 			return ErrDataLen
 		}
 	case FormatPNG:
-		if dataLen < 8 {
+		if dataLen < pngMinLen {
 			return ErrDataLen
 		}
 	default:
@@ -184,6 +184,11 @@ func checkShape(format byte, w, h, hx, hy, dataLen int, id uint32) error {
 func EncodeShape(s Shape) ([]byte, error) {
 	if err := checkShape(s.Format, s.W, s.H, s.HotX, s.HotY, len(s.Data), s.ID); err != nil {
 		return nil, err
+	}
+	if s.Format == FormatPNG {
+		if err := checkPNGHeader(s.Data, s.W, s.H); err != nil {
+			return nil, err
+		}
 	}
 	b := make([]byte, ShapeHeader+len(s.Data))
 	b[0], b[1], b[2] = Magic, KindShape, s.Format
@@ -222,7 +227,33 @@ func DecodeShape(b []byte) (Shape, error) {
 	if err := checkShape(s.Format, s.W, s.H, s.HotX, s.HotY, len(s.Data), s.ID); err != nil {
 		return Shape{}, err
 	}
+	if s.Format == FormatPNG {
+		if err := checkPNGHeader(s.Data, s.W, s.H); err != nil {
+			return Shape{}, err
+		}
+	}
 	return s, nil
+}
+
+// pngMinLen is the PNG signature plus a complete IHDR chunk header + body
+// (8 + 4 len + 4 type + 13 data); fewer bytes cannot be a usable PNG.
+const pngMinLen = 8 + 8 + 13
+
+var pngSig = [8]byte{0x89, 'P', 'N', 'G', '\r', '\n', 0x1a, '\n'}
+
+// checkPNGHeader requires the PNG's own IHDR dimensions to equal the declared
+// shape size. Without it a small message could declare 16x16 while its IHDR
+// says 65535x65535, and the player's image decoder would allocate for the
+// IHDR size (decompression bomb) before anything else looked at it.
+func checkPNGHeader(d []byte, w, h int) error {
+	if len(d) < pngMinLen || [8]byte(d[:8]) != pngSig ||
+		binary.BigEndian.Uint32(d[8:]) != 13 || string(d[12:16]) != "IHDR" {
+		return ErrFormat
+	}
+	if binary.BigEndian.Uint32(d[16:]) != uint32(w) || binary.BigEndian.Uint32(d[20:]) != uint32(h) {
+		return ErrDims
+	}
+	return nil
 }
 
 // Validate checks any cursorproto message (the hub's size/shape cap before

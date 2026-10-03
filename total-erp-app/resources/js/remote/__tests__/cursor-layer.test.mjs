@@ -93,15 +93,25 @@ const container = fakeEl('div');
 const canvas = fakeEl('canvas');
 canvas.style.cursor = 'crosshair';
 
-function pngShapeMsg(id, w, h, hx, hy) {
-    const b = new Uint8Array(16 + 8);
+// PNG-заголовок (сигнатура + IHDR) з розміром ihdrW×ihdrH (типово = w×h).
+function pngShapeMsg(id, w, h, hx, hy, ihdrW = w, ihdrH = h) {
+    const b = new Uint8Array(16 + 29);
     const dv = new DataView(b.buffer);
     b[0] = 0x43; b[1] = 2; b[2] = 1;
     dv.setUint32(4, id, true); dv.setUint16(8, w, true); dv.setUint16(10, h, true);
     dv.setUint16(12, hx, true); dv.setUint16(14, hy, true);
     b.set([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a], 16);
+    dv.setUint32(24, 13); b.set([0x49, 0x48, 0x44, 0x52], 28);
+    dv.setUint32(32, ihdrW); dv.setUint32(36, ihdrH);
     return b;
 }
+const pngUrl = (m) => 'data:image/png;base64,' + Buffer.from(m.subarray(16)).toString('base64');
+
+// PNG, чий IHDR не збігається з заголовком форми (decompression bomb), —
+// сміття; сигнатури без IHDR теж замало.
+assert.equal(decodeCursorMessage(pngShapeMsg(5, 16, 16, 0, 0, 65535, 65535)), null);
+assert.equal(decodeCursorMessage(pngShapeMsg(5, 16, 16, 0, 0).subarray(0, 24)), null);
+assert.equal(decodeCursorMessage(pngShapeMsg(5, 16, 16, 0, 0)).kind, 'shape');
 function posMsg(id, x, y, visible) {
     const b = new Uint8Array(20);
     const dv = new DataView(b.buffer);
@@ -116,7 +126,7 @@ const place = (p) => ({ x: p.x * 2, y: p.y * 2, scale: 2 });
     const layer = createCursorLayer({ doc, container, targets: () => [canvas], place, role: ROLE_CONTROL });
     layer.onMessage(pngShapeMsg(5, 16, 16, 2, 3));
     layer.onMessage(posMsg(5, 10, 10, true));
-    assert.equal(canvas.style.cursor, 'url("data:image/png;base64,iVBORw0KGgo=") 2 3, auto');
+    assert.equal(canvas.style.cursor, 'url("' + pngUrl(pngShapeMsg(5, 16, 16, 2, 3)) + '") 2 3, auto');
     assert.equal(container.children.length, 0, 'керівнику з малою формою оверлей не потрібен');
     layer.onMessage(posMsg(5, 10, 10, false));
     assert.equal(canvas.style.cursor, 'none');
