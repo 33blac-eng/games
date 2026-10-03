@@ -13,6 +13,15 @@ export const HEADER_SIZE = 32;
 export const VERSION = 1;
 export const TYPE_TILE = 1;
 export const TYPE_INVALIDATE = 2;
+// TYPE_STILL — агент анонсує, що НАСТУПНИЙ відеокадр — still-повтор
+// (keepalive) картинки епізоду. Кожен анонс — кредит на один кадр; кадр без
+// кредиту при намальованих тайлах = змінена картинка, що обігнала свій
+// invalidate (DataChannel і RTP не впорядковані між собою) → тайли
+// ховаємо, доки не прийде запізнілий анонс або invalidate.
+// Чому не RTP-мітка: агент пише семпли через pion (випадкова початкова
+// мітка), хаб перебазовує мітки — жодна сторона не знає мітки кадру, яку
+// бачить браузер; а keepalive щоразу дістає НОВУ мітку.
+export const TYPE_STILL = 3;
 export const FORMAT_NONE = 0;
 export const FORMAT_PNG = 1;
 export const MAX_MESSAGE = 64 * 1024;
@@ -44,7 +53,7 @@ export function parseTileMessage(data) {
         format: u8[24],
         payload: u8.subarray(HEADER_SIZE),
     };
-    if (m.type === TYPE_INVALIDATE) {
+    if (m.type === TYPE_INVALIDATE || m.type === TYPE_STILL) {
         return (len === 0 && m.format === FORMAT_NONE) ? m : null;
     }
     if (m.type !== TYPE_TILE || m.format !== FORMAT_PNG || len === 0) return null;
@@ -57,20 +66,34 @@ export function parseTileMessage(data) {
 //   accept(msg) → { clear: bool, draw: bool }
 //   onVideoSize(w, h) → true, якщо тайли треба стерти (інші пропорції кадру =
 //   інший монітор / інша картинка, тайли до неї не стосуються).
+//   onFrames(n) → 'hide' | null — n нових відеокадрів (rVFC presentedFrames);
+//   accept(still) → { show: true }, коли кредитів знову вистачає.
+// Кредити діють лише з першого TYPE_STILL сесії: старий агент/хаб анонсів
+// не шле, і тоді поведінка та сама, що до них (лише invalidate).
 export function createTileState() {
     let epoch = null;
     let srcW = 0;
     let srcH = 0;
     let count = 0;
+    let stillSeen = false;
+    let credits = 0;
     return {
         epoch: () => epoch,
         count: () => count,
+        credits: () => credits,
         source: () => ({ width: srcW, height: srcH }),
         accept(m) {
             if (!m) return { clear: false, draw: false };
+            if (m.type === TYPE_STILL) {
+                if (m.epoch !== epoch) return { clear: false, draw: false };
+                stillSeen = true;
+                credits++;
+                return { clear: false, draw: false, show: credits >= 0 };
+            }
             if (m.type === TYPE_INVALIDATE) {
                 epoch = m.epoch;
                 count = 0;
+                credits = 0;
                 return { clear: true, draw: false };
             }
             let clear = false;
@@ -80,11 +103,23 @@ export function createTileState() {
                 srcW = m.srcW;
                 srcH = m.srcH;
                 count = 0;
+                credits = 0;
             }
             count++;
             return { clear, draw: true };
         },
         isCurrent(e) { return e === epoch; },
+        onFrames(n) {
+            if (!stillSeen || !(n > 0)) return null;
+            if (!count) {
+                // Тайлів ще нема: кадри до них (зокрема той, з якого агент
+                // робив readback) кредитів не їдять у мінус.
+                credits = Math.max(credits - n, 0);
+                return null;
+            }
+            credits -= n;
+            return credits < 0 ? 'hide' : null;
+        },
         onVideoSize(w, h) {
             if (!count || !(w > 0) || !(h > 0) || !srcW || !srcH) return false;
             // Енкодер може масштабувати — порівнюємо пропорції, не пікселі.
@@ -115,12 +150,21 @@ export function createTileOverlay(o) {
     container.appendChild(canvas);
     let box = null; // { left, top, width, height } — CSS-бокс <video>
     let destroyed = false;
+    let hidden = false;
+    let lastPresented = null;
+
+    function setHidden(h) {
+        if (hidden === h) return;
+        hidden = h;
+        canvas.style.visibility = h ? 'hidden' : '';
+    }
 
     function ctx() { return canvas.getContext && canvas.getContext('2d'); }
 
     function clear() {
         const c = ctx();
         if (c) c.clearRect(0, 0, canvas.width, canvas.height);
+        setHidden(false); // порожній canvas ховати нічого
     }
 
     function layout() {
@@ -141,14 +185,25 @@ export function createTileOverlay(o) {
             box = { left, top, width, height };
             layout();
         },
-        onVideoFrame(videoW, videoH) {
-            if (state.onVideoSize(videoW, videoH)) clear();
+        // presentedFrames — з метаданих requestVideoFrameCallback (може
+        // стрибати на кілька кадрів, якщо колбек пропустив); без нього — 1.
+        onVideoFrame(videoW, videoH, presentedFrames) {
+            if (state.onVideoSize(videoW, videoH)) { clear(); return; }
+            let n = 1;
+            if (typeof presentedFrames === 'number') {
+                n = lastPresented === null ? 1 : presentedFrames - lastPresented;
+                lastPresented = presentedFrames;
+                if (!(n > 0)) return;
+            }
+            if (state.onFrames(n) === 'hide') setHidden(true);
         },
+        isHidden: () => hidden,
         async onMessage(data) {
             if (destroyed) return;
             const m = parseTileMessage(data);
             if (!m) return;
             const act = state.accept(m);
+            if (act.show) setHidden(false);
             if (m.type === TYPE_TILE && (canvas.width !== m.srcW || canvas.height !== m.srcH)) {
                 canvas.width = m.srcW; // скидає й вміст
                 canvas.height = m.srcH;

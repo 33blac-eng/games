@@ -749,11 +749,15 @@ export function createOoWebrtcLayer(o) {
         if (!video) return;
         armHiddenKeepalive(gen);
         if (typeof video.requestVideoFrameCallback === 'function') {
-            const onFrame = () => {
+            const onFrame = (_now, meta) => {
                 if (!session.isCurrent(gen) || !video) return;
                 session.noteFrame(gen);
-                // Кадр іншої геометрії (інший монітор) — тайли до нього не стосуються.
-                if (textTiles) textTiles.onVideoFrame(video.videoWidth | 0, video.videoHeight | 0);
+                // Кадр іншої геометрії (інший монітор) — тайли до нього не стосуються;
+                // кадр без анонсу still-повтору — ховаємо тайли (oo-text-tiles.js TYPE_STILL).
+                if (textTiles) {
+                    textTiles.onVideoFrame(video.videoWidth | 0, video.videoHeight | 0,
+                        meta && typeof meta.presentedFrames === 'number' ? meta.presentedFrames : undefined);
+                }
                 rvfcHandle = video.requestVideoFrameCallback(onFrame);
             };
             rvfcHandle = video.requestVideoFrameCallback(onFrame);

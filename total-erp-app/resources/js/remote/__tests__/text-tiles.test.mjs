@@ -2,7 +2,7 @@
 import assert from 'node:assert/strict';
 import {
     parseTileMessage, createTileState, createTileOverlay,
-    HEADER_SIZE, MAX_MESSAGE, TYPE_TILE, TYPE_INVALIDATE, FORMAT_PNG,
+    HEADER_SIZE, MAX_MESSAGE, TYPE_TILE, TYPE_INVALIDATE, TYPE_STILL, FORMAT_PNG,
 } from '../oo-text-tiles.js';
 import { containBox } from '../desktop-oo-webrtc.js';
 
@@ -21,6 +21,7 @@ function msg({ type = TYPE_TILE, epoch = 1, frame = 2, x = 64, y = 0, w = 64, h 
     b.set(payload, HEADER_SIZE);
     return b;
 }
+const still = (epoch) => msg({ type: TYPE_STILL, epoch, w: 0, h: 0, x: 0, format: 0, payload: [] });
 const inval = (epoch) => msg({ type: TYPE_INVALIDATE, epoch, w: 0, h: 0, x: 0, format: 0, payload: [] });
 
 // Еталон із Go: tiles.Encode{Tile, epoch 7, frame 99, 64,128 64x32, 1920x1080, PNG, [1 2 3]}.
@@ -115,5 +116,63 @@ for (const [k, v] of Object.entries(bad)) assert.equal(parseTileMessage(v), null
     ops.length = 0;
     ov.onVideoFrame(1280, 1024);
     assert.deepEqual(ops, ['clear']);
+}
+// TYPE_STILL: розбір і відмови
+{
+    // Еталон із Go: tiles.Still(9, 4).
+    const g = Uint8Array.from([0x4f, 0x54, 0x01, 0x03, 0x09, 0, 0, 0, 0x04, 0, 0, 0,
+        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+    const m = parseTileMessage(g);
+    assert.deepEqual([m.type, m.epoch, m.frame], [TYPE_STILL, 9, 4]);
+    assert.equal(parseTileMessage(msg({ type: TYPE_STILL, format: 0 })), null); // з payload
+}
+
+// кредити still: без анонсів у сесії — кадри тайли не ховають (старий агент)
+{
+    const s = createTileState();
+    s.accept(parseTileMessage(msg({ epoch: 1 })));
+    assert.equal(s.onFrames(5), null);
+}
+// з анонсами: keepalive з кредитом — тайли лишаються; кадр без кредиту — сховати;
+// запізнілий анонс повертає; анонс чужої епохи — ігнор
+{
+    const s = createTileState();
+    s.accept(parseTileMessage(inval(1)));
+    assert.deepEqual(s.accept(parseTileMessage(still(1))), { clear: false, draw: false, show: true });
+    // тайлів ще нема: кадр readback-у їсть кредит, але не в мінус
+    assert.equal(s.onFrames(2), null);
+    assert.equal(s.credits(), 0);
+    s.accept(parseTileMessage(msg({ epoch: 1 })));
+    s.accept(parseTileMessage(still(1)));
+    assert.equal(s.onFrames(1), null);          // keepalive з анонсом
+    assert.equal(s.onFrames(1), 'hide');        // змінений кадр раніше за invalidate
+    assert.equal(s.accept(parseTileMessage(still(1))).show, true); // ні, це був запізнілий анонс
+    assert.equal(s.accept(parseTileMessage(still(7))).show, undefined);
+    assert.equal(s.onFrames(0), null);
+    assert.deepEqual(s.accept(parseTileMessage(inval(2))), { clear: true, draw: false });
+    assert.equal(s.credits(), 0);
+}
+// оверлей: rVFC presentedFrames → visibility
+{
+    const canvas = { style: {}, width: 0, height: 0, getContext: () => ({ clearRect() {}, drawImage() {} }) };
+    const ov = createTileOverlay({
+        doc: { createElement: () => canvas }, container: { appendChild() {} }, containBox,
+        decode: async () => 'bmp',
+    });
+    await ov.onMessage(inval(1).buffer);
+    await ov.onMessage(still(1).buffer);
+    ov.onVideoFrame(1920, 1080, 100);           // кадр readback-у
+    await ov.onMessage(msg({ epoch: 1 }).buffer);
+    await ov.onMessage(still(1).buffer);
+    ov.onVideoFrame(1920, 1080, 101);           // keepalive
+    assert.equal(ov.isHidden(), false);
+    ov.onVideoFrame(1920, 1080, 101);           // той самий presentedFrames — не кадр
+    assert.equal(ov.isHidden(), false);
+    ov.onVideoFrame(1920, 1080, 102);           // кадр без анонсу
+    assert.equal(ov.isHidden(), true);
+    assert.equal(canvas.style.visibility, 'hidden');
+    await ov.onMessage(inval(2).buffer);         // invalidate: стерто й знову видимо
+    assert.equal(ov.isHidden(), false);
+    assert.equal(canvas.style.visibility, '');
 }
 console.log('text-tiles: ok');
