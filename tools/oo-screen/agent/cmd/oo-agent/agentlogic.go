@@ -333,6 +333,39 @@ func shouldKeepalive(waitErr error, paused, haveLast bool) bool {
 // ~16 с заповнять sendQueue (буфер 8) і цикл упреться в sendAsync. Такий стан —
 // уже не «канал не встигає», а мертвий транспорт, і лікує його реконект по
 // txErrCh, а не admission.
+// refineWake — що робити, коли дедлайн NextFrame вкоротив refine (а не
+// keepalive). Refine лише вкорочує очікування, тож він не має права з'їсти
+// keepalive: якщо refine не відбувся (не на часі або канал зайнятий і його
+// відкладено), а з останнього пропущеного кадру минуло keepaliveAfter, —
+// keepalive, як на baseline-дедлайні (shouldKeepalive; admission далі сам).
+type refineWake int
+
+const (
+	refineWakeSkip refineWake = iota
+	refineWakeRefine
+	refineWakePostpone
+	refineWakePostponeKeepalive
+	refineWakeKeepalive
+)
+
+func refineWakeAction(due, paused, haveLast bool, queued int64, sinceAdmitted time.Duration) refineWake {
+	if paused || !haveLast {
+		return refineWakeSkip
+	}
+	keep := sinceAdmitted >= keepaliveAfter
+	switch {
+	case !due && keep:
+		return refineWakeKeepalive
+	case !due:
+		return refineWakeSkip
+	case queued > 0 && keep:
+		return refineWakePostponeKeepalive
+	case queued > 0:
+		return refineWakePostpone
+	}
+	return refineWakeRefine
+}
+
 func shouldAdmit(queued int64, sinceAdmitted time.Duration) bool {
 	return queued == 0 || sinceAdmitted >= admissionFloor
 }

@@ -252,3 +252,30 @@ func TestAdmissionFloorLeavesRoomForDelivery(t *testing.T) {
 			admissionFloor, keepaliveAfter)
 	}
 }
+
+// Refine, відкладений через зайнятий канал, не має з'їдати keepalive (baseline:
+// на дедлайні keepaliveAfter keepalive іде завжди, admission вирішує далі).
+func TestRefineWakeDoesNotStarveKeepalive(t *testing.T) {
+	ka := keepaliveAfter
+	cases := []struct {
+		name        string
+		due, paused bool
+		haveLast    bool
+		queued      int64
+		since       time.Duration
+		want        refineWake
+	}{
+		{"refine due, idle channel", true, false, true, 0, 300 * time.Millisecond, refineWakeRefine},
+		{"refine due, busy, fresh", true, false, true, 1, 300 * time.Millisecond, refineWakePostpone},
+		{"refine due, busy, keepalive overdue", true, false, true, 1, ka, refineWakePostponeKeepalive},
+		{"not due, keepalive overdue", false, false, true, 0, ka + time.Millisecond, refineWakeKeepalive},
+		{"not due, fresh", false, false, true, 0, 10 * time.Millisecond, refineWakeSkip},
+		{"paused", true, true, true, 0, 5 * ka, refineWakeSkip},
+		{"no frame", true, false, false, 0, 5 * ka, refineWakeSkip},
+	}
+	for _, c := range cases {
+		if got := refineWakeAction(c.due, c.paused, c.haveLast, c.queued, c.since); got != c.want {
+			t.Errorf("%s: got %d, want %d", c.name, got, c.want)
+		}
+	}
+}

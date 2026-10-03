@@ -1632,18 +1632,30 @@ loop:
 		case refineWait && errors.Is(err, context.DeadlineExceeded):
 			// Дедлайн вкоротив refine, а не keepalive: keepalive тут не шлемо.
 			qp, due := refiner.Due(time.Now())
-			if !due || gatePaused.Load() || s.lastFrame == nil {
+			switch refineWakeAction(due, gatePaused.Load(), s.lastFrame != nil, queued.Load(), time.Since(lastAdmitAt)) {
+			case refineWakeSkip:
 				continue
-			}
-			if queued.Load() > 0 {
+			case refineWakePostpone:
 				// Канал ще не відправив попереднє: refine не має права його
 				// топити (бюджет ≤ пікового бітрейту) — відкладаємо на кадр.
 				refiner.Postpone(time.Now(), frameInterval)
 				continue
+			case refineWakePostponeKeepalive:
+				// Refine відкладено, але keepalive уже назрів — як на
+				// baseline-дедлайні: шлемо його (admission вирішить далі).
+				refiner.Postpone(time.Now(), frameInterval)
+				frame = s.lastFrame
+				keepalives++
+				still = true
+			case refineWakeKeepalive:
+				frame = s.lastFrame
+				keepalives++
+				still = true
+			case refineWakeRefine:
+				frame = s.lastFrame
+				still = true
+				refineQP = qp
 			}
-			frame = s.lastFrame
-			still = true
-			refineQP = qp
 		case shouldKeepalive(err, gatePaused.Load(), s.lastFrame != nil):
 			// Екран нерухомий: пересилаємо ОСТАННІЙ кадр. Декодер отримує
 			// крихітний P-кадр «нічого не змінилось», сторож у браузері бачить
