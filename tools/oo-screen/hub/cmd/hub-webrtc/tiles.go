@@ -107,8 +107,43 @@ func onAgentTiles(ns *nodeSession, data []byte) {
 	}
 	raw := append([]byte(nil), data...) // pion перевикористовує буфер
 	m.Payload = nil
+	if m.Type == tiles.TypeStill {
+		// Анонс keepalive-кадру (tiles.TypeStill) — подія «зараз», не стан:
+		// у кеш не йде (новому глядачу старі анонси дали б фальшиві кредити),
+		// але й губитись за тайлами не має — інакше плеєр сховає тайли.
+		broadcastStill(ns, raw)
+		return
+	}
 	ns.tiles.remember(m, raw)
 	broadcastTiles(ns, raw, m.Type == tiles.TypeInvalidate)
+}
+
+// broadcastStill — як broadcastTiles, але повна черга віддає під анонс
+// місце найстарішого повідомлення (тайл буде втрачено, анонс — ні).
+func broadcastStill(ns *nodeSession, raw []byte) {
+	ns.mu.Lock()
+	defer ns.mu.Unlock()
+	for _, vl := range ns.viewers {
+		if vl.tilesOut != nil {
+			enqueueStill(vl, raw)
+		}
+	}
+}
+
+func enqueueStill(vl *viewerLeg, raw []byte) {
+	for i := 0; i < 2; i++ {
+		select {
+		case vl.tilesOut <- raw:
+			return
+		default:
+		}
+		select {
+		case <-vl.tilesOut:
+			atomic.AddUint64(&vl.tilesDropped, 1)
+		default:
+		}
+	}
+	atomic.AddUint64(&vl.tilesDropped, 1)
 }
 
 // broadcastTiles кладе повідомлення в черги всіх глядачів з відкритим каналом.

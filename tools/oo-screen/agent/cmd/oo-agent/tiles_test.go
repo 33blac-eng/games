@@ -47,7 +47,7 @@ func TestSendEpisodeStopsOnStaleEpoch(t *testing.T) {
 	dc := &fakeTileDC{state: webrtc.DataChannelStateOpen}
 	img := redTextImage(256, 128)
 	n := 0
-	st := sendEpisode(context.Background(), dc, img, 4, 1, 1<<30, nil, func(e uint32) bool {
+	st := sendEpisode(context.Background(), dc, img, 4, 1, tiles.SelectConfig{}, 1<<30, nil, func(e uint32) bool {
 		n++
 		return n < 5 && e == 4
 	})
@@ -63,7 +63,7 @@ func TestSendEpisodeStopsOnStaleEpoch(t *testing.T) {
 
 func TestSendEpisodeClosedChannel(t *testing.T) {
 	dc := &fakeTileDC{state: webrtc.DataChannelStateClosed}
-	st := sendEpisode(context.Background(), dc, redTextImage(128, 64), 1, 1, 1<<30, nil, func(uint32) bool { return true })
+	st := sendEpisode(context.Background(), dc, redTextImage(128, 64), 1, 1, tiles.SelectConfig{}, 1<<30, nil, func(uint32) bool { return true })
 	if st.Sent != 0 || !st.Aborted {
 		t.Fatalf("sent on a closed channel: %+v", st)
 	}
@@ -85,8 +85,66 @@ func TestTilesFlagOffIsInert(t *testing.T) {
 	tilesStatic(context.Background(), time.Now(), func() ([]byte, int, int, error) {
 		called = true
 		return nil, 0, 0, nil
-	})
+	}, nil)
+	tilesStill() // без прапорця й каналу — нічого, без паніки
 	if called {
 		t.Fatal("readback with the flag off")
+	}
+}
+
+// Софт-шлях (refine вимкнено) отримує тайли за власним таймером простою;
+// апаратний — лише після завершення refine; без жодного кадру — ніколи.
+func TestTilesReadyTrigger(t *testing.T) {
+	prevFlag, prevMotion := textTilesEnabled, tilesLastMotion
+	defer func() { textTilesEnabled, tilesLastMotion = prevFlag, prevMotion }()
+	textTilesEnabled = true
+	tilesLastMotion = time.Time{}
+	now := time.Now()
+	if tilesReady(now, false, true) || tilesReady(now, true, true) {
+		t.Fatal("ready before any frame")
+	}
+	// перший кадр (зокрема GDI на нерухомому екрані) заводить таймер
+	tilesMotion()
+	t0 := tilesLastMotion
+	if t0.IsZero() {
+		t.Fatal("tilesMotion did not arm the idle timer")
+	}
+	if tilesReady(t0.Add(tilesIdleAfter-time.Millisecond), false, false) {
+		t.Fatal("software path fired before idle")
+	}
+	if !tilesReady(t0.Add(tilesIdleAfter), false, false) {
+		t.Fatal("software path never fires (no refine)")
+	}
+	if tilesReady(t0.Add(time.Hour), true, false) {
+		t.Fatal("hardware path fired before refine completed")
+	}
+	if !tilesReady(t0, true, true) {
+		t.Fatal("hardware path ignores refine completion")
+	}
+	textTilesEnabled = false
+	if tilesReady(t0.Add(time.Hour), false, true) {
+		t.Fatal("ready with the flag off")
+	}
+}
+
+func TestTilesCursorExclude(t *testing.T) {
+	if tilesCursorExclude(false, 10, 10) != nil {
+		t.Fatal("hidden pointer excluded something")
+	}
+	ex := tilesCursorExclude(true, 150, 10)
+	dc := &fakeTileDC{state: webrtc.DataChannelStateOpen}
+	img := redTextImage(256, 128)
+	sendEpisode(context.Background(), dc, img, 1, 1, tiles.SelectConfig{Exclude: ex}, 1<<30, nil,
+		func(uint32) bool { return true })
+	if len(dc.sent) == 0 {
+		t.Fatal("nothing sent")
+	}
+	r := ex[0]
+	for _, b := range dc.sent {
+		m, _ := tiles.Decode(b)
+		x, y, w, h := int(m.X), int(m.Y), int(m.W), int(m.H)
+		if x < r.X+r.W && r.X < x+w && y < r.Y+r.H && r.Y < y+h {
+			t.Fatalf("tile %d,%d under the pointer sent", x, y)
+		}
 	}
 }

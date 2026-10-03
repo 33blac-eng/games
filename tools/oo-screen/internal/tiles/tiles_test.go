@@ -265,3 +265,56 @@ func loadBGRA(t testing.TB, f string) Image {
 	}
 	return Image{Pix: rgba.Pix, Stride: rgba.Stride, W: b.Dx(), H: b.Dy()}
 }
+
+func TestStillMessage(t *testing.T) {
+	m, err := Decode(Still(9, 4))
+	if err != nil || m.Type != TypeStill || m.Epoch != 9 || m.Frame != 4 || m.Payload != nil {
+		t.Fatalf("still %+v %v", m, err)
+	}
+	if _, err := Encode(&Msg{Type: TypeStill, Format: FormatPNG}); err == nil {
+		t.Fatal("still with format accepted")
+	}
+	if _, err := Encode(&Msg{Type: TypeStill, Payload: []byte{1}}); err == nil {
+		t.Fatal("still with payload accepted")
+	}
+
+	var e Episodes
+	if e.Still() != nil {
+		t.Fatal("still announced without an episode")
+	}
+	ep, fr, _ := e.Start(time.Unix(1, 0))
+	s, err := Decode(e.Still())
+	if err != nil || s.Epoch != ep || s.Frame != fr {
+		t.Fatalf("episode still %+v %v", s, err)
+	}
+	e.Motion()
+	if e.Still() != nil {
+		t.Fatal("still announced after motion ended the episode")
+	}
+}
+
+func TestSelectExcludesCursor(t *testing.T) {
+	img := canvas(256, 64, 255, 255, 255)
+	glyphs(img, 64, 0, 220, 0, 0)
+	glyphs(img, 128, 0, 0, 0, 230)
+	// pointer at (150,10): its rect overlaps tile x=128 only
+	ex := CursorExclude(150, 10)
+	got := Select(img, SelectConfig{Exclude: []Rect{ex}})
+	if len(got) != 1 || got[0].X != 64 {
+		t.Fatalf("got %+v", got)
+	}
+	// degenerate exclude rect is ignored
+	if n := len(Select(img, SelectConfig{Exclude: []Rect{{X: 0, Y: 0}}})); n != 2 {
+		t.Fatalf("empty exclude dropped tiles: %d", n)
+	}
+	// Build honours it as well
+	var xs []int
+	Build(img, 1, 1, SelectConfig{Exclude: []Rect{ex}}, 1<<30, func(b []byte) bool {
+		m, _ := Decode(b)
+		xs = append(xs, int(m.X))
+		return true
+	})
+	if len(xs) != 1 || xs[0] != 64 {
+		t.Fatalf("build sent %v", xs)
+	}
+}

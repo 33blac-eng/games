@@ -21,6 +21,10 @@ type SelectConfig struct {
 	// MaxGradFrac — maximum share of "soft" steps (photo/gradient content):
 	// text sits on flat backgrounds, photos do not.
 	MaxGradFrac float64
+	// Exclude — source-pixel rects (W/H > 0) whose overlapping tiles are
+	// never selected: the pointer composited into the readback would
+	// otherwise be frozen into a lossless tile and outlive the real cursor.
+	Exclude []Rect
 }
 
 func (c *SelectConfig) defaults() {
@@ -138,6 +142,9 @@ func Select(img Image, cfg SelectConfig) []Rect {
 		h := min(cfg.Tile, img.H-y)
 		for x := 0; x < img.W; x += cfg.Tile {
 			w := min(cfg.Tile, img.W-x)
+			if excluded(cfg.Exclude, x, y, w, h) {
+				continue
+			}
 			if s, ok := Classify(img, x, y, w, h, cfg); ok {
 				out = append(out, Rect{X: x, Y: y, W: w, H: h, Score: s})
 			}
@@ -145,4 +152,22 @@ func Select(img Image, cfg SelectConfig) []Rect {
 	}
 	sort.SliceStable(out, func(a, b int) bool { return out[a].Score > out[b].Score })
 	return out
+}
+
+// excluded reports whether tile x,y,w,h overlaps any rect of ex.
+func excluded(ex []Rect, x, y, w, h int) bool {
+	for _, r := range ex {
+		if r.W > 0 && r.H > 0 && x < r.X+r.W && r.X < x+w && y < r.Y+r.H && r.Y < y+h {
+			return true
+		}
+	}
+	return false
+}
+
+// CursorExclude — the rect to keep tiles away from for a pointer whose shape
+// top-left is at (x,y) (DXGI PointerPosition). The shape size is not known
+// here; the pad covers shapes up to 64x64 plus hotspot slack on every side.
+func CursorExclude(x, y int) Rect {
+	const pad, shape = 16, 64
+	return Rect{X: x - pad, Y: y - pad, W: shape + 2*pad, H: shape + 2*pad}
 }

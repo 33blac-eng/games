@@ -128,6 +128,18 @@ func (e *Episodes) Start(now time.Time) (epoch, frame uint32, ok bool) {
 	return e.epoch, e.frame, true
 }
 
+// Still — a still repeat (keepalive) of the current picture is about to be
+// sent. Returns the TypeStill announcement when an episode of the current
+// epoch was started (tiles may be on screen), nil otherwise.
+func (e *Episodes) Still() []byte {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if !e.started {
+		return nil
+	}
+	return Still(e.epoch, e.frame)
+}
+
 // Current reports whether epoch is still the live one.
 func (e *Episodes) Current(epoch uint32) bool {
 	e.mu.Lock()

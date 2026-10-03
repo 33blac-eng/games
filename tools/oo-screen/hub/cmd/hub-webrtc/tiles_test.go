@@ -266,3 +266,28 @@ func TestTilesFlagOff(t *testing.T) {
 		ns.mu.Unlock()
 	}
 }
+
+// TypeStill: розсилається, не кешується, у повній черзі витісняє тайл.
+func TestOnAgentTilesStillNotCachedAndWins(t *testing.T) {
+	ns := &nodeSession{nodeID: "tiles-still"}
+	a := addViewer(ns, newPC(t), newViewerTrack(t), "u1")
+	t.Cleanup(func() { removeViewer(ns, a) })
+	ns.mu.Lock()
+	a.tilesOut = make(chan []byte, 2)
+	ns.mu.Unlock()
+
+	onAgentTiles(ns, tileMsg(t, 5, 0, 10))
+	onAgentTiles(ns, tileMsg(t, 5, 64, 10)) // черга повна
+	onAgentTiles(ns, tiles.Still(5, 1))
+	if len(ns.tiles.snapshot()) != 2 {
+		t.Fatalf("still touched the cache: %d", len(ns.tiles.snapshot()))
+	}
+	<-a.tilesOut
+	got := <-a.tilesOut
+	if m, err := tiles.Decode(got); err != nil || m.Type != tiles.TypeStill {
+		t.Fatalf("still lost in a full queue: %v %v", m, err)
+	}
+	if a.tilesDropped != 1 {
+		t.Fatalf("dropped=%d", a.tilesDropped)
+	}
+}

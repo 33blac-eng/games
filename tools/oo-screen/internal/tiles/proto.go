@@ -40,6 +40,20 @@ const (
 
 	TypeTile       = 1
 	TypeInvalidate = 2
+	// TypeStill — "the next video frame is a still repeat (keepalive) of the
+	// episode's picture". Sent on the tiles channel just BEFORE the agent
+	// hands such a frame to the video track; the player counts these as
+	// credits and hides the tiles when a presented video frame has no credit
+	// (= a changed frame that outran its invalidate). No payload, header as
+	// TypeInvalidate. Old players ignore unknown types; old hubs drop it.
+	//
+	// Why not an RTP timestamp in the header: the agent writes samples via
+	// pion TrackLocalStaticSample (random initial RTP timestamp, not exposed)
+	// and the hub rebases timestamps per node leg (lastOutTS), so neither end
+	// can name "the RTP ts of the frame the tiles were read from" as the
+	// browser sees it. Keepalive repeats get fresh timestamps too, so a pure
+	// "newer ts => stale" rule would clear tiles every second.
+	TypeStill = 3
 
 	FormatNone = 0
 	FormatPNG  = 1 // RGB(A) PNG, decoded by createImageBitmap in the browser
@@ -75,9 +89,9 @@ var (
 
 func (m *Msg) validate() error {
 	switch m.Type {
-	case TypeInvalidate:
+	case TypeInvalidate, TypeStill:
 		if len(m.Payload) != 0 || m.Format != FormatNone {
-			return fmt.Errorf("%w: invalidate carries payload", ErrInvalid)
+			return fmt.Errorf("%w: invalidate/still carries payload", ErrInvalid)
 		}
 	case TypeTile:
 		if m.Format != FormatPNG || len(m.Payload) == 0 {
@@ -124,6 +138,12 @@ func Encode(m *Msg) ([]byte, error) {
 // Invalidate builds the invalidate message for a new epoch.
 func Invalidate(epoch, frame uint32) []byte {
 	b, _ := Encode(&Msg{Type: TypeInvalidate, Epoch: epoch, Frame: frame})
+	return b
+}
+
+// Still builds the still-repeat announcement for epoch (see TypeStill).
+func Still(epoch, frame uint32) []byte {
+	b, _ := Encode(&Msg{Type: TypeStill, Epoch: epoch, Frame: frame})
 	return b
 }
 

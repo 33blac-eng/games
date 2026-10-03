@@ -1347,6 +1347,7 @@ func main() {
 		lastSeqAt = now
 		au := *lastStillAU
 		au.PTS = time.Duration(captureSeq) * time.Second / time.Duration(effectiveFPS)
+		tilesStill()
 		sendAsync(au)
 		lastStillSentAt = now
 		keepalives++
@@ -1663,6 +1664,9 @@ loop:
 			}
 			log.Printf("oo-agent: перший кадр знято через GDI (екран нерухомий)")
 			frame, s.lastFrame = gdi, gdi
+			// Перший кадр — теж «рух»: без цього refine (і тайли за ним) на
+			// сесії, що стартувала на нерухомому екрані, чекали б першої зміни.
+			refiner.Motion(time.Now())
 			tilesMotion() // інша картинка (новий монітор/реакваєр) — тайли застаріли
 		case errors.Is(err, context.DeadlineExceeded):
 			// Дедлайн був, але слати не можна: глядача нема (пауза). Порожній
@@ -1809,6 +1813,9 @@ loop:
 			}
 			continue
 		}
+		if still {
+			tilesStill() // анонс ДО кадру: плеєр не сховає тайли на цьому повторі
+		}
 		for _, au := range aus {
 			sendAsync(au)
 		}
@@ -1818,11 +1825,17 @@ loop:
 			cp := aus[0]
 			lastStillAU, lastStillEnc, lastStillSentAt = &cp, s.encoder(), time.Now()
 		}
-		// Текстові тайли: екран нерухомий і refine уже доведений до кінця —
-		// один readback BGRA на епоху (повтор на keepalive, якщо епізод не
-		// вдалося почати; Episodes.Start ідемпотентний у межах епохи).
-		if still && !s.software && refiner.Complete() {
-			tilesStatic(ctx, time.Now(), s.cap.ReadBGRA)
+		// Текстові тайли: екран нерухомий і refine уже доведений до кінця
+		// (або, без refine — софт-енкодер, -refine=false, — простій
+		// tilesIdleAfter) — один readback BGRA на епоху (повтор на keepalive,
+		// якщо епізод не вдалося почати; Episodes.Start ідемпотентний у
+		// межах епохи). Тайли під вказівником не шлемо.
+		if still && tilesReady(time.Now(), refineOn, refiner.Complete()) {
+			cv, cx, cy := false, 0, 0
+			if lf := s.lastFrame; lf != nil {
+				cv, cx, cy = lf.CursorVisible, lf.CursorX, lf.CursorY
+			}
+			tilesStatic(ctx, time.Now(), s.cap.ReadBGRA, tilesCursorExclude(cv, cx, cy))
 		}
 
 		if time.Since(lastLog) >= 5*time.Second {
