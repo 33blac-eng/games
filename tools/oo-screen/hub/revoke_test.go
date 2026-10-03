@@ -124,22 +124,33 @@ func TestSubscribeRevoke_UserKind(t *testing.T) {
 // TestSubscribeRevoke_HTTPErrorDoesNotKillLoop — ERP-стаб завжди 500;
 // поллінг має продовжувати без паніки/зависання (fail-soft).
 func TestSubscribeRevoke_HTTPErrorDoesNotKillLoop(t *testing.T) {
-	var hits int32
+	// Лічильник атомарний: handler живе в горутинах httptest-сервера, а тест
+	// читає його зі своєї. Замість сну на «мабуть устигне» — чекаємо події:
+	// другий запит ПІСЛЯ 500 і є доказом, що цикл пережив помилку.
+	var hits atomic.Int32
+	second := make(chan struct{})
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		hits++
+		if hits.Add(1) == 2 {
+			close(second)
+		}
 		http.Error(w, "boom", http.StatusInternalServerError)
 	}))
 	defer srv.Close()
 
 	ctx, cancel := context.WithCancel(context.Background())
-	go SubscribeRevoke(ctx, srv.URL, "secret-key", 5*time.Millisecond, func(kind, val string) {})
+	stopped := make(chan struct{})
+	go func() {
+		SubscribeRevoke(ctx, srv.URL, "secret-key", 5*time.Millisecond, func(kind, val string) {})
+		close(stopped)
+	}()
 
-	time.Sleep(60 * time.Millisecond)
-	cancel()
-
-	if hits < 2 {
-		t.Fatalf("expected loop to keep polling despite 500s, got %d hits", hits)
+	select {
+	case <-second:
+	case <-time.After(10 * time.Second):
+		t.Fatalf("expected loop to keep polling despite 500s, got %d hits", hits.Load())
 	}
+	cancel()
+	<-stopped
 }
 
 // ── staleGate: «м'яко спочатку, твердо згодом» ──────────────────────────────
