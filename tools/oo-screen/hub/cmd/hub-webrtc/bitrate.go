@@ -552,6 +552,14 @@ func (c bitrateCtl) step(lossFrac float64, rttExcess time.Duration, now time.Tim
 	if next == c.target {
 		return c, false
 	}
+	// Стеля (REMB, яку withRemb не встиг застосувати через дебаунс, або
+	// startBps) опустила «підйом» нижче поточної цілі — це зріз, а не підйом:
+	// downDebounce, cutFrom і обірвана серія «чисто», як у withRemb.
+	if next < c.target {
+		up, fast = false, false
+		c.goodSince = time.Time{}
+		c.cleanSince = time.Time{}
+	}
 	debounce := downDebounce
 	if up {
 		debounce = upDebounce

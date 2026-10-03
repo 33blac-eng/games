@@ -137,3 +137,25 @@ func TestContentCeiling(t *testing.T) {
 		}
 	}
 }
+
+// REMB прийшов під час дебаунсу (ціль не зрізана), далі «чисто»: кламп до REMB
+// у step() — це зріз (cutFrom, downDebounce), а не підйом.
+func TestStepRembClampIsCut(t *testing.T) {
+	c := bitrateCtl{target: 4_000_000, startBps: 8_000_000, fastUp: true, lastSent: t0,
+		goodSince: t0.Add(-time.Minute), cleanSince: t0.Add(-time.Minute)}
+	c, s := c.withRemb(2_000_000, t0.Add(time.Second))
+	if s || c.target != 4_000_000 {
+		t.Fatalf("withRemb мав бути задебаунсений: s=%v target=%d", s, c.target)
+	}
+	// 2.5 с після lastSent: fastUpDebounce(3с) ще не минув, downDebounce(2с) — так.
+	c, s = c.step(0, 0, t0.Add(2500*time.Millisecond))
+	if !s || c.target != 2_000_000 {
+		t.Fatalf("кламп до REMB: s=%v target=%d, want true 2000000", s, c.target)
+	}
+	if c.cutFrom != 4_000_000 {
+		t.Fatalf("cutFrom=%d, want 4000000", c.cutFrom)
+	}
+	if !c.cleanSince.IsZero() {
+		t.Fatalf("серія «чисто» не обірвана зрізом")
+	}
+}
