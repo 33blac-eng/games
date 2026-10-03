@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -289,5 +290,67 @@ func TestOnAgentTilesStillNotCachedAndWins(t *testing.T) {
 	}
 	if a.tilesDropped != 1 {
 		t.Fatalf("dropped=%d", a.tilesDropped)
+	}
+}
+
+// TestTilesDuplicateViewerChannels — одна viewer-нога з багатьма каналами
+// 'oosc-tiles' отримує одну помпу; зайві канали закриваються хабом, а
+// закриття каналу зупиняє помпу (горутини не течуть).
+func TestTilesDuplicateViewerChannels(t *testing.T) {
+	withTilesFlag(t, true)
+	agentDC := dialTilesAgent(t, agentNodeIDEnv)
+	if !waitFor(20*time.Second, func() bool { return agentDC.ReadyState() == webrtc.DataChannelStateOpen }) {
+		t.Fatal("agent tiles channel never opened")
+	}
+	basePumps := tilesPumps.Load()
+	baseG := runtime.NumGoroutine()
+
+	remote, err := webrtc.NewPeerConnection(webrtc.Configuration{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer remote.Close()
+	if _, err := remote.AddTransceiverFromKind(webrtc.RTPCodecTypeVideo,
+		webrtc.RTPTransceiverInit{Direction: webrtc.RTPTransceiverDirectionRecvonly}); err != nil {
+		t.Fatal(err)
+	}
+	const n = 40
+	dcs := make([]*webrtc.DataChannel, n)
+	for i := range dcs {
+		if dcs[i], err = remote.CreateDataChannel(tiles.ChannelLabel, nil); err != nil {
+			t.Fatal(err)
+		}
+	}
+	exchange(t, remote, "viewer", offerReq{Token: token})
+
+	// Хаб закриває всі, крім одного.
+	if !waitFor(20*time.Second, func() bool {
+		open, closed := 0, 0
+		for _, dc := range dcs {
+			switch dc.ReadyState() {
+			case webrtc.DataChannelStateOpen:
+				open++
+			case webrtc.DataChannelStateClosed:
+				closed++
+			}
+		}
+		return open == 1 && closed == n-1
+	}) {
+		t.Fatal("duplicate tiles channels were not closed")
+	}
+	if p := tilesPumps.Load() - basePumps; p != 1 {
+		t.Fatalf("pumps=%d, want 1", p)
+	}
+	if g := runtime.NumGoroutine() - baseG; g > 200 {
+		t.Fatalf("goroutines grew by %d", g)
+	}
+	// Закриття єдиного живого каналу зупиняє помпу.
+	for _, dc := range dcs {
+		if dc.ReadyState() == webrtc.DataChannelStateOpen {
+			_ = dc.Close()
+		}
+	}
+	if !waitFor(10*time.Second, func() bool { return tilesPumps.Load() == basePumps }) {
+		t.Fatalf("pump survived its channel: %d", tilesPumps.Load()-basePumps)
 	}
 }

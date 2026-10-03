@@ -187,31 +187,60 @@ func enqueueTiles(vl *viewerLeg, raw []byte, invalidate bool) {
 // viewerTilesHandler — обробник каналу тайлів viewer-ноги (лише під прапорцем).
 // Глядач нічого не шле цим каналом; усе, що прийде, ігнорується.
 func viewerTilesHandler(ns *nodeSession, vl *viewerLeg, dc *webrtc.DataChannel) {
+	// Один канал тайлів на viewer-ногу. Без цього нога, відкривши N каналів
+	// 'oosc-tiles', запускала б N помп (до ~65k горутин), кожна з яких
+	// перезаписувала vl.tilesOut і висіла б до кінця ноги. Зайвий канал
+	// закривається; помпа виходить і на закриття свого каналу.
+	stop := make(chan struct{})
+	var stopOnce sync.Once
+	var q chan []byte
+	dc.OnClose(func() {
+		stopOnce.Do(func() { close(stop) })
+		ns.mu.Lock()
+		if q != nil && vl.tilesOut == q {
+			vl.tilesOut = nil
+		}
+		ns.mu.Unlock()
+	})
 	dc.OnOpen(func() {
-		q := make(chan []byte, tilesQueueDepth)
 		ns.mu.Lock()
 		if _, ok := ns.viewers[vl.pc]; !ok {
 			ns.mu.Unlock()
 			return
 		}
+		if vl.tilesOut != nil {
+			ns.mu.Unlock()
+			log.Printf("tiles: дубль каналу глядача [node=%s] — канал закрито", ns.nodeID)
+			_ = dc.Close()
+			return
+		}
+		q = make(chan []byte, tilesQueueDepth)
 		vl.tilesOut = q
 		// Знімок кешу — під ns.mu разом із появою черги: усе, що прийде
 		// після, піде вже чергою (можливий дубль тайла — нешкідливий).
 		snap := ns.tiles.snapshot()
 		ns.mu.Unlock()
 		log.Printf("tiles: viewer channel open [node=%s], replay %d", ns.nodeID, len(snap))
-		go tilesPump(vl, dc, q, snap)
+		go tilesPump(vl, dc, q, snap, stop)
 	})
 }
 
-// tilesPump шле спершу знімок кешу, далі чергу ноги — до закриття ноги.
+// tilesPumps — скільки помп живе зараз (для тестів і діагностики).
+var tilesPumps atomic.Int64
+
+// tilesPump шле спершу знімок кешу, далі чергу ноги — до закриття ноги або
+// свого каналу (stop).
 // Переповнений SCTP-буфер глядача: чекаємо (черга тим часом переповнюється й
 // сама викидає тайли на вході), а не росте пам'ять.
-func tilesPump(vl *viewerLeg, dc *webrtc.DataChannel, q chan []byte, snap [][]byte) {
+func tilesPump(vl *viewerLeg, dc *webrtc.DataChannel, q chan []byte, snap [][]byte, stop <-chan struct{}) {
+	tilesPumps.Add(1)
+	defer tilesPumps.Add(-1)
 	send := func(raw []byte) bool {
 		for dc.BufferedAmount() > tilesMaxBuffered {
 			select {
 			case <-vl.done:
+				return false
+			case <-stop:
 				return false
 			case <-time.After(10 * time.Millisecond):
 			}
@@ -233,6 +262,8 @@ func tilesPump(vl *viewerLeg, dc *webrtc.DataChannel, q chan []byte, snap [][]by
 	for {
 		select {
 		case <-vl.done:
+			return
+		case <-stop:
 			return
 		case raw := <-q:
 			if !send(raw) {
