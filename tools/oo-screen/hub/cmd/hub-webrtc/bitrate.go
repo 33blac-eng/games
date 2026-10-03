@@ -1,3 +1,26 @@
+// GCC/TWCC НА VIEWER-НОГАХ — ОЦІНЕНО, СВІДОМО НЕ ВМИКАЄМО ЗАРАЗ
+// (pion/interceptor v0.1.47, pkg/cc + pkg/gcc; pion/webrtc v4.2.18).
+// Технічно пакет є і підключається (cc.NewInterceptor + gcc.NewSendSideBWE +
+// webrtc.ConfigureTWCCHeaderExtensionSender), але ризик не «низький»:
+//   - ОДИН interceptor.Registry/API на ВСІ ноги (newAPI у main.go): увімкнути
+//     лише для глядачів = окремий API для viewer-ніг, тобто зміна в місці, де
+//     живуть H-06 (UDP mux) і NACK/PLI-проводка з її задокументованими пастками;
+//   - дефолтний pacer gcc — LeakyBucketPacer: він ПЕРЕТАЙМЛЮЄ пакети, які хаб
+//     лише форвардить, тобто додає власну чергу саме там, де ми боремось із
+//     чергою (ramp5/depth). Безпечний лише NoOpPacer, а без пейсингу оцінка
+//     GCC на бурстових IDR-кадрах (GOP 2 с) систематично занижена;
+//   - хаб не кодує: оцінка ноги мала б іти в агента так само, як REMB
+//     (мінімум по глядачах, дебаунс, keyframe_request) — це той самий
+//     onRembEstimate, лише з іншим джерелом. Тобто виграш ≈ REMB, який Chrome
+//     уже шле, плюс новий ризик у RTP-шляху;
+//   - GCC має власну стартову ціль і slow-start, що конкурує з нашим
+//     контролером за ту саму ручку агента: два контури на одному виході =
+//     пилка, від якої тут дебаунси скрізь.
+//
+// Коли робити: якщо REMB перестане приходити (Firefox/Safari без goog-remb).
+// Тоді — окремий API для viewer-ніг, NoOpPacer, оцінка лише як ЩЕ ОДНА стеля
+// через withRemb-подібну чисту функцію, прапорець хаба дефолт OFF.
+//
 // Адаптація бітрейту (кандидат A). Керує ХАБ, не браузер: hub і так читає RTCP
 // Receiver Report із viewer-ноги (той самий sender.Read, що вже тягне PLI), тож
 // не треба ані нового DataChannel, ані змін у браузері, і воно працює навіть
@@ -17,6 +40,7 @@ package main
 
 import (
 	"log"
+	"math"
 	"os"
 	"strconv"
 	"sync/atomic"
@@ -258,10 +282,111 @@ type bitrateCtl struct {
 	// оцінки ще немає, і тоді контролер працює РІВНО як до її появи. Це друга
 	// стеля поряд зі startBps: ціль = min(startBps, remb, рішення по втратах).
 	remb uint64
+
+	// --- швидке відновлення (fastUp, див. fastUpStep) ---
+	// fastUp — режим увімкнено для ЦІЄЇ ноди (env OO_SCREEN_BITRATE_FASTUP,
+	// дефолт ВИМКНЕНО: нульове значення = рівно стара поведінка, на якій стоять
+	// усі заміри й тести вище).
+	// cleanSince — початок безперервного «чисто», який, на відміну від
+	// goodSince, НЕ скидається власним підйомом: це і є «тривалий чистий
+	// період», після якого підйом стає мультиплікативним.
+	// cutFrom — ціль, З ЯКОЇ було останнє зниження (втрати/RTT/REMB). Вище за
+	// cutFrom*fastUpCapFrac швидкий режим не йде — там лежав затор, і далі
+	// повертаємось до старого повільного кроку (гістерезис проти пилки).
+	fastUp     bool
+	cleanSince time.Time
+	cutFrom    uint64
+
+	// textMode — ЗАГЛУШКА під контентно-залежну стелю (contentCeiling). Нічим не
+	// виставляється й у step() не входить; агента не чіпаємо.
+	textMode bool
+}
+
+// Ручки швидкого відновлення. Свідомо консервативні щодо задокументованих
+// інцидентів: вниз не змінюється НІЧОГО (downDebounce, кроки 0.7/0.85), а
+// швидкий підйом можливий лише (а) після fastUpAfter безперервно чистого (і по
+// втратах, і по RTT < rttUpClear — той самий гейт, що й у повільного підйому,
+// тож ramp5/depth його не відкривають), (б) не частіше за fastUpDebounce (кожна
+// зміна цілі = keyframe_request, IDR раз на 3 с ~ природний GOP 2 с) і (в) лише
+// до fastUpCapFrac від рівня останнього зрізу — вище повземо старим +5%/10 с.
+const (
+	fastUpAfter    = 15 * time.Second // тривалість чистого до мультиплікативного режиму
+	fastUpDebounce = 3 * time.Second
+	fastUpPerSec   = 1.08 // +8%/с еквівалент
+	fastUpMaxStep  = 1.30 // не більше +30% за один крок, хоч би скільки минуло
+	fastUpCapFrac  = 0.85 // межа швидкого режиму відносно cutFrom
+)
+
+// fastRecoveryDefault — env-ручка; читається в newBitrateCtl.
+var fastRecoveryDefault = os.Getenv("OO_SCREEN_BITRATE_FASTUP") == "1"
+
+// fastUpStep — ЧИСТА: чи дозволено швидкий підйом і на яку ціль. ok=false —
+// лишаємось у старому повільному режимі. Стелі startBps/REMB клампить step().
+func (c bitrateCtl) fastUpStep(now time.Time) (uint64, bool) {
+	if !c.fastUp || c.cleanSince.IsZero() || now.Sub(c.cleanSince) < fastUpAfter {
+		return 0, false
+	}
+	if !c.lastSent.IsZero() && now.Sub(c.lastSent) < fastUpDebounce {
+		return 0, false
+	}
+	limit := c.startBps
+	if c.cutFrom > 0 {
+		limit = uint64(float64(c.cutFrom) * fastUpCapFrac)
+	}
+	if c.target >= limit {
+		return 0, false // вище межі — гістерезис, повільний режим
+	}
+	secs := fastUpDebounce.Seconds()
+	if !c.lastSent.IsZero() {
+		secs = now.Sub(c.lastSent).Seconds()
+	}
+	f := math.Pow(fastUpPerSec, secs)
+	if f > fastUpMaxStep {
+		f = fastUpMaxStep
+	}
+	next := uint64(float64(c.target) * f)
+	if next > limit {
+		next = limit
+	}
+	if next <= c.target {
+		return 0, false
+	}
+	return next, true
+}
+
+// contentDecision — що порадити агентові для поточного контенту.
+type contentDecision struct {
+	Bps     uint64 // ціль бітрейту (ніколи не вища за вхідну — канал є канал)
+	FPSHint int    // підказка частоти кадрів; == fps, коли нічого не міняємо
+}
+
+// minTextFPS — нижче цього навіть текст (прокрутка, курсор) смикається.
+const minTextFPS = 5
+
+// contentCeiling — ЧИСТИЙ хук контентно-залежної стелі (ще НЕ підключений до
+// агента). textMode=false — тотожність. textMode=true: для тексту різкість
+// кадру важливіша за плавність, тож при обмеженому каналі (target < ceil)
+// замість дрібнішого квантування на тому самому fps радимо ЗНИЗИТИ fps
+// пропорційно target/ceil — біт на кадр лишається як на стелі. Бітрейт не
+// підіймаємо понад target: обмеження мережі однакове для будь-якого контенту.
+func contentCeiling(textMode bool, targetBps, ceilBps uint64, fps int) contentDecision {
+	d := contentDecision{Bps: targetBps, FPSHint: fps}
+	if !textMode || ceilBps == 0 || targetBps >= ceilBps || fps <= minTextFPS {
+		return d
+	}
+	h := int(math.Round(float64(fps) * float64(targetBps) / float64(ceilBps)))
+	if h < minTextFPS {
+		h = minTextFPS
+	}
+	if h > fps {
+		h = fps
+	}
+	d.FPSHint = h
+	return d
 }
 
 func newBitrateCtl(startBps uint64) bitrateCtl {
-	return bitrateCtl{target: startBps, startBps: startBps}
+	return bitrateCtl{target: startBps, startBps: startBps, fastUp: fastRecoveryDefault}
 }
 
 // ceilingBps — стеля адаптації ЦІЄЇ ноди: фактичний стартовий бітрейт агента з
@@ -367,7 +492,7 @@ func (c bitrateCtl) step(lossFrac float64, rttExcess time.Duration, now time.Tim
 	c, rttRising := c.rttTrend(excess, now)
 	c, rttHigh := c.rttLevel(excess)
 
-	next, up := c.target, false
+	next, up, fast := c.target, false, false
 	switch {
 	// Втрати ріжуть глибше (0.7) за затримку (0.85) і мають пріоритет, коли
 	// спрацювало обидва: втрачений пакет — доконаний збиток, зростання
@@ -375,12 +500,14 @@ func (c bitrateCtl) step(lossFrac float64, rttExcess time.Duration, now time.Tim
 	case lossFrac > lossHighFrac:
 		next = uint64(float64(c.target) * downFactor)
 		c.goodSince = time.Time{} // серія "чисто" обірвана
+		c.cleanSince = time.Time{}
 	// Два плеча затримки: РІСТ (серія зростаючих вікон) і РІВЕНЬ (приріст уже
 	// за rttLevelHigh). Обидва — те, чого не бачить контролер по втратах:
 	// черга наливається, а FractionLost ще нуль.
 	case rttRising || rttHigh:
 		next = uint64(float64(c.target) * rttDownFactor)
 		c.goodSince = time.Time{}
+		c.cleanSince = time.Time{}
 	// Підйом дозволено, лише коли чисто І ПО ВТРАТАХ, І ПО ЗАТРИМЦІ. Друга
 	// умова — те, чого тут бракувало: зріз по затримці був разовим, і ціль
 	// повзла назад до стелі просто тому, що втрат немає, хоч черга стояла на
@@ -390,7 +517,12 @@ func (c bitrateCtl) step(lossFrac float64, rttExcess time.Duration, now time.Tim
 		if c.goodSince.IsZero() {
 			c.goodSince = now
 		}
-		if now.Sub(c.goodSince) >= goodStreak {
+		if c.cleanSince.IsZero() {
+			c.cleanSince = now
+		}
+		if n, ok := c.fastUpStep(now); ok {
+			next, up, fast = n, true, true
+		} else if now.Sub(c.goodSince) >= goodStreak {
 			next, up = uint64(float64(c.target)*upFactor), true
 		}
 	default:
@@ -398,6 +530,7 @@ func (c bitrateCtl) step(lossFrac float64, rttExcess time.Duration, now time.Tim
 		// серію "чисто" збиваємо. Відлік 5с піде наново від моменту, коли
 		// розсмокталось, — підйом одразу після затору нам і не потрібен.
 		c.goodSince = time.Time{}
+		c.cleanSince = time.Time{}
 	}
 
 	if next < minBitrateBps {
@@ -422,6 +555,9 @@ func (c bitrateCtl) step(lossFrac float64, rttExcess time.Duration, now time.Tim
 	debounce := downDebounce
 	if up {
 		debounce = upDebounce
+		if fast {
+			debounce = fastUpDebounce
+		}
 	}
 	if !c.lastSent.IsZero() && now.Sub(c.lastSent) < debounce {
 		// Зарано. Стан серії НЕ чіпаємо: коли дебаунс мине, наступний RR
@@ -430,6 +566,8 @@ func (c bitrateCtl) step(lossFrac float64, rttExcess time.Duration, now time.Tim
 	}
 	if up {
 		c.goodSince = now // серія рахується заново від цього підйому
+	} else if next < c.target {
+		c.cutFrom = c.target // рівень, де був затор: межа швидкого режиму
 	}
 	c.target = next
 	c.lastSent = now
@@ -460,8 +598,10 @@ func (c bitrateCtl) withRemb(bps uint64, now time.Time) (bitrateCtl, bool) {
 	if !c.lastSent.IsZero() && now.Sub(c.lastSent) < downDebounce {
 		return c, false
 	}
+	c.cutFrom = c.target
 	c.target, c.lastSent = next, now
 	c.goodSince = time.Time{} // серія «чисто» до підйому обірвана
+	c.cleanSince = time.Time{}
 	return c, true
 }
 
