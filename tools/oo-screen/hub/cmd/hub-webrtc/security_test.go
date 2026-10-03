@@ -19,6 +19,8 @@ import (
 
 	"github.com/pion/webrtc/v4"
 	"golang.org/x/time/rate"
+
+	"github.com/organicoils/oo-screen/hub"
 )
 
 // secERP — заглушка ERP: на consume віддає задані claims; рахує виклики.
@@ -220,20 +222,38 @@ func TestSecH10AgentTokenRequired(t *testing.T) {
 	}
 }
 
-// SecH11 (KnownFAIL): ОДИН спільний агентський токен на весь парк, а node
-// агент називає сам. Хто має токен (лежить на кожному ПК, у командному рядку
-// schtask) — реєструється під БУДЬ-ЯКОЮ нодою, витісняє справжнього агента і
-// отримує ввід глядачів. Тут: валідний токен + сміттєвий SDP => нода "victim"
-// уже створена в реєстрі ще до відмови 400 (заодно — ріст реєстру).
-func TestSecH11AgentCanClaimAnyNodeKnownFAIL(t *testing.T) {
+// SecH11 (FIXED, SEC #17): токен НОДИ відчиняє лише свою ноду; у strict
+// спільний легасі-токен не відчиняє нічого; невдалий offer (сміттєвий SDP) не
+// лишає ноди в реєстрі.
+func TestSecH11AgentTokenBoundToNode(t *testing.T) {
 	secTicketMode(t, 200, `{}`)
-	b, _ := json.Marshal(offerReq{SDP: "garbage", Token: token, Node: "victim"})
-	rec := secPost(t, handleOffer("agent"), b)
-	if rec.Code != http.StatusBadRequest {
-		t.Fatalf("status=%d, want 400 (bad sdp)", rec.Code)
+	post := func(tok, node string) int {
+		b, _ := json.Marshal(offerReq{SDP: "garbage", Token: tok, Node: node})
+		return secPost(t, handleOffer("agent"), b).Code
 	}
-	if reg.get("victim") == nil {
-		t.Fatal("нода не створилась — вразливість, схоже, виправлено: переверніть тест")
+	// Дефолт: легасі приймається (не ламаємо розгорнутих агентів), але невдалий
+	// offer ноди не створює.
+	if c := post(token, "victim"); c != http.StatusBadRequest || reg.get("victim") != nil {
+		t.Fatalf("legacy: status=%d node=%v, want 400 і без ноди", c, reg.get("victim"))
+	}
+	t.Setenv("OO_SCREEN_AGENT_AUTH", "strict")
+	if c := post(token, "victim"); c != http.StatusUnauthorized {
+		t.Fatalf("strict+legacy: status=%d, want 401", c)
+	}
+	if c := post(hub.NodeToken(agentMaster(), "other"), "victim"); c != http.StatusUnauthorized {
+		t.Fatalf("чужий токен ноди: status=%d, want 401", c)
+	}
+	if c := post(hub.NodeToken(agentMaster(), "victim"), "victim"); c != http.StatusBadRequest || reg.get("victim") != nil {
+		t.Fatalf("свій токен: status=%d node=%v, want 400 (bad sdp) і без ноди", c, reg.get("victim"))
+	}
+	t.Setenv("OO_SCREEN_LEGACY_AGENT_TOKEN", "1")
+	if !agentAuthorized("victim", token) {
+		t.Fatal("OO_SCREEN_LEGACY_AGENT_TOKEN=1 не повернув легасі")
+	}
+	// Наявна нода з агентом після невдалого offer-у лишається.
+	secPublisher("live")
+	if c := post(hub.NodeToken(agentMaster(), "live"), "live"); c != http.StatusBadRequest || reg.get("live") == nil {
+		t.Fatalf("live: status=%d, нода зникла=%v", c, reg.get("live") == nil)
 	}
 }
 

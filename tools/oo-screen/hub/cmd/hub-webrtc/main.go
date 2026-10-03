@@ -419,6 +419,31 @@ func (r *registry) getOrCreate(nodeID string) *nodeSession {
 	return ns
 }
 
+// getOrCreateNew — як getOrCreate, але ще й каже, чи нода створена саме зараз
+// (SEC #17: невдалий offer мусить прибрати те, що сам створив).
+func (r *registry) getOrCreateNew(nodeID string) (*nodeSession, bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	ns := r.nodes[nodeID]
+	if ns != nil {
+		return ns, false
+	}
+	ns = &nodeSession{nodeID: nodeID}
+	r.nodes[nodeID] = ns
+	return ns, true
+}
+
+// removeIfIdle прибирає ноду, якщо в неї немає ні агента, ні глядачів (SEC #17:
+// невдалий agent-offer не лишає порожніх нод — інакше реєстр росте без меж).
+func (r *registry) removeIfIdle(ns *nodeSession) {
+	ns.mu.Lock()
+	idle := ns.agentPC == nil && len(ns.viewers) == 0
+	ns.mu.Unlock()
+	if idle {
+		r.remove(ns.nodeID, ns)
+	}
+}
+
 // get повертає nodeSession для node або nil. Використовує viewer-нога у
 // ticket-режимі: nil => немає publisher => fail-closed (403).
 func (r *registry) get(nodeID string) *nodeSession {
@@ -801,7 +826,16 @@ func handleOffer(leg string) http.HandlerFunc {
 			// legProfile — profile-level-id, який ця нога оголошує. Agent-нога
 			// бере його зі свого ж offer-а, viewer-нога — з ноди.
 			legProfile string
+			// agentCreated — agent-offer створив ноду сам (SEC #17); answered —
+			// дійшли до answer. Невдалий offer прибирає створену ним ноду.
+			agentCreated bool
+			answered     bool
 		)
+		defer func() {
+			if agentCreated && !answered {
+				reg.removeIfIdle(ns)
+			}
+		}()
 
 		switch {
 		case leg == "viewer":
@@ -836,17 +870,17 @@ func handleOffer(leg string) http.HandlerFunc {
 				return
 			}
 		default:
-			// Agent-нога: статичний token завжди. Node з offer (поле "node"),
-			// фолбек — env OO_SCREEN_AGENT_NODE_ID (один T1-агент без -node).
-			if !tokenMatches(req.Token) {
-				http.Error(w, "bad token", http.StatusUnauthorized)
-				return
-			}
+			// Agent-нога: токен НОДИ (SEC #17, agentauth.go) або легасі-спільний.
+			// Node з offer (поле "node"), фолбек — env OO_SCREEN_AGENT_NODE_ID.
 			node := req.Node
 			if node == "" {
 				node = agentNodeIDEnv
 			}
-			ns = reg.getOrCreate(node)
+			if !agentAuthorized(node, req.Token) {
+				http.Error(w, "bad token", http.StatusUnauthorized)
+				return
+			}
+			ns, agentCreated = reg.getOrCreateNew(node)
 			// Стартовий бітрейт агента = стеля адаптації (bitrate.go). Старий
 			// агент поля не шле — лишається фолбек startBitrateBps.
 			if req.Bitrate > 0 {
@@ -890,7 +924,6 @@ func handleOffer(leg string) http.HandlerFunc {
 		}
 		// H-04: кожен error-path нижче раніше лишав PeerConnection (ICE-агент,
 		// UDP-сокети, горутини) жити назавжди. Закриваємо, якщо не дійшли до answer.
-		answered := false
 		defer func() {
 			if !answered {
 				_ = pc.Close()
