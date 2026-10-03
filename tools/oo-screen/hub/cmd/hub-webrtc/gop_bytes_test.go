@@ -18,7 +18,7 @@ func gopStream(g *gopCache, bps uint64, span time.Duration, payload int) int {
 	}
 	step := uint32(span.Seconds()*gopClockRate) / uint32(pps)
 	key := make([]byte, payload)
-	key[0] = 0x65 // IDR
+	copy(key, []byte{0x78, 0, 2, 0x67, 0x42, 0, 2, 0x68, 0xCE, 0, 2, 0x65, 0x88}) // STAP-A: SPS+PPS+IDR
 	g.note(&rtp.Packet{Header: rtp.Header{SequenceNumber: 1, Timestamp: 1000}, Payload: key})
 	for i := 1; i < pps; i++ {
 		p := make([]byte, payload)
@@ -71,7 +71,7 @@ func TestGopHugePacketsHitByteCap(t *testing.T) {
 	}
 	const sz = 64 << 10
 	key := make([]byte, sz)
-	key[0] = 0x65
+	copy(key, []byte{0x78, 0, 2, 0x67, 0x42, 0, 2, 0x68, 0xCE, 0, 2, 0x65, 0x88})
 	g.note(&rtp.Packet{Header: rtp.Header{Timestamp: 0}, Payload: key})
 	i := 1
 	for ; !g.overflow && i < gopMaxPackets; i++ {

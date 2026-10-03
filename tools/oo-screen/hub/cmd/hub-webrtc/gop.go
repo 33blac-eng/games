@@ -104,11 +104,25 @@ type gopCache struct {
 	// НЕ безперервний від IDR. Віддавати такий не можна: глядач отримав би
 	// картинку з діркою посередині замість чесної паузи до keyframe.
 	overflow bool
-	// inKey — попередній пакет належав ключовому набору. Потрібен саме фронт
-	// (перехід «не ключовий» -> «ключовий»): SPS, PPS і фрагменти IDR ідуть
-	// підряд, і скидати кеш на кожному з них означало б викинути SPS/PPS, без
-	// яких сам IDR не декодується.
-	inKey bool
+	// B1: межа кешу — ACCESS UNIT, а не «фронт ключового пакета». AU у RTP —
+	// усі пакети з одним timestamp. Кеш перезапускається лише на ПЕРШОМУ
+	// ключовому пакеті (SPS/PPS/IDR у будь-якому пакуванні) НОВОГО AU, і далі
+	// в нього йде весь цей AU: усі слайси IDR (між FU-A-фрагментами яких раніше
+	// був «фронт»), SEI між PPS та IDR, і навіть SEI/AUD, що стояли в AU ДО SPS
+	// (їх тримає auPkts). Кілька слайсів одного IDR кеш більше не рвуть.
+	//
+	// haveAU/auTS — timestamp поточного AU; auKey — у поточному AU кеш уже
+	// перезапущено; auPkts — пакети поточного AU до його першого ключового
+	// пакета (лише поки !auKey; на зміні AU спорожнюється).
+	haveAU bool
+	auTS   uint32
+	auKey  bool
+	auPkts []*rtp.Packet
+	// hasSPS/hasPPS/hasIDR — що з ключового набору є в ПЕРШОМУ AU кешу. Кеш
+	// самодостатній (декодер почне з першого пакета) лише коли є всі три;
+	// інакше replay() нічого не віддає, і нова нога просить keyframe, а не
+	// вважається primed із кадром, якого не декодувати.
+	hasSPS, hasPPS, hasIDR bool
 	// startTS — RTP-timestamp першого пакета в кеші (межа gopMaxSpan).
 	startTS uint32
 	// bytes — скільки байтів (payload + gopPacketOverhead) зараз у кеші.
@@ -126,19 +140,50 @@ func (g *gopCache) setBitrate(bps uint64) { g.bps = bps }
 // note кладе черговий egress-пакет ноди у кеш. Кликати під ns.mu, ОДРАЗУ після
 // перепису seq/ts і з тим самим вказівником, що йде в черги глядачів: пакет
 // після цього ніхто не мутує (див. forwardToViewers).
-func (g *gopCache) note(pkt *rtp.Packet) {
-	key := h264KeyPart(pkt.Payload)
-	if key && !g.inKey {
+//
+// Повертає true, якщо цей пакет ПОЧАВ новий ключовий AU — єдина точка, з якої
+// декодер уміє стартувати (нею ж forwardToViewers знімає drop-to-IDR).
+func (g *gopCache) note(pkt *rtp.Packet) (keyStart bool) {
+	if !g.haveAU || pkt.Timestamp != g.auTS {
+		g.haveAU = true
+		g.auTS = pkt.Timestamp
+		g.auKey = false
+		clear(g.auPkts)
+		g.auPkts = g.auPkts[:0]
+	}
+	if !g.auKey && h264KeyPart(pkt.Payload) {
+		// Перший ключовий пакет нового AU: новий кеш, і в нього — все, що
+		// цей AU уже приніс (SEI/AUD перед SPS).
+		g.auKey = true
+		keyStart = true
 		g.drop()
 		g.overflow = false
+		g.hasSPS, g.hasPPS, g.hasIDR = false, false, false
 		g.startTS = pkt.Timestamp
+		for _, p := range g.auPkts {
+			g.add(p)
+		}
+		clear(g.auPkts)
+		g.auPkts = g.auPkts[:0]
+	} else if !g.auKey {
+		// Пакети AU до його першого ключового: тримаємо, поки AU не скінчився
+		// (зазвичай це P-кадр — тоді на зміні AU вони просто відпускаються).
+		if len(g.auPkts) < 64 {
+			g.auPkts = append(g.auPkts, pkt)
+		}
 	}
-	g.inKey = key
+	if len(g.pkts) == 0 && !g.auKey {
+		return false // ще не бачили жодного ключового набору — накопичувати нема від чого
+	}
+	g.add(pkt)
+	return keyStart
+}
+
+// add — один пакет у кеш з усіма межами (overflow -> порожній кеш до
+// наступного ключового AU).
+func (g *gopCache) add(pkt *rtp.Packet) {
 	if g.overflow {
 		return
-	}
-	if len(g.pkts) == 0 && !key {
-		return // ще не бачили жодного ключового набору — накопичувати нема від чого
 	}
 	size := len(pkt.Payload) + gopPacketOverhead
 	if len(g.pkts) >= gopMaxPackets ||
@@ -147,6 +192,18 @@ func (g *gopCache) note(pkt *rtp.Packet) {
 		g.overflow = true
 		g.drop()
 		return
+	}
+	if pkt.Timestamp == g.startTS {
+		h264NALTypes(pkt.Payload, func(t byte) {
+			switch t {
+			case 7:
+				g.hasSPS = true
+			case 8:
+				g.hasPPS = true
+			case 5:
+				g.hasIDR = true
+			}
+		})
 	}
 	g.pkts = append(g.pkts, pkt)
 	g.bytes += size
@@ -163,27 +220,63 @@ func (g *gopCache) drop() {
 		g.pkts = g.pkts[:0]
 	}
 	g.bytes = 0
+	g.hasSPS, g.hasPPS, g.hasIDR = false, false, false
 }
 
-// reset викидає кеш цілком. H-07: на заміні агента вміст лишається від
-// ПОПЕРЕДНЬОГО кодера — чужі SPS/PPS і кадри, яких у новому потоці вже немає.
-// Порожній кеш чесніший за такий: нова нога просто чекає IDR нового агента.
+// reset викидає кеш цілком і віддає ВСЮ його пам'ять (B3). H-07: на заміні
+// агента вміст лишається від ПОПЕРЕДНЬОГО кодера — чужі SPS/PPS і кадри, яких
+// у новому потоці вже немає. B2: те саме на втраті агента — кеш мертвого
+// кодера не має дожити ні до нового агента, ні до кінця життя запису ноди.
 // Кликати під ns.mu, як і note/replay.
 func (g *gopCache) reset() {
-	g.drop()
+	g.pkts = nil
+	g.bytes = 0
+	g.hasSPS, g.hasPPS, g.hasIDR = false, false, false
 	g.overflow = false
-	g.inKey = false
+	g.haveAU, g.auKey, g.auTS = false, false, 0
+	g.auPkts = nil
 	g.startTS = 0
 }
 
+// selfContained — кеш починається з повного ключового набору (SPS+PPS+IDR у
+// першому AU), тобто декодер нової ноги почне з першого ж пакета.
+func (g *gopCache) selfContained() bool {
+	return !g.overflow && len(g.pkts) > 0 && g.hasSPS && g.hasPPS && g.hasIDR
+}
+
 // replay — вміст кешу для нового глядача, або nil, якщо віддавати нічого (кеш
-// порожній чи розірваний). Кликати під ns.mu; зріз читається одразу ж, під тим
-// самим локом.
+// порожній, розірваний або не самодостатній — тоді нога просить keyframe).
+// Кликати під ns.mu; зріз читається одразу ж, під тим самим локом.
 func (g *gopCache) replay() []*rtp.Packet {
-	if g.overflow || len(g.pkts) == 0 {
+	if !g.selfContained() {
 		return nil
 	}
 	return g.pkts
+}
+
+// h264NALTypes викликає f для типу кожного NAL, що ПОЧИНАЄТЬСЯ в цьому
+// RTP-payload: одиничний NAL, кожен NAL зі STAP-A, початковий фрагмент FU-A.
+func h264NALTypes(p []byte, f func(byte)) {
+	if len(p) == 0 {
+		return
+	}
+	switch t := p[0] & 0x1F; t {
+	case 24:
+		for i := 1; i+2 < len(p); {
+			n := int(p[i])<<8 | int(p[i+1])
+			if n == 0 || i+2+n > len(p) {
+				return
+			}
+			f(p[i+2] & 0x1F)
+			i += 2 + n
+		}
+	case 28:
+		if len(p) > 1 && p[1]&0x80 != 0 {
+			f(p[1] & 0x1F)
+		}
+	default:
+		f(t)
+	}
 }
 
 // h264KeyPart — чи несе цей RTP-payload частину ключового набору H.264:

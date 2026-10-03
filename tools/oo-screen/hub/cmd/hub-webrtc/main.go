@@ -1693,7 +1693,9 @@ func forwardToViewers(ns *nodeSession, gen uint64, pkt *rtp.Packet) {
 	// нової цілі лише за GOP, і хвіст, набраний на старому бітрейті, не має
 	// рватися через те, що ціль щойно впала.
 	ns.gop.setBitrate(ns.ceilingBps())
-	ns.gop.note(out)
+	// B1: «ключовий» для drop-to-IDR — це ПОЧАТОК ключового AU, а не будь-який
+	// пакет із NAL 5: старт FU-A другого слайса IDR без SPS/PPS не декодується.
+	isKey := ns.gop.note(out)
 
 	// send неблокуючий: черга повна => ця нога відстає від джерела.
 	//
@@ -1702,7 +1704,6 @@ func forwardToViewers(ns *nodeSession, gen uint64, pkt *rtp.Packet) {
 	// наступного ключового пакета, і саме ця пауза дає її pump-у розібрати
 	// чергу. Рвемо лише того, кому це не допомогло viewerOverflowStreakMax разів
 	// поспіль — і, як і раніше, ПОЗА локом (dropViewer смикає колбеки pion).
-	isKey := h264KeyPart(out.Payload)
 	var slow []*viewerLeg
 	overflowed := false
 	for _, vl := range ns.viewers {
