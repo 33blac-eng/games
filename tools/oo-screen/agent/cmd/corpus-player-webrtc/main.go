@@ -41,11 +41,13 @@ var token = envOr("OO_SCREEN_T1_TOKEN", "t1-dev-token")
 var hubURL = envOr("OO_SCREEN_HUB_URL", "http://127.0.0.1:4470/offer/agent")
 
 func corpusPath() string {
-	return filepath.Join("bench", "corpus", "corpus-1080p60.h264")
+	return envOr("OO_CORPUS_PATH", filepath.Join("bench", "corpus", "corpus-1080p60.h264"))
 }
 
-func loadAUs() []h264.AU {
-	data, err := os.ReadFile(corpusPath())
+func loadAUs() []h264.AU { return loadAUsFrom(corpusPath()) }
+
+func loadAUsFrom(path string) []h264.AU {
+	data, err := os.ReadFile(path)
 	if err != nil {
 		log.Fatalf("read corpus: %v", err)
 	}
@@ -88,8 +90,9 @@ func newAPI() (*webrtc.API, error) {
 }
 
 type offerReq struct {
-	SDP   string `json:"sdp"`
-	Token string `json:"token"`
+	SDP     string `json:"sdp"`
+	Token   string `json:"token"`
+	Bitrate uint64 `json:"bitrate,omitempty"`
 }
 type answerResp struct {
 	SDP string `json:"sdp"`
@@ -106,7 +109,7 @@ func negotiate(pc *webrtc.PeerConnection) error {
 	}
 	<-gatherComplete
 
-	body, _ := json.Marshal(offerReq{SDP: pc.LocalDescription().SDP, Token: token})
+	body, _ := json.Marshal(offerReq{SDP: pc.LocalDescription().SDP, Token: token, Bitrate: offerBitrate})
 	resp, err := http.Post(hubURL, "application/json", bytes.NewReader(body))
 	if err != nil {
 		return err
@@ -127,7 +130,21 @@ type errStatus int
 func (e errStatus) Error() string { return "hub responded with non-200 status" }
 
 func main() {
-	aus := loadAUs()
+	// OO_CORPUS_LADDER — режим «енкодер слухає хаб» (bench/impair netbench):
+	// драбина корпусів різного бітрейту, oosc-ctl канал, реакція на
+	// bitrate_target / keyframe_request / PLI. Без змінної — рівно стара поведінка.
+	var lad *ladder
+	if spec := os.Getenv("OO_CORPUS_LADDER"); spec != "" {
+		var err error
+		if lad, err = loadLadder(spec); err != nil {
+			log.Fatalf("ladder: %v", err)
+		}
+		offerBitrate = lad.levels[len(lad.levels)-1].bps
+	}
+	var aus []h264.AU
+	if lad == nil {
+		aus = loadAUs()
+	}
 
 	api, err := newAPI()
 	if err != nil {
@@ -155,6 +172,13 @@ func main() {
 	pc.OnICEConnectionStateChange(func(s webrtc.ICEConnectionState) {
 		log.Printf("agent ICE: %s", s)
 	})
+	if lad != nil {
+		ctl, err := pc.CreateDataChannel("oosc-ctl", nil)
+		if err != nil {
+			log.Fatalf("ctl channel: %v", err)
+		}
+		ctl.OnMessage(func(msg webrtc.DataChannelMessage) { lad.onCtl(msg.Data) })
+	}
 
 	// RTCP read-loop власного sender-а: PLI логуємо (ігноруємо в T1 — корпус
 	// має IDR/2с), NACK-пакети пропускаємо через interceptor-chain (nack
@@ -172,7 +196,12 @@ func main() {
 			}
 			for _, p := range pkts {
 				if _, ok := p.(*rtcp.PictureLossIndication); ok {
-					log.Printf("PLI received from hub (ignored in T1, corpus has IDR/2s)")
+					if lad != nil {
+						log.Printf("PLI received from hub -> IDR")
+						lad.requestIDR()
+					} else {
+						log.Printf("PLI received from hub (ignored in T1, corpus has IDR/2s)")
+					}
 				}
 			}
 		}
@@ -196,6 +225,12 @@ func main() {
 
 	i := 0
 	for range ticker.C {
+		if lad != nil {
+			if err := track.WriteSample(media.Sample{Data: lad.next(), Duration: frameDur}); err != nil {
+				log.Printf("write sample failed: %v", err)
+			}
+			continue
+		}
 		au := aus[i%len(aus)]
 		if err := track.WriteSample(media.Sample{Data: au.Data, Duration: frameDur}); err != nil {
 			// НЕ просуваємо AU на помилці (finding 12): просування створює
