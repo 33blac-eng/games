@@ -20,6 +20,11 @@ concurrency:
   group: oo-screen-${{ github.ref }}
   cancel-in-progress: true
 
+env:
+  # go.mod pins `toolchain go1.26.8` (patched stdlib); auto lets go fetch it
+  # if setup-go installed an older 1.26.x.
+  GOTOOLCHAIN: auto
+
 defaults:
   run:
     shell: bash
@@ -117,20 +122,19 @@ jobs:
         run: bash deploy/test/hub-deploy-test.sh
 
   govulncheck:
-    # Blocking. Uses the latest 1.26 patch release rather than the exact go.mod
-    # version: the scan is about our code + deps, and stdlib advisories are
-    # fixed by rebuilding with a patched toolchain (bump go.mod's `go` line for
-    # release builds to pick them up).
+    # Blocking. Runs on the toolchain pinned in go.mod (go1.26.8), the same one
+    # release builds use, so stdlib advisories fixed by a patch bump show up as
+    # a red build until go.mod's toolchain line is raised.
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
         with:
-          go-version: "1.26.x"
-          check-latest: true
+          go-version-file: tools/oo-screen/go.mod
           cache: true
           cache-dependency-path: tools/oo-screen/go.sum
       - name: govulncheck
         run: |
+          go version
           go install golang.org/x/vuln/cmd/govulncheck@latest
           "$(go env GOPATH)/bin/govulncheck" ./...

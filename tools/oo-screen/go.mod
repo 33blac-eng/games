@@ -2,6 +2,8 @@ module github.com/organicoils/oo-screen
 
 go 1.26.0
 
+toolchain go1.26.8
+
 require (
 	github.com/pion/interceptor v0.1.47
 	github.com/pion/rtcp v1.2.17
