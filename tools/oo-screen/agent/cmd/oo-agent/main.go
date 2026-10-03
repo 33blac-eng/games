@@ -37,6 +37,7 @@ import (
 	"github.com/organicoils/oo-screen/internal/control"
 	"github.com/organicoils/oo-screen/internal/cursorproto"
 	"github.com/organicoils/oo-screen/internal/envelope"
+	"github.com/organicoils/oo-screen/internal/pacer"
 	"github.com/organicoils/oo-screen/internal/refine"
 	"github.com/organicoils/oo-screen/internal/swlimit"
 	"github.com/organicoils/oo-screen/internal/textmode"
@@ -358,8 +359,19 @@ func dialWebRTC(hubURL string, frameInterval time.Duration, onKeyframeRequest fu
 		_ = pc.Close()
 		return nil, fmt.Errorf("new track: %w", err)
 	}
-	sender, err := pc.AddTrack(track)
+	// Пейсер (internal/pacer): pion і далі пакетизує, але RTP виходить
+	// leaky-bucket-ом на ~2x цілі, а не пачкою в 100+ пакетів на IDR.
+	var paced *pacer.Track
+	var local webrtc.TrackLocal = track
+	if pacerEnabled() {
+		paced = pacer.NewTrack(track, pacer.Config{})
+		local = paced
+	}
+	sender, err := pc.AddTrack(local)
 	if err != nil {
+		if paced != nil {
+			paced.Close()
+		}
 		_ = pc.Close()
 		return nil, fmt.Errorf("add track: %w", err)
 	}
@@ -478,7 +490,7 @@ func dialWebRTC(hubURL string, frameInterval time.Duration, onKeyframeRequest fu
 		_ = pc.Close()
 		return nil, err
 	}
-	return &webrtcTransport{pc: pc, track: track, atrk: atrk, frameInterval: frameInterval}, nil
+	return &webrtcTransport{pc: pc, track: track, paced: paced, atrk: atrk, frameInterval: frameInterval}, nil
 }
 
 // waitConnected чекає на connected, який закриває обробник стану з dialWebRTC.
@@ -494,7 +506,12 @@ func waitConnected(pc *webrtc.PeerConnection, connected <-chan struct{}, timeout
 
 func (t *webrtcTransport) send(au encode.AU, _ uint64) error {
 	// WebRTC не використовує envelope: RTP/Pion самі несуть seq/timestamp.
-	return t.track.WriteSample(media.Sample{Data: au.Data, Duration: t.sampleDuration(au.PTS)})
+	s := media.Sample{Data: au.Data, Duration: t.sampleDuration(au.PTS)}
+	if t.paced != nil {
+		t.syncPaceTarget()
+		return t.paced.WriteSample(s, au.Keyframe)
+	}
+	return t.track.WriteSample(s)
 }
 
 // ---------------------------------------------------------------------------
@@ -1068,6 +1085,7 @@ func main() {
 		cap: cap_, output: outIdx,
 	}
 	s.bitrateBps.Store(int64(bitrateBps))
+	paceTargetBps.Store(uint64(bitrateBps))
 	// nil-guard: на паузі капчер звільнено (releaseCapture), тож на виході з
 	// агента, що стався у простої, s.cap уже nil — Close на nil впав би.
 	defer func() {
@@ -1168,6 +1186,7 @@ func main() {
 		// Запамʼятовуємо ЖИВУ ціль: SwitchOutput відкриває новий енкодер саме з
 		// нею, інакше перемикання монітора мовчки скасовувало б притискання хаба.
 		s.bitrateBps.Store(int64(bps))
+		paceTargetBps.Store(uint64(bps))
 		log.Printf("oo-agent: bitrate -> %d bps", bps)
 		if err := e.ForceIDR(); err != nil {
 			log.Printf("oo-agent: ForceIDR (bitrate change): %v", err)

@@ -65,16 +65,26 @@ func (l *ladder) pick(bps uint64) int {
 	return idx
 }
 
-func (l *ladder) next() []byte {
+func (l *ladder) next() []byte { return l.nextAU().Data }
+
+// nextAU — як next, але з прапорцем IDR (для пейсера: кредит на keyframe).
+func (l *ladder) nextAU() h264.AU {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	if l.pending {
 		l.pos, l.pending = 0, false
 	}
 	aus := l.levels[l.cur].aus
-	d := aus[l.pos%len(aus)].Data
+	au := aus[l.pos%len(aus)]
 	l.pos++
-	return d
+	return au
+}
+
+// levelBps — бітрейт поточного щабля (ціль «енкодера» для пейсера).
+func (l *ladder) levelBps() uint64 {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.levels[l.cur].bps
 }
 
 func (l *ladder) requestIDR() {

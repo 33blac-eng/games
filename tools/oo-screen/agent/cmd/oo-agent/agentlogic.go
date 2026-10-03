@@ -9,6 +9,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"os"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -19,6 +20,7 @@ import (
 
 	"github.com/organicoils/oo-screen/internal/control"
 	"github.com/organicoils/oo-screen/internal/h264"
+	"github.com/organicoils/oo-screen/internal/pacer"
 )
 
 const (
@@ -126,6 +128,10 @@ func encoderPLID(headers []byte) (string, error) {
 type webrtcTransport struct {
 	pc    *webrtc.PeerConnection
 	track *webrtc.TrackLocalStaticSample
+	// paced — та сама доріжка під пейсером (nil при OO_SCREEN_PACER=0);
+	// тоді кадри йдуть через неї, а track лише всередині.
+	paced   *pacer.Track
+	paceBps uint64
 	// atrk — доріжка звуку цього ж зʼєднання. nil без OO_SCREEN_AUDIO, і
 	// тоді sendAudio — порожній виклик (audio.go: audioTrackSample).
 	atrk     *webrtc.TrackLocalStaticSample
@@ -226,6 +232,26 @@ func (t *webrtcTransport) sampleDuration(pts time.Duration) time.Duration {
 func (t *webrtcTransport) close() {
 	if t.pc != nil {
 		_ = t.pc.Close()
+	}
+	if t.paced != nil {
+		t.paced.Close()
+	}
+}
+
+// paceTargetBps — жива ціль енкодера (стартова й кожна, що лягла в
+// SetBitrate); пейсер транспорту підхоплює її на наступному кадрі. Глобальна,
+// бо транспорт переживає реконекти окремо від stream.
+var paceTargetBps atomic.Uint64
+
+// pacerEnabled — OO_SCREEN_PACER: типово УВІМКНЕНО, "0" вимикає (стара
+// поведінка: весь AU одразу в сокет).
+func pacerEnabled() bool { return os.Getenv("OO_SCREEN_PACER") != "0" }
+
+// syncPaceTarget — з кадрового циклу перед WriteSample.
+func (t *webrtcTransport) syncPaceTarget() {
+	if b := paceTargetBps.Load(); b != t.paceBps {
+		t.paced.SetTarget(b)
+		t.paceBps = b
 	}
 }
 

@@ -20,12 +20,16 @@ import (
 	"github.com/pion/webrtc/v4/pkg/media"
 
 	"github.com/organicoils/oo-screen/internal/h264"
+	"github.com/organicoils/oo-screen/internal/pacer"
 )
 
 const (
 	frameDur     = 16667 * time.Microsecond // 60fps
 	h264FmtpLine = "level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=64002a"
 )
+
+// lastPace — остання ціль, віддана пейсеру (лише кадровий цикл).
+var lastPace uint64
 
 func envOr(k, def string) string {
 	if v := os.Getenv(k); v != "" {
@@ -164,7 +168,38 @@ func main() {
 		log.Fatalf("new track: %v", err)
 	}
 
-	sender, err := pc.AddTrack(track)
+	// OO_SCREEN_PACER=1 — RTP іде через leaky-bucket пейсер (internal/pacer),
+	// той самий, що в oo-agent: для порівняння netbench з/без. Ціль пейсера —
+	// бітрейт поточного щабля драбини (без драбини — offerBitrate або 8 Мбіт/с).
+	var paced *pacer.Track
+	var local webrtc.TrackLocal = track
+	if os.Getenv("OO_SCREEN_PACER") == "1" {
+		paced = pacer.NewTrack(track, pacer.Config{})
+		local = paced
+		log.Printf("pacer: on")
+		go func() {
+			for range time.Tick(10 * time.Second) {
+				log.Printf("pacer: stats=%+v", paced.Stats())
+			}
+		}()
+	}
+	write := func(au h264.AU) error {
+		s := media.Sample{Data: au.Data, Duration: frameDur}
+		if paced == nil {
+			return track.WriteSample(s)
+		}
+		bps := uint64(8_000_000)
+		if lad != nil {
+			bps = lad.levelBps()
+		}
+		if bps != lastPace {
+			paced.SetTarget(bps)
+			lastPace = bps
+		}
+		return paced.WriteSample(s, au.Keyframe)
+	}
+
+	sender, err := pc.AddTrack(local)
 	if err != nil {
 		log.Fatalf("add track: %v", err)
 	}
@@ -226,13 +261,13 @@ func main() {
 	i := 0
 	for range ticker.C {
 		if lad != nil {
-			if err := track.WriteSample(media.Sample{Data: lad.next(), Duration: frameDur}); err != nil {
+			if err := write(lad.nextAU()); err != nil {
 				log.Printf("write sample failed: %v", err)
 			}
 			continue
 		}
 		au := aus[i%len(aus)]
-		if err := track.WriteSample(media.Sample{Data: au.Data, Duration: frameDur}); err != nil {
+		if err := write(au); err != nil {
 			// НЕ просуваємо AU на помилці (finding 12): просування створює
 			// дірку в стрімі (пропущений AU) поверх уже втраченого сімпла.
 			// Короткий бек-офф + retry того ж AU на наступному тіку.
