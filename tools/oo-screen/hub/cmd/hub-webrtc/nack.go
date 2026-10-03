@@ -117,9 +117,11 @@ func onNack(ns *nodeSession, vl *viewerLeg, n *rtcp.TransportLayerNack, now time
 	window := nackWindowFor(sent)
 
 	var req, hit uint64
+	var seqs []uint16
 	for i := range n.Nacks {
 		n.Nacks[i].Range(func(seq uint16) bool {
 			req++
+			seqs = append(seqs, seq)
 			if nackRecoverable(highest, seq, window) {
 				hit++
 			}
@@ -132,6 +134,7 @@ func onNack(ns *nodeSession, vl *viewerLeg, n *rtcp.TransportLayerNack, now time
 
 	ns.mu.Lock()
 	defer ns.mu.Unlock()
+	vl.noteNackSeqs(seqs) // B4: втрати до ретрансмісії (legCongestion)
 	if vl.nackWinAt.IsZero() {
 		vl.nackWinAt = now
 	}

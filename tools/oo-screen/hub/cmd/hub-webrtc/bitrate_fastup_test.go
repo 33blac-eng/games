@@ -71,12 +71,23 @@ func TestFastUpHysteresisBelowCutLevel(t *testing.T) {
 	}
 	c.target, c.cutFrom = 2_000_000, 4_000_000
 	limit := uint64(4_000_000 * fastUpCapFrac)
-	for i := 1; i <= 40; i++ {
+	// B5: межа діє, поки cutFrom не забуто (cutFromHold: тепер 4-8 с замість
+	// 60 с), тож вікно тесту — в межах витримки, а не 40 с: старий цикл пінив
+	// саме повільне відновлення, яке B5 виправляє. failedProbes=2 подовжує
+	// витримку до 8 с, щоб швидкий режим (після fastUpAfter 5 с) встиг
+	// зрушити; межу видно, бо перевіряємо її на кожному кроці. Після забування — див. TestProbeBackoff* у bitrate_cong_test.go.
+	c.failedProbes = 2
+	c.cutFrom = 2_400_000 // межа 2.04M: досяжна одним кроком розгону (×1.15 < 2.04/2)
+	limit = uint64(2_400_000 * fastUpCapFrac)
+	for i := 1; i < int(c.cutFromHold()/time.Second); i++ {
 		c, _ = c.step(0, 0, t0.Add(time.Duration(i)*time.Second))
+		if c.cutFrom > 0 && c.target > limit {
+			t.Fatalf("на %d с ціль %d вища за межу швидкого %d", i, c.target, limit)
+		}
 	}
-	// До межі — швидко; за межею лише повільні +5%/10 с.
-	if c.target < limit || float64(c.target) > float64(limit)*upFactor*upFactor+1 {
-		t.Fatalf("ціль %d, межа швидкого %d", c.target, limit)
+	// До межі — швидко.
+	if c.target != limit || c.cutFrom == 0 {
+		t.Fatalf("ціль %d, межа швидкого %d, cutFrom %d", c.target, limit, c.cutFrom)
 	}
 }
 

@@ -1536,6 +1536,7 @@ func setupViewerLeg(ns *nodeSession, pc *webrtc.PeerConnection, claims *hub.Tick
 				switch pkt := p.(type) {
 				case *rtcp.PictureLossIndication:
 					ns.m.pliFromViewers.Add(1)
+					notePLI(ns, vl) // B4: keyframe-request rate ноги
 					propagatePLI(ns)
 				case *rtcp.TransportLayerNack:
 					// NACK responder pion відповідає на цей же пакет сам
@@ -1572,8 +1573,10 @@ func setupViewerLeg(ns *nodeSession, pc *webrtc.PeerConnection, claims *hub.Tick
 						// щойно прийшов (див. worstViewerRR).
 						loss, jitter, rttExcess := worstViewerRR(ns, vl, float64(rr.FractionLost)/256, rr.Jitter, rtt, now)
 						prev := bitrateTarget(ns)
-						onReceiverReport(ns, loss, jitter, rttExcess, now)
-						metricsNoteBitrate(ns, prev, "", loss)
+						// B4: втрати до ретрансмісії та PLI — RR їх не бачить.
+						sig := legCongestion(ns, vl, now)
+						onReceiverReportSig(ns, loss, jitter, rttExcess, sig, now)
+						metricsNoteBitrate(ns, prev, bitrateReason(ns), loss)
 					}
 				}
 			}

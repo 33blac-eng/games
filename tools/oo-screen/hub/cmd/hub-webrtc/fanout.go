@@ -121,6 +121,18 @@ type viewerLeg struct {
 	nackWinAt time.Time
 	pliUntil  time.Time
 
+	// B4: сигнали затору до ретрансмісії (legCongestion). nackSeen — унікальні
+	// seq із NACK за поточний інтервал між RR (nackPrev — за попередній, щоб
+	// повторний NACK того самого seq через межу інтервалу не рахувався двічі),
+	// sentAtRR — vl.sent на початку інтервалу, pliCnt — PLI від глядача за
+	// інтервал. preLoss/plis — підсумок останнього закритого інтервалу. Під ns.mu.
+	nackSeen map[uint16]struct{}
+	nackPrev map[uint16]struct{}
+	sentAtRR uint64
+	pliCnt   int
+	preLoss  float64
+	plis     int
+
 	sent    uint64 // скільки пакетів реально пішло в трек (атомарно)
 	lastSeq uint32 // останній seq, реально записаний у трек (атомарно, uint16 у uint32)
 
@@ -461,6 +473,62 @@ func worstViewerRR(ns *nodeSession, vl *viewerLeg, loss float64, jitter uint32, 
 		}
 	}
 	return worstLoss, worstJitter, worstExcess
+}
+
+// legMinSent — найменше відправлених за інтервал, з якого preLoss має сенс:
+// на 1-2 пакетах keepalive один NACK дав би 50%.
+const legMinSent = 20
+
+// noteNackSeqs кладе запитані seq у множину поточного інтервалу. Кликати під ns.mu.
+func (vl *viewerLeg) noteNackSeqs(seqs []uint16) {
+	if vl.nackSeen == nil {
+		vl.nackSeen = make(map[uint16]struct{}, len(seqs))
+	}
+	for _, s := range seqs {
+		if _, dup := vl.nackPrev[s]; dup {
+			continue
+		}
+		vl.nackSeen[s] = struct{}{}
+	}
+}
+
+// notePLI рахує PLI від глядача цієї ноги (keyframe-request rate, B4).
+func notePLI(ns *nodeSession, vl *viewerLeg) {
+	ns.mu.Lock()
+	vl.pliCnt++
+	ns.mu.Unlock()
+}
+
+// legCongestion — B4: закриває інтервал ЦІЄЇ ноги (кликати на її RR) і віддає
+// НАЙГІРШІ preLoss/plis серед свіжих ніг — те саме правило, що worstViewerRR.
+// preLoss = унікальні NACK-нуті seq / відправлені за інтервал: втрати ДО
+// ретрансмісії, яких RR FractionLost не показує (див. bitrate.go, B4).
+func legCongestion(ns *nodeSession, vl *viewerLeg, now time.Time) congSignals {
+	sent := atomic.LoadUint64(&vl.sent)
+	ns.mu.Lock()
+	defer ns.mu.Unlock()
+	if d := sent - vl.sentAtRR; d >= legMinSent {
+		vl.preLoss = float64(len(vl.nackSeen)) / float64(d)
+		if vl.preLoss > 1 {
+			vl.preLoss = 1
+		}
+		vl.plis = vl.pliCnt
+		vl.nackPrev, vl.nackSeen = vl.nackSeen, nil
+		vl.sentAtRR, vl.pliCnt = sent, 0
+	}
+	worst := congSignals{preLoss: vl.preLoss, plis: vl.plis}
+	for _, o := range ns.viewers {
+		if o == vl || !o.ready || o.lastRR.IsZero() || now.Sub(o.lastRR) > viewerRRStale {
+			continue
+		}
+		if o.preLoss > worst.preLoss {
+			worst.preLoss = o.preLoss
+		}
+		if o.plis > worst.plis {
+			worst.plis = o.plis
+		}
+	}
+	return worst
 }
 
 // pump — власний писар ноги: єдине місце, де пакет іде у трек глядача. Живе

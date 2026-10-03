@@ -161,6 +161,89 @@ const (
 	rttDownFactor = 0.85
 )
 
+// B4 (TZ-GENERAL P0): СИГНАЛИ ЗАТОРУ, ЯКІ НЕ ЗАЛЕЖАТЬ ВІД ФІНАЛЬНИХ ВТРАТ.
+//
+// Заміряно (bench/RESULTS-network.md, п. 5): під стелею 2/4 Мбіт/с контролер
+// не сходився нижче за стелю, бо обидва його сигнали сліпі саме тут:
+//   - RR FractionLost рахується ПІСЛЯ ретрансмісій: NACK відновив пакет — у RR
+//     він «прийнятий», lossFrac сидить у сірій зоні 0.5-2% і ТРИМАЄ ціль, а
+//     повільний +5% тягне її назад у затор;
+//   - RTT-плечі мають поріг rttExcessMin 120 мс, а мілкий буфер вузького місця
+//     (100 мс, типовий Wi-Fi AP / мобільний) більшої черги дати НЕ МОЖЕ.
+//
+// Тому третій сигнал — комбінація, яку хаб бачить сам, без браузера:
+//   - preLoss — втрати ДО ретрансмісії: унікальні seq із NACK цієї ноги за
+//     інтервал між RR, поділені на відправлені за той самий інтервал. NACK
+//     іде повз RR, тож цю частку RR не «лікує»;
+//   - plis — PLI від глядача за інтервал (keyframe-request rate): дірка, яку
+//     NACK не закрив;
+//   - тренд затримки з НИЖЧИМ порогом (congDelayMin) — стійке зростання
+//     приросту, а не рівень.
+//
+// Головне: жоден із них не ріже САМ. Рівномірні втрати без затору (5-10%
+// при RTT 200 мс) дають preLoss тієї ж величини, але ЧЕРГИ не дають — приріст
+// RTT біля нуля, і різати там марно (NACK усе відновлює, а 0.5 Мбіт/с
+// картинки не покращать). Джитер ±30 мс дає приріст до ~80 мс, але NACK-ів
+// не дає (заміряно: дірка закривається раніше за опит генератора). Тож затор
+// = черга (приріст >= congDelayMin) І свідчення втрат (preLoss / PLI /
+// зростання з втратами). Поріг затримки тут 40 мс, а не 120: хиба 78 мс, через
+// яку rttExcessMin підняли до 120, була при НУЛЬОВИХ NACK, і в цю гілку вона
+// не проходить.
+//
+// Крок униз — не сталий 0.7, а за оцінкою доставленої швидкості:
+// ціль × (1 − preLoss) × congRateMargin, у межах [congCutMin, rttDownFactor].
+// Стеля 2 при цілі 8 дає preLoss ~0.75: один крок до ~2 замість чотирьох
+// кроків по 0.7 з дебаунсом 2 с (8 с) — ціль ≤ стелі за ≤ 5 с.
+const (
+	congDelayMin   = 40 * time.Millisecond // приріст, від якого черга вважається реальною
+	congPreLoss    = 0.02                  // частка NACK-нутого, що за наявності черги = затор
+	congPLIs       = 2                     // PLI за інтервал RR, що за наявності черги = затор
+	congRiseStep   = 10 * time.Millisecond // крок «зростання» для тренду з нижчим порогом
+	congRises      = 2                     // скільки зростань ПОСПІЛЬ до сигналу
+	congRateMargin = 0.9                   // запас під доставлену швидкість
+	congCutMin     = 0.5                   // найглибший один крок
+)
+
+// congSignals — додаткові входи контролера з НАЙГІРШОЇ ноги (legCongestion у
+// fanout.go). Нульове значення = сигналів немає = поведінка рівно як до B4.
+type congSignals struct {
+	preLoss float64 // втрати до ретрансмісії (унікальні NACK / відправлені), 0..1
+	plis    int     // PLI від глядача за інтервал між RR
+}
+
+// congestion — ЧИСТА: чи є затор за комбінованими сигналами і на який
+// множник різати. Без черги (excess < congDelayMin) — ніколи: див. блок вище.
+func congestion(excess time.Duration, s congSignals, lowRising bool) (bool, float64) {
+	if excess < congDelayMin {
+		return false, 0
+	}
+	if s.preLoss < congPreLoss && s.plis < congPLIs && !(lowRising && s.preLoss > lossLowFrac) {
+		return false, 0
+	}
+	f := (1 - s.preLoss) * congRateMargin
+	if f < congCutMin {
+		f = congCutMin
+	}
+	if f > rttDownFactor {
+		f = rttDownFactor
+	}
+	return true, f
+}
+
+// rttLowTrend — тренд затримки з НИЖЧИМ порогом: зростання на congRiseStep
+// семпл за семплом, congRises разів поспіль, над congDelayMin. Сам по собі
+// не ріже (див. congestion): лише разом із ненульовим preLoss.
+func (c bitrateCtl) rttLowTrend(excess time.Duration) (bitrateCtl, bool) {
+	switch {
+	case excess >= congDelayMin && excess >= c.lowRef+congRiseStep:
+		c.lowRises++
+	case excess < c.lowRef:
+		c.lowRises = 0
+	}
+	c.lowRef = excess
+	return c, c.lowRises >= congRises
+}
+
 // ГОЛОВНИЙ сигнал контролера — ВТРАТИ (доведено живим прогоном: 8 Мбіт/с ->
 // 660 кбіт/с і назад ×1.05 раз на 10 с). Другим тут стояв jitter із RR, і живий
 // прогін показав, що для НАШОГО тракту він непридатний у принципі, а не лише
@@ -297,6 +380,31 @@ type bitrateCtl struct {
 	cleanSince time.Time
 	cutFrom    uint64
 
+	// --- B5: проба з відступом (probe-and-back-off) ---
+	// lastUpAt/probeFrom — момент і рівень ДО останнього підйому: якщо затор
+	// прийшов протягом probeWindow після підйому, винен саме підйом, і
+	// відступаємо рівно на probeFrom, а не множником. probeLvl — рівень
+	// останнього затору; він переживає забутий cutFrom і обмежує першу пробу
+	// над ним probeOvershoot. failedProbes подвоює витримку перед наступною
+	// пробою (cutFromHold) — так на сталій стелі проби рідшають, а не пиляють.
+	lastUpAt     time.Time
+	probeFrom    uint64
+	probeLvl     uint64
+	failedProbes int
+	// congAt — коли востаннє БАЧИЛИ затор (навіть якщо зріз задебаунсено):
+	// проба підтверджена, лише якщо після підйому затору не бачили.
+	congAt time.Time
+
+	// reason — причина останньої зміни цілі (stepSig), для метрик.
+	reason string
+
+	// Стан rttLowTrend і серія «черга + NACK» (lossyRuns).
+	lowRef    time.Duration
+	lowRises  int
+	lossyRuns int
+	// upRun — швидких підйомів поспіль без зрізу (розгін кроку, fastUpStep).
+	upRun int
+
 	// textMode — ЗАГЛУШКА під контентно-залежну стелю (contentCeiling). Нічим не
 	// виставляється й у step() не входить; агента не чіпаємо.
 	textMode bool
@@ -309,20 +417,60 @@ type bitrateCtl struct {
 // тож ramp5/depth його не відкривають), (б) не частіше за fastUpDebounce (кожна
 // зміна цілі = keyframe_request, IDR раз на 3 с ~ природний GOP 2 с) і (в) лише
 // до fastUpCapFrac від рівня останнього зрізу — вище повземо старим +5%/10 с.
+//
+// B5 (TZ-GENERAL P0): заміряно, що «швидкий» режим був швидким лише після
+// хвилини чистоти (fastUpAfter 15 с + cutFromExpire 60 с): після стелі 2/4
+// Мбіт/с — 57-58 с до 90% від 8 Мбіт/с, без FASTUP — ~185 с. Тепер:
+//   - FASTUP УВІМКНЕНО за замовчуванням (OO_SCREEN_BITRATE_FASTUP=0 — стара
+//     поведінка);
+//   - fastUpAfter 15 -> 5 с, крок до +50% раз на 2 с;
+//   - cutFromExpire 60 -> 4 с, АЛЕ з подвоєнням за кожну невдалу пробу (до
+//     cutFromExpireMax) і з відступом на рівень до проби (probeFrom), якщо
+//     затор прийшов протягом probeWindow після підйому. Тобто підйом над
+//     старим затором — це ПРОБА: перша не вища за probeLvl×probeOvershoot,
+//     невдала відкочується одразу, а наступна чекає вдвічі довше.
 const (
-	fastUpAfter    = 15 * time.Second // тривалість чистого до мультиплікативного режиму
-	fastUpDebounce = 3 * time.Second
-	fastUpPerSec   = 1.08 // +8%/с еквівалент
-	fastUpMaxStep  = 1.30 // не більше +30% за один крок, хоч би скільки минуло
+	fastUpAfter    = 5 * time.Second // тривалість чистого до мультиплікативного режиму
+	fastUpDebounce = 2 * time.Second
+	fastUpPerSec   = 1.25 // +25%/с еквівалент
+	fastUpMaxStep  = 1.50 // не більше +50% за один крок, хоч би скільки минуло
 	fastUpCapFrac  = 0.85 // межа швидкого режиму відносно cutFrom
 	// cutFromExpire — після стількох безперервно чистих секунд рівень старого
 	// затору вже нічого не каже про канал: cutFrom забуваємо, і швидкий режим
-	// знову може йти до startBps/REMB.
-	cutFromExpire = 60 * time.Second
+	// знову може пробувати вище (див. probeLvl). Подвоюється за кожну
+	// невдалу пробу, до cutFromExpireMax.
+	//
+	// Чому так коротко (4-8 с, а не хвилина): час відновлення після зняття
+	// стелі = витримка до проби + підтвердження + ~4 кроки розгону по 2 с.
+	// Щоб уміститись у ~15 с, витримка мусить бути ≤ ~8 с. Ціна на СТАЛІЙ
+	// стелі — проба раз на ~8-12 с, але мала (≤ probeOvershoot над рівнем затору, ~2 с,
+	// і відкат на рівень до проби), а не пилка 0.7/+5%.
+	cutFromExpire    = 4 * time.Second
+	cutFromExpireMax = 8 * time.Second
+	probeWindow      = 5 * time.Second // затор за стільки після підйому = проба невдала
+	probeOvershoot   = 1.15            // перша проба над рівнем затору — не вище
+	probeConfirm     = 2 * time.Second // проба без затору стільки — канал ширший
+	// probeBackoffDebounce — дебаунс відкату невдалої проби (замість
+	// downDebounce); не нижче за keyframeDebnc, щоб IDR не дублювались.
+	probeBackoffDebounce = time.Second
 )
 
-// fastRecoveryDefault — env-ручка; читається в newBitrateCtl.
-var fastRecoveryDefault = os.Getenv("OO_SCREEN_BITRATE_FASTUP") == "1"
+// fastRecoveryDefault — env-ручка; читається в newBitrateCtl. B5: дефолт
+// УВІМКНЕНО, "0" вимикає.
+var fastRecoveryDefault = os.Getenv("OO_SCREEN_BITRATE_FASTUP") != "0"
+
+// cutFromHold — скільки чистого треба, щоб забути cutFrom, з урахуванням
+// невдалих проб (експоненційний відступ).
+func (c bitrateCtl) cutFromHold() time.Duration {
+	d := cutFromExpire
+	for i := 0; i < c.failedProbes && d < cutFromExpireMax; i++ {
+		d *= 2
+	}
+	if d > cutFromExpireMax {
+		d = cutFromExpireMax
+	}
+	return d
+}
 
 // fastUpStep — ЧИСТА: чи дозволено швидкий підйом і на яку ціль. ok=false —
 // лишаємось у старому повільному режимі. Стелі startBps/REMB клампить step().
@@ -336,6 +484,12 @@ func (c bitrateCtl) fastUpStep(now time.Time) (uint64, bool) {
 	limit := c.startBps
 	if c.cutFrom > 0 {
 		limit = uint64(float64(c.cutFrom) * fastUpCapFrac)
+	} else if c.probeLvl > 0 {
+		// cutFrom забуто, але проба над старим затором ще не підтверджена:
+		// не вище за probeLvl×probeOvershoot, доки не переживе probeConfirm.
+		if p := uint64(float64(c.probeLvl) * probeOvershoot); p < limit {
+			limit = p
+		}
 	}
 	if c.target >= limit {
 		return 0, false // вище межі — гістерезис, повільний режим
@@ -345,6 +499,13 @@ func (c bitrateCtl) fastUpStep(now time.Time) (uint64, bool) {
 		secs = now.Sub(c.lastSent).Seconds()
 	}
 	f := math.Pow(fastUpPerSec, secs)
+	// Розгін, а не стрибок: перший швидкий крок після зрізу — не більше
+	// probeOvershoot, кожен наступний без затору — ще ×probeOvershoot, до
+	// fastUpMaxStep. Так проба на сталій стелі коштує +15%, а не +50%, а
+	// після зняття стелі за 4-5 кроків (8-10 с) крок уже повний.
+	if lim := math.Pow(probeOvershoot, float64(c.upRun+1)); f > lim {
+		f = lim
+	}
 	if f > fastUpMaxStep {
 		f = fastUpMaxStep
 	}
@@ -492,19 +653,45 @@ func (c bitrateCtl) rttLevel(excess time.Duration) (bitrateCtl, bool) {
 // ціль агентові. Дебаунс і "не слати, якщо ціль не змінилась" — теж тут, щоб усі
 // гілки рішення тестувались без мережі.
 func (c bitrateCtl) step(lossFrac float64, rttExcess time.Duration, now time.Time) (bitrateCtl, bool) {
+	return c.stepSig(lossFrac, rttExcess, congSignals{}, now)
+}
+
+// stepSig — step() плюс сигнали B4 (sig). Нульовий sig = рівно step().
+func (c bitrateCtl) stepSig(lossFrac float64, rttExcess time.Duration, sig congSignals, now time.Time) (bitrateCtl, bool) {
 	c, excess := c.pushRTT(rttExcess)
 	c, rttRising := c.rttTrend(excess, now)
 	c, rttHigh := c.rttLevel(excess)
+	c, lowRising := c.rttLowTrend(excess)
+	// Черга є і NACK-и є, але до затору ще не дотягує — підйом не пускаємо.
+	// Якщо так стоїть congRises RR поспіль — це вже затор: ціль трохи вища за
+	// стелю дає рівно такий стійкий «невеликий» preLoss, і сіра зона тримала б
+	// її над стелею безкінечно (спіймано моделлю стелі в bitrate_cong_test.go).
+	queueLossy := excess >= congDelayMin && sig.preLoss > lossLowFrac
+	if queueLossy {
+		c.lossyRuns++
+	} else {
+		c.lossyRuns = 0
+	}
+	cong, congF := congestion(excess, sig, lowRising || c.lossyRuns >= congRises)
 
 	next, up, fast := c.target, false, false
 	switch {
 	// Втрати ріжуть глибше (0.7) за затримку (0.85) і мають пріоритет, коли
 	// спрацювало обидва: втрачений пакет — доконаний збиток, зростання
-	// затримки — лише попередження.
-	case lossFrac > lossHighFrac:
-		next = uint64(float64(c.target) * downFactor)
+	// затримки — лише попередження. B4: затор за NACK+чергою ріже за оцінкою
+	// доставленої швидкості; береться глибший із двох.
+	case lossFrac > lossHighFrac || cong:
+		f := 1.0
+		if lossFrac > lossHighFrac {
+			f = downFactor
+		}
+		if cong && congF < f {
+			f = congF
+		}
+		next = uint64(float64(c.target) * f)
 		c.goodSince = time.Time{} // серія "чисто" обірвана
 		c.cleanSince = time.Time{}
+		c.congAt = now
 	// Два плеча затримки: РІСТ (серія зростаючих вікон) і РІВЕНЬ (приріст уже
 	// за rttLevelHigh). Обидва — те, чого не бачить контролер по втратах:
 	// черга наливається, а FractionLost ще нуль.
@@ -517,15 +704,24 @@ func (c bitrateCtl) step(lossFrac float64, rttExcess time.Duration, now time.Tim
 	// повзла назад до стелі просто тому, що втрат немає, хоч черга стояла на
 	// місці (заміряно на ramp5 і depth). Поріг звільнення rttUpClear свідомо
 	// нижчий за поріг зрізу — див. його коментар про пилку.
-	case lossFrac <= lossLowFrac && excess < rttUpClear:
+	case lossFrac <= lossLowFrac && excess < rttUpClear && !queueLossy:
 		if c.goodSince.IsZero() {
 			c.goodSince = now
 		}
 		if c.cleanSince.IsZero() {
 			c.cleanSince = now
 		}
-		if c.cutFrom > 0 && now.Sub(c.cleanSince) >= cutFromExpire {
+		if c.cutFrom > 0 && now.Sub(c.cleanSince) >= c.cutFromHold() {
 			c.cutFrom = 0
+		}
+		// Проба над старим затором пережила probeConfirm — канал ширший,
+		// обмеження проби й лічильник невдач знято.
+		// «Пережила» — саме проба на повну висоту (probeLvl×probeOvershoot), а
+		// не дрібний +5% над probeLvl: інакше будь-який повільний крок знімав би
+		// обмеження, і наступний швидкий стрибав би ×1.5 у ту саму стелю.
+		if c.probeLvl > 0 && float64(c.target)+1 >= float64(c.probeLvl)*probeOvershoot &&
+			!c.lastUpAt.IsZero() && now.Sub(c.lastUpAt) >= probeConfirm && c.congAt.Before(c.lastUpAt) {
+			c.probeLvl, c.failedProbes = 0, 0
 		}
 		if n, ok := c.fastUpStep(now); ok {
 			next, up, fast = n, true, true
@@ -556,6 +752,17 @@ func (c bitrateCtl) step(lossFrac float64, rttExcess time.Duration, now time.Tim
 	if next < minBitrateBps {
 		next = minBitrateBps
 	}
+	// B5: затор одразу після підйому — винен підйом. Відступаємо на рівень ДО
+	// нього (якщо це не мілкіше за вже вирахуваний зріз) і рахуємо невдалу пробу.
+	// Стан (failedProbes) міняємо лише коли зріз справді піде — після дебаунсу.
+	backoff := next < c.target && !up && c.probeFrom > 0 && c.probeFrom < c.target &&
+		!c.lastUpAt.IsZero() && now.Sub(c.lastUpAt) < probeWindow
+	if backoff && c.probeFrom < next {
+		next = c.probeFrom
+		if next < minBitrateBps {
+			next = minBitrateBps
+		}
+	}
 	if next == c.target {
 		return c, false
 	}
@@ -568,6 +775,11 @@ func (c bitrateCtl) step(lossFrac float64, rttExcess time.Duration, now time.Tim
 		c.cleanSince = time.Time{}
 	}
 	debounce := downDebounce
+	if backoff {
+		// Невдала проба: відкат не чекає повних 2 с — підйом щойно сам був
+		// зміною цілі, і кожна зайва секунда над стелею = дропи в черзі.
+		debounce = probeBackoffDebounce
+	}
 	if up {
 		debounce = upDebounce
 		if fast {
@@ -584,8 +796,39 @@ func (c bitrateCtl) step(lossFrac float64, rttExcess time.Duration, now time.Tim
 		if c.cutFrom > 0 && next >= c.cutFrom {
 			c.cutFrom = 0 // повільний підйом пройшов рівень затору — межа знята
 		}
+		c.lastUpAt, c.probeFrom = now, c.target
+		if fast {
+			c.upRun++
+		}
 	} else if next < c.target {
+		c.upRun = 0
 		c.cutFrom = c.target // рівень, де був затор: межа швидкого режиму
+		c.probeLvl = c.target
+		if backoff {
+			// Невдала проба: межею наступної стає рівень, на який відкотились
+			// (перевірено чистий), а не той, що провалився, — інакше кожна
+			// наступна проба була б на probeOvershoot вища за попередню.
+			c.probeLvl = next
+			c.failedProbes++
+		}
+		c.lastUpAt, c.probeFrom = time.Time{}, 0
+	}
+	// Причина зміни — для метрики oo_hub_bitrate_target_reason (metrics.go).
+	switch {
+	case up && fast:
+		c.reason = "fast_recover"
+	case up:
+		c.reason = "recover"
+	case backoff:
+		c.reason = "probe_backoff"
+	case lossFrac > lossHighFrac:
+		c.reason = "loss"
+	case cong:
+		c.reason = "congestion"
+	case rttRising || rttHigh:
+		c.reason = "rtt"
+	default:
+		c.reason = "ceiling" // кламп REMB/стелею
 	}
 	c.target = next
 	c.lastSent = now
@@ -647,17 +890,31 @@ func onRembEstimate(ns *nodeSession, bps uint64, now time.Time) {
 // jitterTicks (такти 90 кГц) сюди йде ЛИШЕ заради телеметрії — у рішення він не
 // входить, тож і в step() не передається.
 func onReceiverReport(ns *nodeSession, lossFrac float64, jitterTicks uint32, rttExcess time.Duration, now time.Time) {
+	onReceiverReportSig(ns, lossFrac, jitterTicks, rttExcess, congSignals{}, now)
+}
+
+// bitrateReason — причина останньої зміни цілі контролером ("" — немає).
+func bitrateReason(ns *nodeSession) string {
+	ns.mu.Lock()
+	defer ns.mu.Unlock()
+	return ns.bitrate.reason
+}
+
+// onReceiverReportSig — onReceiverReport із сигналами B4 (legCongestion).
+func onReceiverReportSig(ns *nodeSession, lossFrac float64, jitterTicks uint32, rttExcess time.Duration, sig congSignals, now time.Time) {
 	ns.mu.Lock()
 	if ns.bitrate.startBps == 0 {
 		ns.bitrate = newBitrateCtl(ns.ceilingBps())
 	}
-	next, send := ns.bitrate.step(lossFrac, rttExcess, now)
+	next, send := ns.bitrate.stepSig(lossFrac, rttExcess, sig, now)
 	ns.bitrate = next
 	ns.mu.Unlock()
 	if !send {
 		return
 	}
 	sendBitrateTarget(ns, next.target, lossFrac*100, jitterTicks, rttExcess)
+	ndjsonf(`{"leg":"cong","node":%q,"bitrate":%d,"preLossPct":%.2f,"plis":%d,"rttExcessMs":%d}`+"\n",
+		ns.nodeID, next.target, sig.preLoss*100, sig.plis, rttExcess.Milliseconds())
 }
 
 // dcWriter — DataChannel як io.Writer, щоб писати тим самим control.Write, що й
