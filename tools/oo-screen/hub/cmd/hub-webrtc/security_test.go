@@ -237,6 +237,7 @@ func TestSecH11AgentTokenBoundToNode(t *testing.T) {
 		t.Fatalf("legacy: status=%d node=%v, want 400 і без ноди", c, reg.get("victim"))
 	}
 	t.Setenv("OO_SCREEN_AGENT_AUTH", "strict")
+	t.Setenv("OO_SCREEN_AGENT_SECRET", "sec-h11-separate-master") // strict вимагає окремий master
 	if c := post(token, "victim"); c != http.StatusUnauthorized {
 		t.Fatalf("strict+legacy: status=%d, want 401", c)
 	}

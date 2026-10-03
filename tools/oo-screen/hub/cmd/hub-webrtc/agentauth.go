@@ -42,13 +42,23 @@ func legacyAgentTokenAllowed() bool {
 // секрету її не роздує.
 var legacyWarned sync.Map
 
+// strictNoMasterWarned — одноразове ERROR про strict без окремого master.
+var strictNoMasterWarned sync.Map
+
 // agentAuthorized — чи має право tok зареєструвати агента ноди node.
 func agentAuthorized(node, tok string) bool {
 	if !validAgentNodeID(node) {
 		return false
 	}
-	if hub.NodeTokenValid(agentMaster(), node, tok) {
-		return true
+	if master := agentMaster(); master != token || legacyAgentTokenAllowed() {
+		if hub.NodeTokenValid(master, node, tok) {
+			return true
+		}
+	} else if _, seen := strictNoMasterWarned.LoadOrStore(struct{}{}, struct{}{}); !seen {
+		// Повторний аудит #17: master == спільний T1-токен, а він є на кожному
+		// ПК — будь-який агент виковує токен чужої ноди. У strict токени нод
+		// без окремого OO_SCREEN_AGENT_SECRET не приймаються взагалі.
+		log.Printf("ERROR offer/agent: OO_SCREEN_AGENT_AUTH=strict, але OO_SCREEN_AGENT_SECRET не задано (або == OO_SCREEN_T1_TOKEN) — токени нод відхиляються; задай окремий master")
 	}
 	if !tokenMatches(tok) {
 		return false
