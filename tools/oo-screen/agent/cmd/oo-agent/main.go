@@ -507,6 +507,11 @@ func dialWebRTC(hubURL string, frameInterval time.Duration, onKeyframeRequest fu
 		_ = pc.Close()
 		return nil, fmt.Errorf("add audio track: %w", err)
 	}
+	// Канал текстових тайлів (tiles.go) — лише під -text-tiles, до offer-а.
+	if err := addTilesChannel(pc); err != nil {
+		_ = pc.Close()
+		return nil, fmt.Errorf("create tiles datachannel: %w", err)
+	}
 	pc.OnICEConnectionStateChange(func(s webrtc.ICEConnectionState) {
 		log.Printf("oo-agent: webrtc ICE: %s", s)
 	})
@@ -1292,6 +1297,7 @@ func main() {
 	audioFlag := flag.Bool("audio", false, "передавати звук ПК (перекриває env OO_SCREEN_AUDIO=1)")
 	inputFlag := flag.Bool("input", false, "приймати клавіатуру й мишу від глядача (перекриває env OO_SCREEN_INPUT=1)")
 	refineFlag := flag.Bool("refine", true, "дошліфування нерухомого екрана (ТЗ P4): через 200 мс без нових кадрів 1–2 рази перекодувати останній кадр із нижчим QP; false — вимкнути")
+	textTilesFlag := flag.Bool("text-tiles", false, "текстові тайли (STAGE3-444 B): на нерухомому дошліфованому екрані один раз слати lossless PNG-тайли кольорового тексту каналом oosc-tiles (потрібен OO_SCREEN_TILES=1 на хабі і config.textTiles у плеєрі)")
 	gopSeconds := flag.Int("gop-seconds", 2, "інтервал періодичного IDR, с (ТЗ 1.4). >3 вимагає на хабі OO_SCREEN_GOP_SPAN трохи більшого за GOP (дефолт 3s, макс 30s), інакше GOP-кеш хаба не спрацює і новий глядач чекатиме IDR через PLI/requestKeyframe")
 	flag.Parse()
 
@@ -1302,6 +1308,7 @@ func main() {
 	// Тільки в один бік (прапорець вмикає, не вимикає): -audio=false не мусить
 	// гасити те, що людина свідомо ввімкнула через середовище.
 	applyFeatureFlags(*audioFlag, *inputFlag)
+	textTilesEnabled = *textTilesFlag
 
 	// GUI-режим (-H windowsgui) не має консолі, тож log за замовчуванням у
 	// нікуди. -log перенаправляє його у файл. Ставимо ДО першого log.Printf.
@@ -2002,6 +2009,8 @@ loop:
 		case err == nil:
 			s.lastFrame = frame
 			refiner.Motion(time.Now()) // новий кадр = рух: refine, що йшов, перериваємо
+			// Текстові тайли: invalidate ДО кодування цього кадру (tiles.go).
+			tilesMotion()
 			if textDet != nil {
 				text, flipped := textDet.Update(
 					capture.ChangedFraction(frame),
@@ -2049,6 +2058,7 @@ loop:
 			}
 			log.Printf("oo-agent: перший кадр знято через GDI (екран нерухомий)")
 			frame, s.lastFrame = gdi, gdi
+			tilesMotion() // інша картинка (новий монітор/реакваєр) — тайли застаріли
 		case errors.Is(err, context.DeadlineExceeded):
 			// Дедлайн був, але слати не можна: глядача нема (пауза). Порожній
 			// кадр тут не вигадуємо — декодеру нема з чого будувати картинку,
@@ -2202,6 +2212,12 @@ loop:
 		if still && refineQP == 0 && len(aus) == 1 && !aus[0].Keyframe {
 			cp := aus[0]
 			lastStillAU, lastStillEnc, lastStillSentAt = &cp, s.encoder(), time.Now()
+		}
+		// Текстові тайли: екран нерухомий і refine уже доведений до кінця —
+		// один readback BGRA на епоху (повтор на keepalive, якщо епізод не
+		// вдалося почати; Episodes.Start ідемпотентний у межах епохи).
+		if still && !s.software && refiner.Complete() {
+			tilesStatic(ctx, time.Now(), s.cap.ReadBGRA)
 		}
 
 		if time.Since(lastLog) >= 5*time.Second {

@@ -110,6 +110,12 @@ int oos_gdi_next(oos_cap *c, oos_frame *frame, char *err, int32_t err_len);
 
 void oos_close(oos_cap *c);
 
+/* Text tiles: one-shot CPU readback of the current BGRA desktop (pointer
+ * composited) into dst (dst_pitch >= width*4, height rows). Uses its own
+ * staging texture, released before returning. OOS_OK / OOS_ERROR /
+ * OOS_ACCESS_LOST. */
+int oos_read_bgra(oos_cap *c, uint8_t *dst, int32_t dst_pitch, char *err, int32_t err_len);
+
 /* Dimensions of the duplicated output (texture orientation, not rotated). */
 int32_t oos_width(oos_cap *c);
 int32_t oos_height(oos_cap *c);

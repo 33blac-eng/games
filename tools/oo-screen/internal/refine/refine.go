@@ -122,5 +122,9 @@ func (s *State) NeedRestore() bool {
 	return r
 }
 
+// Complete — усі refine-кадри після останнього руху вже пішли: екран
+// нерухомий і дошліфований (тригер текстових тайлів, internal/tiles).
+func (s *State) Complete() bool { return s.done >= len(s.cfg.QPs) }
+
 // Refining — чи пішов уже хоч один refine після останнього руху.
 func (s *State) Refining() bool { return s.done > 0 }

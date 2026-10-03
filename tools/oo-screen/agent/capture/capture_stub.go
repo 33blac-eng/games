@@ -98,4 +98,6 @@ func (c *Capturer) NextFrame(ctx context.Context) (*NV12Frame, error) {
 	return nil, ErrNotAvailable
 }
 
+func (c *Capturer) ReadBGRA() ([]byte, int, int, error) { return nil, 0, 0, ErrNotAvailable }
+
 func (c *Capturer) Close() error { return nil }

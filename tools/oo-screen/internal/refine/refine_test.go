@@ -106,3 +106,24 @@ func TestPostponeAndDisarm(t *testing.T) {
 		t.Fatal("wait after disarm")
 	}
 }
+
+func TestComplete(t *testing.T) {
+	s := New(Config{QPs: []int{22, 18}})
+	t0 := time.Unix(100, 0)
+	s.Motion(t0)
+	if s.Complete() {
+		t.Fatal("complete before any refine")
+	}
+	s.Sent(t0, 0, 0)
+	if s.Complete() {
+		t.Fatal("complete after 1 of 2")
+	}
+	s.Sent(t0, 0, 0)
+	if !s.Complete() {
+		t.Fatal("not complete after 2 of 2")
+	}
+	s.Motion(t0)
+	if s.Complete() {
+		t.Fatal("motion must reset")
+	}
+}

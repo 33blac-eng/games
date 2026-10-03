@@ -903,6 +903,49 @@ done:
     return st;
 }
 
+/* Text tiles (internal/tiles): copy the current BGRA desktop (pointer
+ * included, exactly what was last converted) into dst. A one-shot staging
+ * texture is created, mapped once and released: this runs at most once per
+ * static episode, so keeping 8-15 MB of staging memory alive is not worth it. */
+int oos_read_bgra(oos_cap *c, uint8_t *dst, int32_t dst_pitch, char *err, int32_t err_len)
+{
+    D3D11_TEXTURE2D_DESC d;
+    D3D11_MAPPED_SUBRESOURCE m;
+    ID3D11Texture2D *stage = NULL;
+    HRESULT hr;
+    int32_t y;
+
+    if (!c || !c->bgra || !c->have_image || !dst || dst_pitch < c->width * 4) {
+        set_err(err, err_len, "read_bgra: no image", E_POINTER);
+        return OOS_ERROR;
+    }
+    memset(&d, 0, sizeof(d));
+    d.Width = (UINT)c->width;
+    d.Height = (UINT)c->height;
+    d.MipLevels = 1;
+    d.ArraySize = 1;
+    d.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+    d.SampleDesc.Count = 1;
+    d.Usage = D3D11_USAGE_STAGING;
+    d.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+    hr = c->dev->lpVtbl->CreateTexture2D(c->dev, &d, NULL, &stage);
+    if (FAILED(hr)) { c->last_hr = hr; set_err(err, err_len, "read_bgra: CreateTexture2D", hr); return classify(hr); }
+    c->ctx->lpVtbl->CopyResource(c->ctx, (ID3D11Resource *)stage, (ID3D11Resource *)c->bgra);
+    hr = c->ctx->lpVtbl->Map(c->ctx, (ID3D11Resource *)stage, 0, D3D11_MAP_READ, 0, &m);
+    if (FAILED(hr)) {
+        c->last_hr = hr;
+        SAFE_RELEASE(stage);
+        set_err(err, err_len, "read_bgra: Map", hr);
+        return classify(hr);
+    }
+    for (y = 0; y < c->height; y++)
+        memcpy(dst + (size_t)y * (size_t)dst_pitch,
+               (const uint8_t *)m.pData + (size_t)y * m.RowPitch, (size_t)c->width * 4);
+    c->ctx->lpVtbl->Unmap(c->ctx, (ID3D11Resource *)stage, 0);
+    SAFE_RELEASE(stage);
+    return OOS_OK;
+}
+
 void oos_release(oos_cap *c)
 {
     if (c && c->mapped) {

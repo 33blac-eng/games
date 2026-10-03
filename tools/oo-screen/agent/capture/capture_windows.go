@@ -494,6 +494,32 @@ func (c *Capturer) GDIFrame() (*NV12Frame, error) {
 	return frame, nil
 }
 
+// ReadBGRA copies the current desktop image (the one last converted, pointer
+// included) into a fresh BGRA buffer: w*4 bytes per row, h rows. One GPU
+// staging copy + Map; meant for the text-tile pass on a static screen, not
+// per frame. Must be called from the capture loop (like NextFrame).
+func (c *Capturer) ReadBGRA() (pix []byte, w, h int, err error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.closed {
+		return nil, 0, 0, ErrClosed
+	}
+	if c.c == nil {
+		return nil, 0, 0, fmt.Errorf("%w: pipeline not open", ErrAccessLost)
+	}
+	w, h = int(C.oos_width(c.c)), int(C.oos_height(c.c))
+	if w <= 0 || h <= 0 {
+		return nil, 0, 0, fmt.Errorf("capture: read_bgra: bad size %dx%d", w, h)
+	}
+	pix = make([]byte, w*4*h)
+	buf := (*C.char)(C.calloc(256, 1))
+	defer C.free(unsafe.Pointer(buf))
+	if st := C.oos_read_bgra(c.c, (*C.uint8_t)(unsafe.Pointer(&pix[0])), C.int32_t(w*4), buf, 256); st != C.OOS_OK {
+		return nil, 0, 0, fmt.Errorf("capture: output %d: %s", c.output, C.GoString(buf))
+	}
+	return pix, w, h, nil
+}
+
 // NextFrame blocks until a frame is available, ctx is done, or capture fails.
 //
 // A DXGI_ERROR_WAIT_TIMEOUT is neither a frame nor an error: NextFrame simply
