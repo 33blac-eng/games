@@ -140,6 +140,21 @@ func (l *ipLimiter) allow(ip string, now time.Time) bool {
 	return e.lim.AllowN(now, 1)
 }
 
+// rateKey — ключ кошика для адреси клієнта. IPv6-клієнт зазвичай володіє
+// цілим /64: кошик на /128 дозволяв обходити ліміт ротацією адрес і роздувати
+// мапу кошиків. IPv6 групується по /64, v4-mapped зводиться до IPv4
+// (повторний аудит).
+func rateKey(ip string) string {
+	p := net.ParseIP(ip)
+	if p == nil {
+		return ip
+	}
+	if v4 := p.To4(); v4 != nil {
+		return v4.String()
+	}
+	return p.Mask(net.CIDRMask(64, 128)).String() + "/64"
+}
+
 // offerLimiter — спільний на /offer/viewer і /offer/agent.
 var offerLimiter = newIPLimiter(
 	envFloat("OO_SCREEN_OFFER_RATE", 1),
@@ -165,7 +180,7 @@ func trustedProxiesEnv() string {
 // rateLimited загортає хендлер у per-IP ліміт (OPTIONS не рахуються).
 func rateLimited(l *ipLimiter, h http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodOptions && !l.allow(l.clientIP(r), time.Now()) {
+		if r.Method != http.MethodOptions && !l.allow(rateKey(l.clientIP(r)), time.Now()) {
 			w.Header().Set("Retry-After", "1")
 			http.Error(w, "too many requests", http.StatusTooManyRequests)
 			return
