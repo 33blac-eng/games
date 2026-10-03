@@ -289,6 +289,9 @@ type nodeSession struct {
 	bitrate         bitrateCtl
 	startBps        uint64
 	lastKeyframeReq time.Time
+	// kfTrailing — у дебаунс-вікні вже заплановано ОДИН відкладений
+	// keyframe-запит (requestKeyframe). Під ns.mu.
+	kfTrailing bool
 
 	// lastPLI — окремий годинник дебаунсу PLI від глядачів (pliGate, nack.go).
 	// Під ns.mu.
@@ -1889,7 +1892,11 @@ func recomputeBinding(ns *nodeSession) {
 // щойно зайшов», і ногу лікує звичайний requestKeyframe. Скільки з цього —
 // хвіст кешу, пам'ятає vl.primeSlack (поріг відставання у forwardToViewers).
 func primeViewerLocked(ns *nodeSession, vl *viewerLeg) bool {
-	pkts := ns.gop.replay()
+	pkts, nbytes, tooBig := ns.gop.replayFor()
+	if tooBig {
+		log.Printf("gop skip [node=%s]: хвіст %d Б > бюджету відтворення %d Б — keyframe_request замість кешу", ns.nodeID, nbytes, gopReplayBudget(ns.gop.bps))
+		return false
+	}
 	if len(pkts) == 0 {
 		return false
 	}
@@ -1905,7 +1912,7 @@ func primeViewerLocked(ns *nodeSession, vl *viewerLeg) bool {
 		vl.out <- p
 	}
 	vl.primeSlack = len(pkts)
-	log.Printf("gop prime [node=%s]: віддано %d кешованих пакетів від останнього IDR", ns.nodeID, len(pkts))
+	log.Printf("gop prime [node=%s]: віддано %d кешованих пакетів (%d Б) від останнього IDR", ns.nodeID, len(pkts), nbytes)
 	return true
 }
 

@@ -185,6 +185,8 @@ sudo sh -c 'umask 077; grep ^OO_SCREEN_AGENT_SECRET= /etc/oo-screen/hub.env | cu
 | `OO_SCREEN_CONTROL_REQUIRES_INPUT` **нова** | вимк. | `1` — `/control` лише з grant=control у тікеті |
 | `OO_SCREEN_SESSION_CAP` | `120m` | максимальна тривалість сесії глядача |
 | `OO_SCREEN_GOP_SPAN` | `12s` (3s…30s) | глибина GOP-кешу; більше за `-gop-seconds` агента |
+| `OO_SCREEN_GOP_REPLAY_SPAN` | `2s` | бюджет віддачі кешу новому глядачеві: бітрейт × span × 1,25; більший хвіст → keyframe-запит |
+| `OO_SCREEN_GOP_REPLAY_MAX_BYTES` | `3145728` | жорстка стеля віддачі кешу (≤ 12 МБ); `0` — кеш не віддавати, завжди IDR |
 | `OO_SCREEN_START_BITRATE` | `8000000` | стартовий бітрейт, біт/с |
 | `OO_SCREEN_BITRATE_FASTUP` | вимк. | `1` — швидке відновлення бітрейту |
 | `OO_SCREEN_STRICT_CODEC` | вимк. | `1`/`true` — рвати сесію при неузгодженому профілі H.264 |

@@ -723,8 +723,22 @@ func requestKeyframe(ns *nodeSession) {
 	// keyframe_request, і PLI — тобто два IDR замість одного.
 	ns.mu.Lock()
 	if since := time.Since(ns.lastKeyframeReq); !ns.lastKeyframeReq.IsZero() && since < keyframeDebnc {
+		// Запит у вікні не губимо: IDR попереднього запиту міг уже пройти
+		// ДО цього тригера (новий глядач тоді чекав би природного IDR — з
+		// GOP 10 с це секунди). Один відкладений запит на кінець вікна
+		// обслуговує ВСІ тригери в ньому: N приєднань -> не більше 2 IDR.
+		schedule := !ns.kfTrailing
+		ns.kfTrailing = true
 		ns.mu.Unlock()
-		log.Printf("keyframe_request debounced [node=%s] (last one %v ago)", ns.nodeID, since)
+		if schedule {
+			time.AfterFunc(keyframeDebnc-since, func() {
+				ns.mu.Lock()
+				ns.kfTrailing = false
+				ns.mu.Unlock()
+				requestKeyframe(ns)
+			})
+		}
+		log.Printf("keyframe_request debounced [node=%s] (last one %v ago, trailing=%v)", ns.nodeID, since, schedule)
 		return
 	}
 	ns.lastKeyframeReq = time.Now()

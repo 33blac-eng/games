@@ -16,6 +16,9 @@
 package main
 
 import (
+	"log"
+	"os"
+	"strconv"
 	"time"
 
 	"github.com/pion/rtp"
@@ -59,6 +62,60 @@ const (
 	// gopClockRate — та сама, що й у треку глядача (H.264, 90 кГц).
 	gopClockRate = 90000
 )
+
+// Бюджет ВІДТВОРЕННЯ кешу новому глядачеві (окремо від бюджету зберігання).
+// Кеш віддається нозі одним шматком: з GOP 10 с на 8 Мбіт/с це до ~11 МБ, тобто
+// секунди передачі на повільному каналі глядача. Тому віддаємо хвіст лише коли
+// він невеликий — до gopReplaySpan на поточному бітрейті ноди, але не більше
+// gopReplayMaxBytes; інакше нога не primed і хаб просить keyframe (дебаунс
+// спільний, тож пачка приєднань ділить один IDR). Нижня межа gopMinBytes (не
+// більша за стелю): на низькому бітрейті сам IDR важить сотні КБ.
+//
+// OO_SCREEN_GOP_REPLAY_SPAN (time.ParseDuration, дефолт 2s) і
+// OO_SCREEN_GOP_REPLAY_MAX_BYTES (байти, дефолт 3 МБ, ≤ gopMaxBytes).
+var (
+	gopReplaySpan     = envDuration("OO_SCREEN_GOP_REPLAY_SPAN", 2*time.Second)
+	gopReplayMaxBytes = envBytes("OO_SCREEN_GOP_REPLAY_MAX_BYTES", 3<<20)
+)
+
+// gopReplayBudget — скільки байтів кешу (payload + gopPacketOverhead) можна
+// віддати новому глядачеві при бітрейті ноди bps; 0 = невідомий -> стеля.
+func gopReplayBudget(bps uint64) int {
+	ceil := gopReplayMaxBytes
+	if ceil > gopMaxBytes {
+		ceil = gopMaxBytes
+	}
+	if ceil < 0 {
+		ceil = 0
+	}
+	floor := min(gopMinBytes, ceil)
+	if bps == 0 {
+		return ceil
+	}
+	b := float64(bps) / 8 * gopReplaySpan.Seconds() * 1.25 // +25 %: IDR і заголовки (GOP 2 с на 8 Мбіт/с вміщається)
+	if b >= float64(ceil) {
+		return ceil
+	}
+	if b < float64(floor) {
+		return floor
+	}
+	return int(b)
+}
+
+// envBytes — ціле число байтів зі змінної середовища; нерозбірне чи від'ємне
+// значення -> типове (з логом, як envDuration).
+func envBytes(k string, def int) int {
+	v := os.Getenv(k)
+	if v == "" {
+		return def
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil || n < 0 {
+		log.Printf("%s=%q не розібралось — беру типове %d", k, v, def)
+		return def
+	}
+	return n
+}
 
 // gopMaxSpan — стеля кешу в часі RTP. Налаштовується OO_SCREEN_GOP_SPAN
 // (формат time.ParseDuration), коли агент кодує з іншим GOP: ставити її треба
@@ -260,6 +317,19 @@ func (g *gopCache) replay() []*rtp.Packet {
 		return nil
 	}
 	return g.pkts
+}
+
+// replayFor — replay з бюджетом відтворення: tooBig = кеш самодостатній, але
+// важчий за gopReplayBudget — нозі краще IDR на запит, ніж мегабайти хвоста.
+func (g *gopCache) replayFor() (pkts []*rtp.Packet, bytes int, tooBig bool) {
+	pkts = g.replay()
+	if pkts == nil {
+		return nil, 0, false
+	}
+	if g.bytes > gopReplayBudget(g.bps) {
+		return nil, g.bytes, true
+	}
+	return pkts, g.bytes, false
 }
 
 // h264NALTypes викликає f для типу кожного NAL, що ПОЧИНАЄТЬСЯ в цьому
