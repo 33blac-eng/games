@@ -1171,10 +1171,13 @@ func main() {
 		}
 	}
 
-	// applyBitrate — ЄДИНЕ місце, де ціль реально лягає в енкодер. Після
-	// успішної зміни одразу IDR (тим самим шляхом, що й keyframe_request):
-	// без нього поточний GOP догравається старим квантуванням і нова ціль
-	// проявиться аж через ~2с, тобто саме тоді, коли вона вже не потрібна.
+	// applyBitrate — ЄДИНЕ місце, де ціль реально лягає в енкодер. IDR тут
+	// БІЛЬШЕ НЕ ФОРСУЄМО (P0 B4/B5): AVEncCommonMeanBitRate — динамічна
+	// властивість MFT, CBR-контроль перераховує QP з наступного кадру, тож
+	// «GOP догравається старим квантуванням» не відбувається. А IDR — це
+	// найбільший кадр, і саме при ЗНИЖЕННІ цілі (канал вузький) він б'є в
+	// чергу вузького місця: стенд показав 22-33 IDR/хв під стелею і фризи від
+	// них. Якщо глядачу потрібен IDR, хаб шле keyframe_request окремо.
 	applyBitrate := func(bps int) {
 		e := s.encoder()
 		if e == nil {
@@ -1189,9 +1192,6 @@ func main() {
 		s.bitrateBps.Store(int64(bps))
 		paceTargetBps.Store(uint64(bps))
 		log.Printf("oo-agent: bitrate -> %d bps", bps)
-		if err := e.ForceIDR(); err != nil {
-			log.Printf("oo-agent: ForceIDR (bitrate change): %v", err)
-		}
 	}
 
 	// onBitrateTarget — hub просить іншу CBR-ціль. Крутимо ручку на живому

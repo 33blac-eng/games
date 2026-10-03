@@ -257,6 +257,17 @@ func TestDefaultBitrate(t *testing.T) {
 		}
 	})
 
+	t.Run("P0: стеля не ріже нижче 4K і дає 4K ~30 Мбіт/с", func(t *testing.T) {
+		if maxAutoBitrateBps < 28_000_000 {
+			t.Fatalf("стеля %d: 4K знову обрізано", maxAutoBitrateBps)
+		}
+		// 3440x1440 (ultrawide, 4.95 Мпікс) — ще за щільністю, без стелі.
+		want := 8_000_000 * 3440 * 1440 / (1920 * 1080)
+		if got := defaultBitrate(0, 3440, 1440); got != want {
+			t.Fatalf("defaultBitrate(0, 3440,1440) = %d, хотіли %d", got, want)
+		}
+	})
+
 	t.Run("явний -bitrate перекриває", func(t *testing.T) {
 		if got := defaultBitrate(3_000_000, 2560, 1440); got != 3_000_000 {
 			t.Fatalf("defaultBitrate(3000000, 2560,1440) = %d, хотіли 3000000", got)

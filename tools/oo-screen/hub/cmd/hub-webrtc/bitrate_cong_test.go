@@ -203,6 +203,25 @@ func TestRandomLossWithoutQueueKeepsTarget(t *testing.T) {
 	}
 }
 
+// Та сама стала затримка, але з сильним свідченням (preLoss 3%): ріже, проте
+// перебазування обмежує шкоду кількома кроками.
+func TestStepDelayStrongEvidenceLimited(t *testing.T) {
+	c := bitrateCtl{target: 8_000_000, startBps: 8_000_000, fastUp: true}
+	now := t0
+	cuts := 0
+	for i := 0; i < 30; i++ {
+		now = now.Add(time.Second)
+		prev := c.target
+		c, _ = c.stepSig(0.005, 200*time.Millisecond, congSignals{preLoss: 0.03}, now)
+		if c.target < prev {
+			cuts++
+		}
+	}
+	if cuts > 3 || c.target < 4_000_000 {
+		t.Fatalf("стала затримка, preLoss 3%%: %d зрізів, ціль %d", cuts, c.target)
+	}
+}
+
 func TestFastUpDefaultOn(t *testing.T) {
 	if !fastRecoveryDefault {
 		t.Skip("OO_SCREEN_BITRATE_FASTUP=0 у середовищі")
@@ -267,7 +286,27 @@ func TestStepDelayRebasesAfterUselessCut(t *testing.T) {
 			cuts++
 		}
 	}
-	if cuts > 2 || c.target < 5_000_000 {
+	// Плаский приріст + слабке свідчення (preLoss 1%) — не ріже взагалі.
+	if cuts != 0 {
 		t.Fatalf("стала затримка: %d зрізів, ціль %d", cuts, c.target)
+	}
+}
+
+// Стрибок шляху посеред сесії (rtt-200ms у стенді): 0 -> 200 мс за один RR і
+// рівномірні втрати з preLoss 2-3%. Перший прогін після B4 тут різав 8 -> 6.8
+// і тримав зрізане всю ваду; стрибок > congJumpMax іде одразу в базу.
+func TestStepPathJumpIsNotQueue(t *testing.T) {
+	c := bitrateCtl{target: 8_000_000, startBps: 8_000_000, fastUp: true}
+	now := t0
+	for i := 0; i < 40; i++ {
+		now = now.Add(time.Second)
+		ex, sig := time.Duration(0), congSignals{}
+		if i >= 10 {
+			ex, sig = 200*time.Millisecond, congSignals{preLoss: 0.025}
+		}
+		c, _ = c.stepSig(0.005, ex, sig, now)
+		if c.target != 8_000_000 {
+			t.Fatalf("на %d с ціль %d: стрибок шляху прочитано як чергу", i, c.target)
+		}
 	}
 }
