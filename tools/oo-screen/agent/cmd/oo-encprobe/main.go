@@ -1,3 +1,5 @@
+//go:build windows
+
 // oo-encprobe — headless H.264 encoder-MFT enumeration probe.
 //
 // Не захоплює екран, не потребує сесії користувача чи робочого столу, не
