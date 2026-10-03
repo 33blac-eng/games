@@ -243,9 +243,10 @@ func (t *webrtcTransport) close() {
 // бо транспорт переживає реконекти окремо від stream.
 var paceTargetBps atomic.Uint64
 
-// pacerEnabled — OO_SCREEN_PACER: типово УВІМКНЕНО, "0" вимикає (стара
-// поведінка: весь AU одразу в сокет).
-func pacerEnabled() bool { return os.Getenv("OO_SCREEN_PACER") != "0" }
+// pacerEnabled — OO_SCREEN_PACER: типово ВИМКНЕНО (весь AU одразу в сокет),
+// "1" вмикає. Стенд показав користь лише під стелею 8 Мбіт/с, ціною до 75 мс
+// черги; під 4 Мбіт/с різниці немає. Вмикати після перевірки на реальних ПК.
+func pacerEnabled() bool { return os.Getenv("OO_SCREEN_PACER") == "1" }
 
 // syncPaceTarget — з кадрового циклу перед WriteSample.
 func (t *webrtcTransport) syncPaceTarget() {

@@ -202,6 +202,7 @@ sudo sh -c 'umask 077; grep ^OO_SCREEN_AGENT_SECRET= /etc/oo-screen/hub.env | cu
 | `OO_AGENT_TOKEN` **нова** | порожньо | токен ноди (нижче за `-token-file`, вище за `-token`) |
 | `OO_SCREEN_T1_TOKEN` | `t1-dev-token` | легасі-фолбек токена агента |
 | `OO_AGENT_INPUT_BLOCK_KEYS` **нова** | порожньо | скан-коди через кому (`0xE05B,0xE05C`), які агент не вводить; помилка в списку = відмова |
+| `OO_SCREEN_PACER` **нова** | вимк. | `1` = рівномірна відправка RTP (~2× цілі бітрейту, черга ≤ 75 мс); допомагає під стелею каналу ~8 Мбіт/с, додає до 75 мс затримки |
 | `OO_SCREEN_AUDIO` | вимк. | `1` = `-audio` |
 | `OO_SCREEN_INPUT` | вимк. | `1` = `-input` |
 
