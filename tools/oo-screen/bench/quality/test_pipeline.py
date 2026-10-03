@@ -25,5 +25,15 @@ class TestSub420(unittest.TestCase):
         self.assertIsNone(bits)
 
 
+class TestPasteTiles(unittest.TestCase):
+    def test_paste(self):
+        src = np.full((8, 8, 3), 200, np.uint8)
+        dst = np.zeros((8, 8, 3), np.uint8)
+        out = P.paste_tiles(dst, src, [{"X": 4, "Y": 0, "W": 4, "H": 4}])
+        self.assertTrue((out[0:4, 4:8] == 200).all())
+        self.assertTrue((out[4:, :] == 0).all())
+        self.assertTrue((dst == 0).all())
+
+
 if __name__ == "__main__":
     unittest.main()

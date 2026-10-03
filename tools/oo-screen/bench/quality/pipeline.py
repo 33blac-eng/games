@@ -55,8 +55,9 @@ def up420(c, h, w):
     return np.asarray(Image.fromarray(c.astype(np.float32), "F").resize((w, h), Image.BILINEAR), dtype=np.float64)
 
 
-def x264(planes, w, h, chroma, kbps, frames=30, fps=30):
-    """Encode `frames` copies of a static frame, return decoded last frame planes."""
+def x264(planes, w, h, chroma, kbps, frames=30, fps=30, qp=None):
+    """Encode `frames` copies of a static frame, return decoded last frame planes.
+    qp: constant-QP mode (x264 -qp) instead of the kbps rate control (static refine)."""
     pix = "yuv420p" if chroma == "420" else "yuv444p"
     profile = "main" if chroma == "420" else "high444"  # Main can't carry 4:4:4
     raw = b"".join(p.tobytes() for p in planes)
@@ -68,7 +69,8 @@ def x264(planes, w, h, chroma, kbps, frames=30, fps=30):
         subprocess.run(common + ["-f", "rawvideo", "-pix_fmt", pix, "-s", f"{w}x{h}", "-r", str(fps),
                         "-color_range", "tv", "-colorspace", "bt709", "-i", src,
                         "-c:v", "libx264", "-profile:v", profile, "-preset", "veryfast", "-tune", "zerolatency",
-                        "-b:v", f"{kbps}k", "-maxrate", f"{kbps}k", "-bufsize", f"{kbps}k",
+                        *(["-qp", str(qp)] if qp is not None else
+                          ["-b:v", f"{kbps}k", "-maxrate", f"{kbps}k", "-bufsize", f"{kbps}k"]),
                         "-g", "600", "-pix_fmt", pix, enc], check=True)
         subprocess.run(common + ["-i", enc, "-f", "rawvideo", "-pix_fmt", pix, dec], check=True)
         data = np.fromfile(dec, dtype=np.uint8)
@@ -82,7 +84,7 @@ def x264(planes, w, h, chroma, kbps, frames=30, fps=30):
     return (y, u, v), bits / frames
 
 
-def run(rgb, chroma="420", scale=None, filt="bicubic", kbps=None):
+def run(rgb, chroma="420", scale=None, filt="bicubic", kbps=None, qp=None, frames=30):
     """Returns (reconstructed RGB at original size, avg bits/frame or None)."""
     H, W = rgb.shape[:2]
     img = rgb
@@ -95,8 +97,8 @@ def run(rgb, chroma="420", scale=None, filt="bicubic", kbps=None):
         cb, cr = sub420(cb), sub420(cr)
     planes = (q8(y), q8(cb), q8(cr))
     bits = None
-    if kbps:
-        planes, bits = x264(planes, w, h, chroma, kbps)
+    if kbps or qp is not None:
+        planes, bits = x264(planes, w, h, chroma, kbps, frames=frames, qp=qp)
     y, cb, cr = (p.astype(np.float64) for p in planes)
     if chroma == "420":
         cb, cr = up420(cb, h, w), up420(cr, h, w)
@@ -113,3 +115,12 @@ def vmaf(ref_png, dist_png):
         if "VMAF score" in l:
             return float(l.rsplit(":", 1)[1])
     return None
+
+
+def paste_tiles(dst, src, rects):
+    """Overlay lossless original pixels for tile rects (dicts X,Y,W,H) onto dst."""
+    out = dst.copy()
+    for r in rects:
+        x, y, w, h = r["X"], r["Y"], r["W"], r["H"]
+        out[y:y + h, x:x + w] = src[y:y + h, x:x + w]
+    return out
