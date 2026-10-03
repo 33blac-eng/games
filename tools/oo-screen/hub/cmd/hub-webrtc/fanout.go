@@ -141,6 +141,14 @@ type viewerLeg struct {
 // публікація вмикається лише recomputeBinding() після Connected ТА наявного
 // publisher-а (fail-closed — той самий інваріант, що й на одному глядачеві).
 func addViewer(ns *nodeSession, pc *webrtc.PeerConnection, trk *webrtc.TrackLocalStaticRTP, userID string) *viewerLeg {
+	return addViewerLimit(ns, pc, trk, userID, 0)
+}
+
+// addViewerLimit — addViewer зі стелею: перевірка len(ns.viewers) і вставка
+// йдуть під одним ns.mu, тож паралельні /offer (ICE-gathering між раннім
+// viewerCapReached і реєстрацією триває довго) стелю не перескочать.
+// limit<=0 — без стелі. nil — стелю досягнуто, нічого не зареєстровано.
+func addViewerLimit(ns *nodeSession, pc *webrtc.PeerConnection, trk *webrtc.TrackLocalStaticRTP, userID string, limit int) *viewerLeg {
 	vl := &viewerLeg{
 		pc:     pc,
 		trk:    trk,
@@ -155,6 +163,10 @@ func addViewer(ns *nodeSession, pc *webrtc.PeerConnection, trk *webrtc.TrackLoca
 		vl.audioOut = make(chan []byte, audioQueueDepth)
 	}
 	ns.mu.Lock()
+	if limit > 0 && len(ns.viewers) >= limit {
+		ns.mu.Unlock()
+		return nil
+	}
 	if ns.viewers == nil {
 		ns.viewers = make(map[*webrtc.PeerConnection]*viewerLeg)
 	}

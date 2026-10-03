@@ -22,6 +22,7 @@ import (
 	"crypto/rand"
 	"crypto/subtle"
 	"encoding/hex"
+	"errors"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -905,6 +906,10 @@ func handleOffer(leg string) http.HandlerFunc {
 		case "viewer":
 			var err error
 			if sessionID, err = setupViewerLeg(ns, pc, viewerClaims, viewerTicket, legProfile); err != nil {
+				if errors.Is(err, errViewerCap) {
+					http.Error(w, "too many viewers for node", http.StatusTooManyRequests)
+					return
+				}
 				http.Error(w, err.Error(), http.StatusInternalServerError)
 				return
 			}
@@ -1000,6 +1005,10 @@ var maxViewersPerNode = func() int {
 	}
 	return 16
 }()
+
+// errViewerCap — стелю досягнуто вже під час реєстрації ноги (гонка
+// паралельних /offer повз ранню перевірку viewerCapReached).
+var errViewerCap = errors.New("too many viewers for node")
 
 // viewerCapReached — чи вже досягнуто стелі глядачів ноди.
 func viewerCapReached(ns *nodeSession) bool {
@@ -1300,7 +1309,10 @@ func setupViewerLeg(ns *nodeSession, pc *webrtc.PeerConnection, claims *hub.Tick
 	// Нога стає в ряд до наявних; ще НЕ live — forwardToViewers форвардить лише
 	// у ноги з vl.live, а це вмикає тільки recomputeBinding() після Connected ТА
 	// наявного publisher-а цієї ноди (на failure/close знімаємо назад).
-	vl := addViewer(ns, pc, trk, viewerUserID)
+	vl := addViewerLimit(ns, pc, trk, viewerUserID, maxViewersPerNode)
+	if vl == nil {
+		return "", errViewerCap
+	}
 	// F-11: секрет ЦІЄЇ ноги. Він не дає нічого, крім права переукласти
 	// ICE/SDP на PeerConnection, яка вже існує і вже авторизована: node, user і
 	// grant у неї ті самі, а зникає нога з реєстру — зникає й дія цього
