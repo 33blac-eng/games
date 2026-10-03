@@ -120,6 +120,8 @@ jobs:
         run: shellcheck deploy/*.sh deploy/test/*.sh ci/*.sh
       - name: hub-deploy test
         run: bash deploy/test/hub-deploy-test.sh
+      - name: hub-deploy security test
+        run: bash deploy/test/hub-deploy-sec2-test.sh
 
   govulncheck:
     # Blocking. Runs on the toolchain pinned in go.mod (go1.26.8), the same one
