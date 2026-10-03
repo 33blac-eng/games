@@ -11,9 +11,9 @@ import (
 // агентською ногою. Без цього сеанси різних днів зливались в один файл.
 func TestRecordClosesAfterLastViewerLeaves(t *testing.T) {
 	withRecordFlag(t, true)
-	prev := recordIdleClose
-	recordIdleClose = 20 * time.Millisecond
-	t.Cleanup(func() { recordIdleClose = prev })
+	prev := recordIdleClose.Load()
+	recordIdleClose.Store(int64(20 * time.Millisecond))
+	t.Cleanup(func() { recordIdleClose.Store(prev) })
 
 	ns := &nodeSession{nodeID: "rot"}
 	vl := silentViewer(t, ns)
@@ -42,9 +42,9 @@ func TestRecordClosesAfterLastViewerLeaves(t *testing.T) {
 // Глядач повернувся до спливу паузи — той самий файл лишається.
 func TestRecordSurvivesQuickReconnect(t *testing.T) {
 	withRecordFlag(t, true)
-	prev := recordIdleClose
-	recordIdleClose = 40 * time.Millisecond
-	t.Cleanup(func() { recordIdleClose = prev })
+	prev := recordIdleClose.Load()
+	recordIdleClose.Store(int64(40 * time.Millisecond))
+	t.Cleanup(func() { recordIdleClose.Store(prev) })
 
 	ns := &nodeSession{nodeID: "rec2"}
 	vl := silentViewer(t, ns)

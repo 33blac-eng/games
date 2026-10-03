@@ -24,9 +24,10 @@ import (
 func withRecordFlag(t *testing.T, on bool) string {
 	t.Helper()
 	dir := t.TempDir()
-	prevOn, prevDir := recordEnabled, recordDir
-	recordEnabled, recordDir = on, dir
-	t.Cleanup(func() { recordEnabled, recordDir = prevOn, prevDir })
+	prevOn, prevDir := recordEnabled.Load(), recordDir.Load()
+	recordEnabled.Store(on)
+	recordDir.Store(&dir)
+	t.Cleanup(func() { recordEnabled.Store(prevOn); recordDir.Store(prevDir) })
 	return dir
 }
 
@@ -59,9 +60,9 @@ func TestRecordFlagOffChangesNothing(t *testing.T) {
 	// Дефолт перевіряємо ДО підміни: інакше тест доводив би лише те, що
 	// перемикач працює, а не те, що ТИПОВО він вимкнений — а прод захищає саме
 	// друге. Перевернутий дефолт падає тут.
-	if recordEnabled != (os.Getenv("OO_SCREEN_RECORD") == "1") {
+	if recordEnabled.Load() != (os.Getenv("OO_SCREEN_RECORD") == "1") {
 		t.Fatalf("recordEnabled=%v при OO_SCREEN_RECORD=%q — типово запис мусить бути ВИМКНЕНИЙ",
-			recordEnabled, os.Getenv("OO_SCREEN_RECORD"))
+			recordEnabled.Load(), os.Getenv("OO_SCREEN_RECORD"))
 	}
 
 	dir := withRecordFlag(t, false)

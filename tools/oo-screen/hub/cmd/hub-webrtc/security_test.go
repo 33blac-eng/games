@@ -325,9 +325,9 @@ func TestSecH14ViewerCapPerNode(t *testing.T) {
 func TestSecH15RecordingPermissions(t *testing.T) {
 	withRecordFlag(t, true)
 	dir := filepath.Join(t.TempDir(), "rec")
-	prevDir := recordDir
-	recordDir = dir
-	defer func() { recordDir = prevDir }()
+	prevDir := recordDir.Load()
+	recordDir.Store(&dir)
+	defer func() { recordDir.Store(prevDir) }()
 
 	// Пишемо через open() напряму — без корпусу: реальний SPS 1920x1080.
 	r := &recorder{nodeID: "node", dir: dir,

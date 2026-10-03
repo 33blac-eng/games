@@ -1286,7 +1286,7 @@ func setupAgentLeg(ns *nodeSession, pc *webrtc.PeerConnection) error {
 				// те, що прислав кодер. Send неблокуючий — диск не стоїть на
 				// шляху глядача.
 				rec := ns.rec.Load()
-				if rec == nil && recordEnabled && ns.viewerCount.Load() > 0 && time.Now().After(nextTry) {
+				if rec == nil && recordEnabled.Load() && ns.viewerCount.Load() > 0 && time.Now().After(nextTry) {
 					// ponytail: повтор не частіше за 30 с — startRecording при тісному
 					// диску відмовляє, а питати диск на кожному пакеті дорого.
 					nextTry = time.Now().Add(30 * time.Second)

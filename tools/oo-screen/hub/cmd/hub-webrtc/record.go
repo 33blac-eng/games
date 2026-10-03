@@ -50,12 +50,25 @@ import (
 
 // recordEnabled — прапорець. Змінна, а не os.Getenv на місці: тести перемикають
 // її напряму (той самий прийом, що audioEnabled в audio.go).
-var recordEnabled = os.Getenv("OO_SCREEN_RECORD") == "1"
+//
+// Атомарна, як і recordDir та recordIdleClose нижче: їх читають горутини, яких
+// тест не контролює — колбек стану PeerConnection (dropViewer ->
+// scheduleRecordClose) нерідко спрацьовує вже ПІСЛЯ кінця тесту, що цю ногу
+// завів, і гонить із наступним тестом, який перемикає прапорець (race detector
+// під навантаженням: TestRecordSurvivesQuickReconnect / ClosesAfterLastViewerLeaves).
+var recordEnabled atomic.Bool
 
 // recordDir — куди складати записи. Дефолт відносний: хаб на проді запускається
 // зі свого каталогу, і "recordings" поруч із бінарем — це те, що адміністратор
 // знайде без документації. Каталог створюється при першому записі.
-var recordDir = envOr("OO_SCREEN_RECORD_DIR", "recordings")
+var recordDir atomic.Pointer[string]
+
+func init() {
+	recordEnabled.Store(os.Getenv("OO_SCREEN_RECORD") == "1")
+	d := envOr("OO_SCREEN_RECORD_DIR", "recordings")
+	recordDir.Store(&d)
+	recordIdleClose.Store(int64(30 * time.Second))
+}
 
 // recordQueueDepth — глибина черги до писаря. ~830 пакетів/с на 8 Мбіт/с, тож
 // 2048 ≈ 2.5 с запасу: звичайне «диск задумався» переживається без втрат.
@@ -128,19 +141,20 @@ type recorder struct {
 // startRecording піднімає писаря сесії. nil (і жодного сліду на диску), поки
 // OO_SCREEN_RECORD не заданий — це і є «без прапорця нічого не змінилось».
 func startRecording(nodeID string) *recorder {
-	if !recordEnabled {
+	if !recordEnabled.Load() {
 		return nil
 	}
+	dir := *recordDir.Load()
 	// Запобіжник місця (recordprune.go). Прибирає застаріле й відмовляється
 	// починати, коли на диску тісно. Саме ТУТ, а не у фоновому таймері: у
 	// момент старту сесії ми ще можемо чесно сказати «не пишу», а посеред
 	// запису вибір уже між зіпсованим файлом і забитим диском.
-	if !recordingsFit(recordDir) {
+	if !recordingsFit(dir) {
 		return nil
 	}
 	r := &recorder{
 		nodeID: nodeID,
-		dir:    recordDir,
+		dir:    dir,
 		ch:     make(chan recItem, recordQueueDepth),
 		done:   make(chan struct{}),
 		fin:    make(chan struct{}),
@@ -509,7 +523,7 @@ func safeNodeID(id string) string {
 // recordIdleClose — скільки чекаємо після ОСТАННЬОГО глядача, перш ніж закрити
 // файл. Перепідключення після обриву (оновили сторінку, мигнула мережа) лишається
 // в тому самому файлі, а сеанс наступного дня — вже в новому.
-var recordIdleClose = 30 * time.Second
+var recordIdleClose atomic.Int64 // time.Duration; типово 30 с (init вище)
 
 // scheduleRecordClose закриває поточний файл ноди, якщо за recordIdleClose так і
 // не зʼявився жоден глядач. Close() чекає на писаря, тому поза таймерною горутиною.
@@ -517,10 +531,10 @@ var recordIdleClose = 30 * time.Second
 // файл — тоді він закриється, і наступний пакет відкриє ще один. Короткий зайвий
 // файл, не втрата запису.
 func scheduleRecordClose(ns *nodeSession) {
-	if !recordEnabled {
+	if !recordEnabled.Load() {
 		return
 	}
-	time.AfterFunc(recordIdleClose, func() {
+	time.AfterFunc(time.Duration(recordIdleClose.Load()), func() {
 		if ns.viewerCount.Load() != 0 {
 			return
 		}
