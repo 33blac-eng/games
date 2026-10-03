@@ -24,6 +24,14 @@ export const TYPE_INVALIDATE = 2;
 // мітка), хаб перебазовує мітки — жодна сторона не знає мітки кадру, яку
 // бачить браузер; а keepalive щоразу дістає НОВУ мітку.
 export const TYPE_STILL = 3;
+// TYPE_KEEP — дедуп між епізодами (той самий VERSION 1: старий плеєр невідомий
+// тип просто ігнорує). Перше повідомлення епізоду після invalidate:
+// payload = N × (u16 x, u16 y, u16 w, u16 h) LE — тайли попередніх епізодів
+// (тієї ж srcW×srcH), чиї пікселі не змінились. Плеєр тримає декодовані тайли
+// між епохами (store), invalidate лише стирає canvas; keep повертає на canvas
+// перелічені й викидає решту, нові/змінені тайли приходять як TYPE_TILE.
+export const TYPE_KEEP = 4;
+export const KEEP_RECT_SIZE = 8;
 export const FORMAT_NONE = 0;
 export const FORMAT_PNG = 1;
 export const MAX_MESSAGE = 64 * 1024;
@@ -61,6 +69,20 @@ export function parseTileMessage(data) {
     if (m.type === TYPE_INVALIDATE || m.type === TYPE_STILL) {
         return (len === 0 && m.format === FORMAT_NONE) ? m : null;
     }
+    if (m.type === TYPE_KEEP) {
+        if (m.format !== FORMAT_NONE || m.x || m.y || m.w || m.h || len % KEEP_RECT_SIZE) return null;
+        if (!m.srcW || !m.srcH || m.srcW > MAX_SRC_SIDE || m.srcH > MAX_SRC_SIDE) return null;
+        const rects = [];
+        for (let o = HEADER_SIZE; o < u8.length; o += KEEP_RECT_SIZE) {
+            const r = { x: dv.getUint16(o, true), y: dv.getUint16(o + 2, true),
+                w: dv.getUint16(o + 4, true), h: dv.getUint16(o + 6, true) };
+            if (!r.w || !r.h || r.w > MAX_TILE_SIDE || r.h > MAX_TILE_SIDE) return null;
+            if (r.x + r.w > m.srcW || r.y + r.h > m.srcH) return null;
+            rects.push(r);
+        }
+        m.rects = rects;
+        return m;
+    }
     if (m.type !== TYPE_TILE || m.format !== FORMAT_PNG || len === 0) return null;
     if (!m.w || !m.h || m.w > MAX_TILE_SIDE || m.h > MAX_TILE_SIDE) return null;
     if (!m.srcW || !m.srcH || m.srcW > MAX_SRC_SIDE || m.srcH > MAX_SRC_SIDE) return null;
@@ -71,14 +93,22 @@ export function parseTileMessage(data) {
     return m;
 }
 
+const tileKey = (r) => r.x + ',' + r.y + ',' + r.w + ',' + r.h;
+
 // createTileState — чиста логіка епох (без DOM), тестується в node.
-//   accept(msg) → { clear: bool, draw: bool }
+//   accept(msg) → { clear, draw, entry?, kept?, dropped? }
+//     entry — запис сховища для нового тайла (overlay кладе туди bmp);
+//     kept — записи, що їх keep повернув у поточну епоху (малювати);
+//     dropped — записи, викинуті зі сховища (закрити bmp).
 //   onVideoSize(w, h) → true, якщо тайли треба стерти (інші пропорції кадру =
 //   інший монітор / інша картинка, тайли до неї не стосуються).
 //   onFrames(n) → 'hide' | null — n нових відеокадрів (rVFC presentedFrames);
 //   accept(still) → { show: true }, коли кредитів знову вистачає.
 // Кредити діють лише з першого TYPE_STILL сесії: старий агент/хаб анонсів
 // не шле, і тоді поведінка та сама, що до них (лише invalidate).
+// Сховище (store) — тайли, що переживають епохи: запис чинний (малюється),
+// коли entry.epoch === поточна епоха. Епізод без keep (старий агент/хаб)
+// викидає все старіше за свою епоху — поведінка як до дедупу.
 export function createTileState() {
     let epoch = null;
     let srcW = 0;
@@ -86,11 +116,23 @@ export function createTileState() {
     let count = 0;
     let stillSeen = false;
     let credits = 0;
+    let keepEpoch = null;
+    const store = new Map();
+    function dropWhere(f) {
+        const out = [];
+        for (const [k, e] of store) {
+            if (f(e)) { store.delete(k); out.push(e); }
+        }
+        return out;
+    }
     return {
         epoch: () => epoch,
         count: () => count,
         credits: () => credits,
+        held: () => store.size,
         source: () => ({ width: srcW, height: srcH }),
+        inStore(e) { return store.get(e.key) === e; },
+        isLive(e) { return store.get(e.key) === e && e.epoch === epoch; },
         accept(m) {
             if (!m) return { clear: false, draw: false };
             if (m.type === TYPE_STILL) {
@@ -105,17 +147,45 @@ export function createTileState() {
                 credits = 0;
                 return { clear: true, draw: false };
             }
+            if (m.type === TYPE_KEEP) {
+                const clear = epoch !== m.epoch || count > 0;
+                if (epoch !== m.epoch) credits = 0;
+                epoch = m.epoch;
+                keepEpoch = m.epoch;
+                const same = srcW === m.srcW && srcH === m.srcH;
+                const want = new Set(m.rects.map(tileKey));
+                const dropped = dropWhere((e) => !same || !want.has(e.key));
+                srcW = m.srcW;
+                srcH = m.srcH;
+                const kept = [];
+                for (const r of m.rects) {
+                    const e = store.get(tileKey(r));
+                    if (e && e.epoch !== m.epoch) { e.epoch = m.epoch; kept.push(e); }
+                }
+                count = kept.length;
+                return { clear, draw: false, kept, dropped };
+            }
             let clear = false;
+            let dropped = [];
             if (epoch !== m.epoch || srcW !== m.srcW || srcH !== m.srcH) {
                 clear = count > 0 || epoch !== m.epoch;
+                if (srcW !== m.srcW || srcH !== m.srcH) dropped = dropWhere(() => true);
                 epoch = m.epoch;
                 srcW = m.srcW;
                 srcH = m.srcH;
                 count = 0;
                 credits = 0;
             }
+            if (keepEpoch !== m.epoch) {
+                dropped = dropped.concat(dropWhere((e) => e.epoch !== m.epoch));
+            }
+            const key = tileKey(m);
+            const old = store.get(key);
+            if (old) dropped.push(old);
+            const entry = { key, x: m.x, y: m.y, epoch: m.epoch, bmp: null };
+            store.set(key, entry);
             count++;
-            return { clear, draw: true };
+            return { clear, draw: true, entry, dropped };
         },
         isCurrent(e) { return e === epoch; },
         onFrames(n) {
@@ -129,6 +199,8 @@ export function createTileState() {
             credits -= n;
             return credits < 0 ? 'hide' : null;
         },
+        // dropAll — інша картинка: сховище більше ні до чого.
+        dropAll() { return dropWhere(() => true); },
         onVideoSize(w, h) {
             if (!count || !(w > 0) || !(h > 0) || !srcW || !srcH) return false;
             // Енкодер може масштабувати — порівнюємо пропорції, не пікселі.
@@ -176,6 +248,14 @@ export function createTileOverlay(o) {
         setHidden(false); // порожній canvas ховати нічого
     }
 
+    function release(list) {
+        if (!list) return;
+        for (const e of list) {
+            if (e.bmp && e.bmp.close) e.bmp.close();
+            e.bmp = null;
+        }
+    }
+
     function layout() {
         const src = state.source();
         if (!box || !src.width || !src.height) return;
@@ -197,7 +277,7 @@ export function createTileOverlay(o) {
         // presentedFrames — з метаданих requestVideoFrameCallback (може
         // стрибати на кілька кадрів, якщо колбек пропустив); без нього — 1.
         onVideoFrame(videoW, videoH, presentedFrames) {
-            if (state.onVideoSize(videoW, videoH)) { clear(); return; }
+            if (state.onVideoSize(videoW, videoH)) { release(state.dropAll()); clear(); return; }
             let n = 1;
             if (typeof presentedFrames === 'number') {
                 n = lastPresented === null ? 1 : presentedFrames - lastPresented;
@@ -212,33 +292,46 @@ export function createTileOverlay(o) {
             const m = parseTileMessage(data);
             if (!m) return;
             const act = state.accept(m);
+            release(act.dropped);
             if (act.show) setHidden(false);
-            if (m.type === TYPE_TILE && (canvas.width !== m.srcW || canvas.height !== m.srcH)) {
+            if ((m.type === TYPE_TILE || m.type === TYPE_KEEP) &&
+                (canvas.width !== m.srcW || canvas.height !== m.srcH)) {
                 canvas.width = m.srcW; // скидає й вміст
                 canvas.height = m.srcH;
                 layout();
             } else if (act.clear) {
                 clear();
             }
+            if (act.kept) {
+                const c = ctx();
+                for (const e of act.kept) {
+                    if (c && e.bmp) c.drawImage(e.bmp, e.x, e.y);
+                }
+            }
             if (!act.draw) return;
+            const entry = act.entry;
             let bmp;
             try {
                 bmp = await decode(m.payload);
             } catch (e) {
                 return;
             }
-            // Поки декодували, екран міг змінитись — тоді тайл уже чужий.
-            if (destroyed || !state.isCurrent(m.epoch)) {
+            // Поки декодували, запис могли витіснити — тоді тайл уже чужий.
+            if (destroyed || !entry || !state.inStore(entry)) {
                 if (bmp && bmp.close) bmp.close();
                 return;
             }
+            entry.bmp = bmp;
+            // Запис може бути в сховищі, але з минулої епохи (invalidate під
+            // час декоду): тримаємо для keep, не малюємо.
+            if (!state.isLive(entry)) return;
             const c = ctx();
             if (c) c.drawImage(bmp, m.x, m.y);
-            if (bmp && bmp.close) bmp.close();
         },
         clear,
         destroy() {
             destroyed = true;
+            release(state.dropAll());
             if (canvas.parentNode) canvas.parentNode.removeChild(canvas);
         },
     };

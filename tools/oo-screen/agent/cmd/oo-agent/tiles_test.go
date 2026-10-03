@@ -50,7 +50,7 @@ func TestSendEpisodeStopsOnStaleEpoch(t *testing.T) {
 	st := sendEpisode(context.Background(), dc, img, 4, 1, tiles.SelectConfig{}, 1<<30, nil, func(e uint32) bool {
 		n++
 		return n < 5 && e == 4
-	})
+	}, nil)
 	if !st.Aborted || len(dc.sent) == 0 || len(dc.sent) >= st.Selected {
 		t.Fatalf("stats %+v sent %d", st, len(dc.sent))
 	}
@@ -63,7 +63,7 @@ func TestSendEpisodeStopsOnStaleEpoch(t *testing.T) {
 
 func TestSendEpisodeClosedChannel(t *testing.T) {
 	dc := &fakeTileDC{state: webrtc.DataChannelStateClosed}
-	st := sendEpisode(context.Background(), dc, redTextImage(128, 64), 1, 1, tiles.SelectConfig{}, 1<<30, nil, func(uint32) bool { return true })
+	st := sendEpisode(context.Background(), dc, redTextImage(128, 64), 1, 1, tiles.SelectConfig{}, 1<<30, nil, func(uint32) bool { return true }, nil)
 	if st.Sent != 0 || !st.Aborted {
 		t.Fatalf("sent on a closed channel: %+v", st)
 	}
@@ -135,7 +135,7 @@ func TestTilesCursorExclude(t *testing.T) {
 	dc := &fakeTileDC{state: webrtc.DataChannelStateOpen}
 	img := redTextImage(256, 128)
 	sendEpisode(context.Background(), dc, img, 1, 1, tiles.SelectConfig{Exclude: ex}, 1<<30, nil,
-		func(uint32) bool { return true })
+		func(uint32) bool { return true }, nil)
 	if len(dc.sent) == 0 {
 		t.Fatal("nothing sent")
 	}
@@ -146,5 +146,49 @@ func TestTilesCursorExclude(t *testing.T) {
 		if x < r.X+r.W && r.X < x+w && y < r.Y+r.H && r.Y < y+h {
 			t.Fatalf("tile %d,%d under the pointer sent", x, y)
 		}
+	}
+}
+
+// Друга серія на тому самому екрані: лише TypeKeep, жодного PNG; змінений
+// тайл — одним TypeTile; новий канал (Reset) — знову повний набір.
+func TestSendEpisodeDedup(t *testing.T) {
+	held := &tiles.Held{}
+	img := redTextImage(256, 128)
+	run := func(epoch uint32) (keep int, tilesN int) {
+		dc := &fakeTileDC{state: webrtc.DataChannelStateOpen}
+		sendEpisode(context.Background(), dc, img, epoch, 1, tiles.SelectConfig{}, 1<<30, nil,
+			func(uint32) bool { return true }, held)
+		for i, b := range dc.sent {
+			m, err := tiles.Decode(b)
+			if err != nil || m.Epoch != epoch {
+				t.Fatalf("bad msg %v %+v", err, m)
+			}
+			if m.Type == tiles.TypeKeep {
+				if i != 0 {
+					t.Fatal("keep not first")
+				}
+				keep = len(tiles.KeepRects(m.Payload))
+			} else {
+				tilesN++
+			}
+		}
+		return
+	}
+	k, n := run(1)
+	if k != 0 || n == 0 {
+		t.Fatalf("first: keep %d tiles %d", k, n)
+	}
+	k2, n2 := run(2)
+	if k2 != n || n2 != 0 {
+		t.Fatalf("second: keep %d tiles %d (want %d/0)", k2, n2, n)
+	}
+	img.Pix[(10*img.Stride)+10*4] ^= 0xFF // touch tile (0,0)
+	k3, n3 := run(3)
+	if n3 != 1 || k3 != n-1 {
+		t.Fatalf("changed: keep %d tiles %d", k3, n3)
+	}
+	held.Reset()
+	if k4, n4 := run(4); k4 != 0 || n4 != n {
+		t.Fatalf("after reset: keep %d tiles %d", k4, n4)
 	}
 }

@@ -2,6 +2,7 @@ package tiles
 
 import (
 	"bytes"
+	"hash/maphash"
 	"image"
 	"image/png"
 	"sync"
@@ -73,6 +74,7 @@ func EncodePNG(img Image, x, y, w, h int, level png.CompressionLevel) ([]byte, e
 type Stats struct {
 	Selected int // tiles the selector picked
 	Sent     int // tiles emitted
+	Kept     int // tiles re-validated by TypeKeep (not resent)
 	Bytes    int // total bytes emitted (headers included)
 	Capped   bool
 	Aborted  bool
@@ -83,13 +85,111 @@ type Stats struct {
 // returns false (epoch went stale / channel gone).
 func Build(img Image, epoch, frame uint32, cfg SelectConfig, maxBytes int,
 	emit func(msg []byte) bool) Stats {
+	return BuildDedup(img, epoch, frame, cfg, maxBytes, nil, emit)
+}
+
+// TileKey — tile rect as a map key.
+type TileKey struct{ X, Y, W, H uint16 }
+
+func keyOf(r Rect) TileKey { return TileKey{uint16(r.X), uint16(r.Y), uint16(r.W), uint16(r.H)} }
+
+// Held mirrors what the viewer side retains: tile rect -> pixel hash, for one
+// source geometry. The agent owns one per channel; Reset when the channel (and
+// so every viewer's store) is new. Safe for concurrent use.
+type Held struct {
+	mu   sync.Mutex
+	gen  uint64
+	w, h int
+	m    map[TileKey]uint64
+}
+
+// Reset forgets everything (new channel / viewer set).
+func (h *Held) Reset() {
+	h.mu.Lock()
+	h.gen++
+	h.m, h.w, h.h = nil, 0, 0
+	h.mu.Unlock()
+}
+
+// Len — tiles currently believed held.
+func (h *Held) Len() int {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return len(h.m)
+}
+
+var hashSeed = maphash.MakeSeed()
+
+// tileHash — hash of the tile's BGRA pixels (position is the map key).
+func tileHash(img Image, r Rect) uint64 {
+	var mh maphash.Hash
+	mh.SetSeed(hashSeed)
+	for y := r.Y; y < r.Y+r.H; y++ {
+		o := y*img.Stride + r.X*4
+		_, _ = mh.Write(img.Pix[o : o+r.W*4])
+	}
+	return mh.Sum64()
+}
+
+// BuildDedup is Build with cross-episode dedup. held == nil: plain Build (no
+// TypeKeep). Otherwise the selected tiles whose pixels equal what the viewer
+// already holds are announced in ONE TypeKeep message emitted first; only the
+// rest is encoded and sent. held is updated to exactly what the viewer holds
+// afterwards (kept + successfully emitted).
+func BuildDedup(img Image, epoch, frame uint32, cfg SelectConfig, maxBytes int, held *Held,
+	emit func(msg []byte) bool) Stats {
 	var st Stats
-	if img.W > 0xFFFF || img.H > 0xFFFF {
+	if img.W > 0xFFFF || img.H > 0xFFFF || img.W > MaxSrcSide || img.H > MaxSrcSide {
 		return st
 	}
 	rects := Select(img, cfg)
 	st.Selected = len(rects)
-	for _, r := range rects {
+	var hashes []uint64
+	var gen uint64
+	if held != nil {
+		hashes = make([]uint64, len(rects))
+		for i, r := range rects {
+			hashes[i] = tileHash(img, r)
+		}
+		held.mu.Lock()
+		gen = held.gen
+		prev := held.m
+		if held.w != img.W || held.h != img.H {
+			prev = nil
+		}
+		var keep []Rect
+		next := make(map[TileKey]uint64, len(rects))
+		rest := rects[:0:0]
+		restH := hashes[:0:0]
+		for i, r := range rects {
+			k := keyOf(r)
+			if hv, ok := prev[k]; ok && hv == hashes[i] && len(keep) < MaxPayload/KeepRectSize {
+				keep = append(keep, r)
+				next[k] = hv
+				continue
+			}
+			rest = append(rest, r)
+			restH = append(restH, hashes[i])
+		}
+		held.mu.Unlock()
+		msg, err := Keep(epoch, frame, img.W, img.H, keep)
+		if err != nil {
+			return st
+		}
+		if !emit(msg) {
+			st.Aborted = true
+			return st
+		}
+		st.Bytes += len(msg)
+		st.Kept = len(keep)
+		held.mu.Lock()
+		if held.gen == gen {
+			held.m, held.w, held.h = next, img.W, img.H
+		}
+		held.mu.Unlock()
+		rects, hashes = rest, restH
+	}
+	for i, r := range rects {
 		payload, err := EncodePNG(img, r.X, r.Y, r.W, r.H, png.BestSpeed)
 		if err != nil || len(payload) > MaxPayload {
 			continue
@@ -112,6 +212,13 @@ func Build(img Image, epoch, frame uint32, cfg SelectConfig, maxBytes int,
 		}
 		st.Sent++
 		st.Bytes += len(msg)
+		if held != nil {
+			held.mu.Lock()
+			if held.gen == gen {
+				held.m[keyOf(r)] = hashes[i]
+			}
+			held.mu.Unlock()
+		}
 	}
 	return st
 }

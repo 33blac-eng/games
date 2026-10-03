@@ -146,6 +146,9 @@ type viewerLeg struct {
 	// born — момент створення ноги: старт відліку time-to-first-frame
 	// (/metrics, metrics.go). Пишеться раз, до pump.
 	born time.Time
+	// tilesLossy — з останнього TypeKeep глядач втратив хоч один тайл: його
+	// сховище може не мати тайлів, які агент вважає утриманими (tiles.go).
+	tilesLossy atomic.Bool
 }
 
 // addViewer реєструє нову viewer-ногу ноди й піднімає її pump. Нога ще НЕ live:

@@ -54,6 +54,16 @@ const (
 	// browser sees it. Keepalive repeats get fresh timestamps too, so a pure
 	// "newer ts => stale" rule would clear tiles every second.
 	TypeStill = 3
+	// TypeKeep — dedup across episodes (wire v1 compatible: old players and
+	// parsers drop unknown types). Sent first in an episode, after the
+	// invalidate of its epoch. Payload: N x (u16 x, u16 y, u16 w, u16 h) LE —
+	// tiles of earlier episodes (same SrcW x SrcH, header fields) whose
+	// pixels are unchanged; the receiver re-adopts them into Epoch and drops
+	// every retained tile NOT listed. Header X/Y/W/H/Format are 0. Tiles not
+	// in the list are sent as TypeTile in the same epoch as before.
+	TypeKeep = 4
+	// KeepRectSize — bytes per rect in a TypeKeep payload.
+	KeepRectSize = 8
 
 	FormatNone = 0
 	FormatPNG  = 1 // RGB(A) PNG, decoded by createImageBitmap in the browser
@@ -100,6 +110,20 @@ func (m *Msg) validate() error {
 	case TypeInvalidate, TypeStill:
 		if len(m.Payload) != 0 || m.Format != FormatNone {
 			return fmt.Errorf("%w: invalidate/still carries payload", ErrInvalid)
+		}
+	case TypeKeep:
+		if m.Format != FormatNone || m.X != 0 || m.Y != 0 || m.W != 0 || m.H != 0 ||
+			len(m.Payload)%KeepRectSize != 0 {
+			return fmt.Errorf("%w: keep header/payload", ErrInvalid)
+		}
+		if m.SrcW == 0 || m.SrcH == 0 || m.SrcW > MaxSrcSide || m.SrcH > MaxSrcSide {
+			return fmt.Errorf("%w: source %dx%d", ErrInvalid, m.SrcW, m.SrcH)
+		}
+		for _, r := range KeepRects(m.Payload) {
+			if r.W == 0 || r.H == 0 || r.W > MaxTileSide || r.H > MaxTileSide ||
+				r.X+r.W > int(m.SrcW) || r.Y+r.H > int(m.SrcH) {
+				return fmt.Errorf("%w: keep rect %+v outside %dx%d", ErrInvalid, r, m.SrcW, m.SrcH)
+			}
 		}
 	case TypeTile:
 		if m.Format != FormatPNG || len(m.Payload) == 0 {
@@ -155,6 +179,52 @@ func Invalidate(epoch, frame uint32) []byte {
 // Still builds the still-repeat announcement for epoch (see TypeStill).
 func Still(epoch, frame uint32) []byte {
 	b, _ := Encode(&Msg{Type: TypeStill, Epoch: epoch, Frame: frame})
+	return b
+}
+
+// Keep builds the TypeKeep message for epoch; rects must fit srcW x srcH.
+func Keep(epoch, frame uint32, srcW, srcH int, rects []Rect) ([]byte, error) {
+	p := make([]byte, len(rects)*KeepRectSize)
+	le := binary.LittleEndian
+	for i, r := range rects {
+		if r.X < 0 || r.Y < 0 || r.X > 0xFFFF || r.Y > 0xFFFF || r.W > 0xFFFF || r.H > 0xFFFF {
+			return nil, fmt.Errorf("%w: keep rect %+v", ErrInvalid, r)
+		}
+		o := i * KeepRectSize
+		le.PutUint16(p[o:], uint16(r.X))
+		le.PutUint16(p[o+2:], uint16(r.Y))
+		le.PutUint16(p[o+4:], uint16(r.W))
+		le.PutUint16(p[o+6:], uint16(r.H))
+	}
+	if srcW <= 0 || srcH <= 0 || srcW > MaxSrcSide || srcH > MaxSrcSide {
+		return nil, fmt.Errorf("%w: source %dx%d", ErrInvalid, srcW, srcH)
+	}
+	if len(p) == 0 {
+		p = nil
+	}
+	return Encode(&Msg{Type: TypeKeep, Epoch: epoch, Frame: frame,
+		SrcW: uint16(srcW), SrcH: uint16(srcH), Payload: p})
+}
+
+// KeepRects decodes a TypeKeep payload (trailing partial rect ignored).
+func KeepRects(p []byte) []Rect {
+	le := binary.LittleEndian
+	out := make([]Rect, 0, len(p)/KeepRectSize)
+	for o := 0; o+KeepRectSize <= len(p); o += KeepRectSize {
+		out = append(out, Rect{X: int(le.Uint16(p[o:])), Y: int(le.Uint16(p[o+2:])),
+			W: int(le.Uint16(p[o+4:])), H: int(le.Uint16(p[o+6:]))})
+	}
+	return out
+}
+
+// Restamp returns a copy of the encoded message raw with its epoch replaced
+// (the header has no checksum). Used by the hub to replay retained tiles of
+// earlier epochs to a late viewer as tiles of the current epoch.
+func Restamp(raw []byte, epoch uint32) []byte {
+	b := append([]byte(nil), raw...)
+	if len(b) >= HeaderSize {
+		binary.LittleEndian.PutUint32(b[4:], epoch)
+	}
 	return b
 }
 

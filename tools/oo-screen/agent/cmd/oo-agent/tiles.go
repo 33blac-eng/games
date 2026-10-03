@@ -38,6 +38,10 @@ var (
 	tilesDC atomic.Pointer[webrtc.DataChannel]
 	// tileEps — епоха/епізоди; одна на процес, щоб епоха росла й через реконекти.
 	tileEps = &tiles.Episodes{MinInterval: tiles.DefaultMinInterval}
+	// tileHeld — які тайли (rect → хеш пікселів) уже тримає сторона глядача
+	// (плеєр/хаб) для поточної геометрії: наступний епізод шле лише змінені,
+	// а незмінені — одним tiles.TypeKeep. Скидається з новим каналом.
+	tileHeld = &tiles.Held{}
 	// tilesBusy — епізод зараз будується (не більше одного одночасно).
 	tilesBusy atomic.Bool
 	// tilesLastMotion — коли кадровий цикл востаннє бачив змінений кадр
@@ -168,9 +172,9 @@ func tilesStatic(ctx context.Context, now time.Time, read func() ([]byte, int, i
 		lim := rate.NewLimiter(tilesRateBytes, tiles.MaxMessage)
 		t1 := time.Now()
 		st := sendEpisode(ctx, dc, img, epoch, frame, tiles.SelectConfig{Exclude: exclude},
-			tiles.DefaultEpisodeBytes, lim, tileEps.Current)
-		log.Printf("oo-agent: text tiles epoch=%d: %d/%d tiles, %d B, capped=%v aborted=%v (readback %v, build+send %v)",
-			epoch, st.Sent, st.Selected, st.Bytes, st.Capped, st.Aborted,
+			tiles.DefaultEpisodeBytes, lim, tileEps.Current, tileHeld)
+		log.Printf("oo-agent: text tiles epoch=%d: %d/%d tiles (+%d kept), %d B, capped=%v aborted=%v (readback %v, build+send %v)",
+			epoch, st.Sent, st.Selected, st.Kept, st.Bytes, st.Capped, st.Aborted,
 			readDur.Round(time.Millisecond), time.Since(t1).Round(time.Millisecond))
 	}()
 }
@@ -178,8 +182,8 @@ func tilesStatic(ctx context.Context, now time.Time, read func() ([]byte, int, i
 // sendEpisode будує й шле один епізод з дотриманням бюджету, швидкості й
 // буфера каналу; обривається, щойно епоха перестала бути поточною.
 func sendEpisode(ctx context.Context, dc tileChannel, img tiles.Image, epoch, frame uint32,
-	cfg tiles.SelectConfig, budget int, lim *rate.Limiter, current func(uint32) bool) tiles.Stats {
-	return tiles.Build(img, epoch, frame, cfg, budget, func(msg []byte) bool {
+	cfg tiles.SelectConfig, budget int, lim *rate.Limiter, current func(uint32) bool, held *tiles.Held) tiles.Stats {
+	return tiles.BuildDedup(img, epoch, frame, cfg, budget, held, func(msg []byte) bool {
 		for {
 			if !current(epoch) || dc.ReadyState() != webrtc.DataChannelStateOpen || ctx.Err() != nil {
 				return false

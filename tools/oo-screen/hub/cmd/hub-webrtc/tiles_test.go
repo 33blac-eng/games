@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"runtime"
@@ -31,25 +32,90 @@ func tileMsg(t *testing.T, epoch uint32, x uint16, size int) []byte {
 	return b
 }
 
+func tileAt(t *testing.T, epoch uint32, x, y uint16, tag byte) []byte {
+	t.Helper()
+	p := tilePNG(40)
+	p[39] = tag
+	b, err := tiles.Encode(&tiles.Msg{Type: tiles.TypeTile, Epoch: epoch, X: x, Y: y, W: 64, H: 64,
+		SrcW: 1920, SrcH: 1080, Format: tiles.FormatPNG, Payload: p})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return b
+}
+
+func feed(c *tilesCache, raw []byte) [][]byte {
+	m, err := tiles.Decode(raw)
+	if err != nil {
+		panic(err)
+	}
+	var kr []tiles.Rect
+	if m.Type == tiles.TypeKeep {
+		kr = tiles.KeepRects(m.Payload)
+	}
+	return c.remember(m, raw, kr)
+}
+
+// summary — (type, epoch, x, tag) кожного повідомлення знімка.
+func summary(t *testing.T, s [][]byte) []string {
+	t.Helper()
+	var out []string
+	for _, raw := range s {
+		m, err := tiles.Decode(raw)
+		if err != nil {
+			t.Fatal(err)
+		}
+		switch m.Type {
+		case tiles.TypeInvalidate:
+			out = append(out, fmt.Sprintf("inv%d", m.Epoch))
+		case tiles.TypeKeep:
+			out = append(out, fmt.Sprintf("keep%d:%d", m.Epoch, len(tiles.KeepRects(m.Payload))))
+		default:
+			out = append(out, fmt.Sprintf("t%d@%d#%d", m.Epoch, m.X, m.Payload[39]))
+		}
+	}
+	return out
+}
+
 func TestTilesCacheEpochs(t *testing.T) {
 	var c tilesCache
-	c.remember(&tiles.Msg{Type: tiles.TypeTile, Epoch: 1}, []byte("a"))
-	c.remember(&tiles.Msg{Type: tiles.TypeTile, Epoch: 1}, []byte("b"))
-	if n := len(c.snapshot()); n != 2 {
-		t.Fatalf("cache %d", n)
+	if c.snapshot() != nil {
+		t.Fatal("empty cache replays")
 	}
-	c.remember(&tiles.Msg{Type: tiles.TypeInvalidate, Epoch: 2}, []byte("inv"))
-	if s := c.snapshot(); len(s) != 1 || string(s[0]) != "inv" {
-		t.Fatalf("after invalidate %q", s)
+	feed(&c, tileAt(t, 1, 0, 0, 1))
+	feed(&c, tileAt(t, 1, 64, 0, 2))
+	if got := fmt.Sprint(summary(t, c.snapshot())); got != "[keep1:0 t1@0#1 t1@64#2]" {
+		t.Fatalf("cache %s", got)
 	}
-	c.remember(&tiles.Msg{Type: tiles.TypeTile, Epoch: 2}, []byte("c"))
-	c.remember(&tiles.Msg{Type: tiles.TypeTile, Epoch: 3}, []byte("d")) // new epoch w/o invalidate
-	if s := c.snapshot(); len(s) != 1 || string(s[0]) != "d" {
-		t.Fatalf("epoch switch %q", s)
+	feed(&c, tiles.Invalidate(2, 0))
+	if got := fmt.Sprint(summary(t, c.snapshot())); got != "[inv2]" {
+		t.Fatalf("after invalidate %s", got)
 	}
-	big := make([]byte, tilesCacheBytes)
-	c.remember(&tiles.Msg{Type: tiles.TypeTile, Epoch: 3}, big)
-	if len(c.snapshot()) != 1 {
+	// keep: тайл 0 лишається (перештампований у епоху 2), 64 — викинуто
+	keep, _ := tiles.Keep(2, 0, 1920, 1080, []tiles.Rect{{X: 0, W: 64, H: 64}, {X: 128, W: 64, H: 64}})
+	repair := feed(&c, keep)
+	if got := fmt.Sprint(summary(t, repair)); got != "[t2@0#1]" {
+		t.Fatalf("repair %s", got)
+	}
+	feed(&c, tileAt(t, 2, 192, 0, 3))
+	if got := fmt.Sprint(summary(t, c.snapshot())); got != "[inv2 keep2:0 t2@0#1 t2@192#3]" {
+		t.Fatalf("after keep %s", got)
+	}
+	// новий епізод без keep (старий агент): старі тайли недійсні
+	feed(&c, tiles.Invalidate(3, 0))
+	feed(&c, tileAt(t, 3, 64, 0, 4))
+	if got := fmt.Sprint(summary(t, c.snapshot())); got != "[inv3 keep3:0 t3@64#4]" {
+		t.Fatalf("no-keep episode %s", got)
+	}
+	// keep іншої геометрії стирає все
+	feed(&c, tiles.Invalidate(4, 0))
+	keep2, _ := tiles.Keep(4, 0, 1280, 1024, []tiles.Rect{{X: 64, W: 64, H: 64}})
+	if r := feed(&c, keep2); len(r) != 0 || len(c.held) != 0 {
+		t.Fatalf("geometry change kept %d", len(c.held))
+	}
+	big := make([]byte, tilesCacheBytes+1)
+	c.remember(&tiles.Msg{Type: tiles.TypeTile, Epoch: 4, SrcW: 1280, SrcH: 1024, W: 64, H: 64}, big, nil)
+	if len(c.held) != 0 {
 		t.Fatal("cache cap ignored")
 	}
 	inv := c.reset()
@@ -58,6 +124,45 @@ func TestTilesCacheEpochs(t *testing.T) {
 	}
 	if c.reset() != nil {
 		t.Fatal("reset of empty cache must not broadcast")
+	}
+}
+
+// Глядач, що губив тайли, разом із keep-ом отримує перелічені тайли з кешу;
+// глядач без втрат — лише keep.
+func TestKeepRepairsLossyViewer(t *testing.T) {
+	ns := &nodeSession{nodeID: "tiles-keep"}
+	a, b := addViewer(ns, newPC(t), newViewerTrack(t), "u1"), addViewer(ns, newPC(t), newViewerTrack(t), "u2")
+	t.Cleanup(func() { removeViewer(ns, a); removeViewer(ns, b) })
+	ns.mu.Lock()
+	a.tilesOut, b.tilesOut = make(chan []byte, 1), make(chan []byte, 8)
+	ns.mu.Unlock()
+	onAgentTiles(ns, tileAt(t, 1, 0, 0, 1))
+	onAgentTiles(ns, tileAt(t, 1, 64, 0, 2)) // a: черга повна — втрачено
+	<-a.tilesOut
+	for len(b.tilesOut) > 0 {
+		<-b.tilesOut
+	}
+	onAgentTiles(ns, tiles.Invalidate(2, 0))
+	<-a.tilesOut
+	<-b.tilesOut
+	keep, _ := tiles.Keep(2, 0, 1920, 1080, []tiles.Rect{{X: 64, W: 64, H: 64}})
+	a.tilesOut = make(chan []byte, 8)
+	onAgentTiles(ns, keep)
+	var ga, gb [][]byte
+	for len(a.tilesOut) > 0 {
+		ga = append(ga, <-a.tilesOut)
+	}
+	for len(b.tilesOut) > 0 {
+		gb = append(gb, <-b.tilesOut)
+	}
+	if got := fmt.Sprint(summary(t, ga)); got != "[keep2:1 t2@64#2]" {
+		t.Fatalf("lossy viewer %s", got)
+	}
+	if got := fmt.Sprint(summary(t, gb)); got != "[keep2:1]" {
+		t.Fatalf("clean viewer %s", got)
+	}
+	if a.tilesLossy.Load() {
+		t.Fatal("lossy flag not cleared")
 	}
 }
 
@@ -106,7 +211,7 @@ func TestOnAgentTilesRejectsAndFansOut(t *testing.T) {
 	if got := <-a.tilesOut; got[40] != 0 {
 		t.Fatal("message aliased the input buffer")
 	}
-	if len(ns.tiles.snapshot()) != 1 {
+	if len(ns.tiles.snapshot()) != 2 { // keep + тайл
 		t.Fatal("not cached")
 	}
 }
@@ -237,15 +342,17 @@ func TestTilesAgentToViewer(t *testing.T) {
 		t.Fatal("tile never reached the viewer")
 	}
 
-	// late viewer: replay from cache
+	// late viewer: replay from cache — порожній keep, далі повний набір
 	got2, _ := dialTilesViewer(t)
-	select {
-	case m := <-got2:
-		if d, err := tiles.Decode(m); err != nil || d.X != 128 {
-			t.Fatalf("replay %v %+v", err, d)
+	for _, want := range []uint8{tiles.TypeKeep, tiles.TypeTile} {
+		select {
+		case m := <-got2:
+			if d, err := tiles.Decode(m); err != nil || d.Type != want || (want == tiles.TypeTile && d.X != 128) {
+				t.Fatalf("replay %v %+v", err, d)
+			}
+		case <-time.After(20 * time.Second):
+			t.Fatal("late viewer got no replay")
 		}
-	case <-time.After(20 * time.Second):
-		t.Fatal("late viewer got no replay")
 	}
 }
 
@@ -280,7 +387,7 @@ func TestOnAgentTilesStillNotCachedAndWins(t *testing.T) {
 	onAgentTiles(ns, tileMsg(t, 5, 0, 10))
 	onAgentTiles(ns, tileMsg(t, 5, 64, 10)) // черга повна
 	onAgentTiles(ns, tiles.Still(5, 1))
-	if len(ns.tiles.snapshot()) != 2 {
+	if len(ns.tiles.snapshot()) != 3 { // keep + 2 тайли
 		t.Fatalf("still touched the cache: %d", len(ns.tiles.snapshot()))
 	}
 	<-a.tilesOut

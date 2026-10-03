@@ -17,8 +17,10 @@
 package main
 
 import (
+	"encoding/binary"
 	"log"
 	"os"
+	"sort"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -42,40 +44,153 @@ const (
 	tilesCacheBytes = 3 << 20
 )
 
-// tilesCache — повідомлення поточного епізоду ноди: invalidate (якщо був) +
-// тайли тієї ж епохи. Захищений власним mu, не ns.mu.
+// tilesCache — дзеркало того, що тримає плеєр ноди: останній invalidate
+// поточної епохи + утримані тайли (rect → сире повідомлення та епоха, в якій
+// тайл чинний). Тайли переживають епохи: tiles.TypeKeep переводить
+// перелічені в нову епоху й викидає решту (як плеєр). Пізній глядач
+// отримує ПОВНИЙ набір чинних тайлів, перештампований у поточну епоху
+// (tiles.Restamp), а не keep-посилання на тайли, яких у нього немає.
+// Захищений власним mu, не ns.mu.
 type tilesCache struct {
-	mu      sync.Mutex
-	epoch   uint32
-	have    bool
-	msgs    [][]byte
-	bytes   int
-	dropped atomic.Uint64 // відкинуто на вході від агента (невалідні/завеликі)
+	mu         sync.Mutex
+	epoch      uint32
+	have       bool
+	inv        []byte // invalidate поточної епохи (nil — епоха почалась без нього)
+	keepEpoch  uint32 // епоха останнього TypeKeep
+	keepSeen   bool
+	srcW, srcH uint16
+	held       map[tiles.TileKey]*heldTile
+	bytes      int
+	dropped    atomic.Uint64 // відкинуто на вході від агента (невалідні/завеликі)
 }
 
-// remember кладе валідне повідомлення в кеш.
-func (c *tilesCache) remember(m *tiles.Msg, raw []byte) {
+type heldTile struct {
+	raw   []byte
+	epoch uint32
+}
+
+func (c *tilesCache) dropWhere(f func(*heldTile) bool) {
+	for k, t := range c.held {
+		if f(t) {
+			c.bytes -= len(t.raw)
+			delete(c.held, k)
+		}
+	}
+}
+
+// setEpoch — нова епоха без invalidate (keep/тайл прийшов першим).
+func (c *tilesCache) setEpoch(e uint32) {
+	if !c.have || e != c.epoch {
+		c.epoch, c.have, c.inv = e, true, nil
+	}
+}
+
+// remember застосовує валідне повідомлення до кешу. Для TypeKeep повертає
+// перелічені тайли, перештамповані в епоху keep-а (ремонт для глядачів, що
+// губили тайли).
+func (c *tilesCache) remember(m *tiles.Msg, raw []byte, keepRects []tiles.Rect) [][]byte {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if !c.have || m.Epoch != c.epoch || m.Type == tiles.TypeInvalidate {
-		c.epoch, c.have, c.msgs, c.bytes = m.Epoch, true, nil, 0
+	switch m.Type {
+	case tiles.TypeInvalidate:
+		c.epoch, c.have, c.inv = m.Epoch, true, raw
+		return nil
+	case tiles.TypeKeep:
+		c.setEpoch(m.Epoch)
+		c.keepEpoch, c.keepSeen = m.Epoch, true
+		want := make(map[tiles.TileKey]bool, len(keepRects))
+		order := make([]tiles.TileKey, 0, len(keepRects))
+		for _, r := range keepRects {
+			k := tiles.TileKey{X: uint16(r.X), Y: uint16(r.Y), W: uint16(r.W), H: uint16(r.H)}
+			want[k] = true
+			order = append(order, k)
+		}
+		sameSrc := c.srcW == m.SrcW && c.srcH == m.SrcH
+		for k, t := range c.held {
+			if !sameSrc || !want[k] {
+				c.bytes -= len(t.raw)
+				delete(c.held, k)
+			}
+		}
+		c.srcW, c.srcH = m.SrcW, m.SrcH
+		var repair [][]byte
+		for _, k := range order {
+			if t := c.held[k]; t != nil {
+				t.epoch = m.Epoch
+				repair = append(repair, tiles.Restamp(t.raw, m.Epoch))
+			}
+		}
+		return repair
 	}
-	if m.Type == tiles.TypeInvalidate {
-		c.msgs = append(c.msgs, raw)
-		c.bytes = len(raw)
-		return
+	// TypeTile
+	c.setEpoch(m.Epoch)
+	if !c.keepSeen || c.keepEpoch != m.Epoch {
+		// Епізод без keep (старий агент): старі тайли недійсні.
+		e := m.Epoch
+		c.dropWhere(func(t *heldTile) bool { return t.epoch != e })
+	}
+	if c.srcW != m.SrcW || c.srcH != m.SrcH {
+		c.dropWhere(func(*heldTile) bool { return true })
+		c.srcW, c.srcH = m.SrcW, m.SrcH
+	}
+	k := tiles.TileKey{X: m.X, Y: m.Y, W: m.W, H: m.H}
+	if c.held == nil {
+		c.held = make(map[tiles.TileKey]*heldTile)
+	}
+	if old := c.held[k]; old != nil {
+		c.bytes -= len(old.raw)
+		delete(c.held, k)
 	}
 	if c.bytes+len(raw) > tilesCacheBytes {
-		return
+		return nil
 	}
-	c.msgs = append(c.msgs, raw)
+	c.held[k] = &heldTile{raw: raw, epoch: m.Epoch}
 	c.bytes += len(raw)
+	return nil
 }
 
+// snapshot — повний стан для глядача, що щойно відкрив канал: invalidate
+// епохи, порожній keep (новий плеєр стирає будь-яке власне сховище), далі
+// всі чинні тайли, перештамповані в поточну епоху, у стабільному порядку.
 func (c *tilesCache) snapshot() [][]byte {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	return append([][]byte(nil), c.msgs...)
+	if !c.have {
+		return nil
+	}
+	var out [][]byte
+	if c.inv != nil {
+		out = append(out, c.inv)
+	}
+	var cur []tiles.TileKey
+	for k, t := range c.held {
+		if t.epoch == c.epoch {
+			cur = append(cur, k)
+		}
+	}
+	if len(cur) == 0 {
+		return out
+	}
+	if keep, err := tiles.Keep(c.epoch, 0, int(c.srcW), int(c.srcH), nil); err == nil {
+		out = append(out, keep)
+	}
+	sort.Slice(cur, func(i, j int) bool {
+		a, b := cur[i], cur[j]
+		if a.Y != b.Y {
+			return a.Y < b.Y
+		}
+		return a.X < b.X
+	})
+	for _, k := range cur {
+		t := c.held[k]
+		if t.epoch == c.epoch && len(t.raw) >= tiles.HeaderSize &&
+			binary.LittleEndian.Uint32(t.raw[4:]) == c.epoch {
+			out = append(out, t.raw)
+		} else {
+			out = append(out, tiles.Restamp(t.raw, c.epoch))
+		}
+	}
+	return out
 }
 
 // reset — агентська нога пішла: кеш недійсний. Повертає synthetic invalidate
@@ -85,7 +200,7 @@ func (c *tilesCache) reset() []byte {
 	defer c.mu.Unlock()
 	had := c.have
 	c.epoch++
-	c.have, c.msgs, c.bytes = false, nil, 0
+	c.have, c.inv, c.held, c.bytes, c.keepSeen, c.srcW, c.srcH = false, nil, nil, 0, false, 0, 0
 	if !had {
 		return nil
 	}
@@ -114,8 +229,39 @@ func onAgentTiles(ns *nodeSession, data []byte) {
 		broadcastStill(ns, raw)
 		return
 	}
-	ns.tiles.remember(m, raw)
+	if m.Type == tiles.TypeKeep {
+		repair := ns.tiles.remember(m, raw, tiles.KeepRects(raw[tiles.HeaderSize:]))
+		broadcastKeep(ns, raw, repair)
+		return
+	}
+	ns.tiles.remember(m, raw, nil)
 	broadcastTiles(ns, raw, m.Type == tiles.TypeInvalidate)
+}
+
+// broadcastKeep — keep не губиться (як анонс still витісняє найстаріше).
+// Глядач, що з минулого keep-а губив тайли (tilesLossy), одразу за keep-ом
+// отримує перелічені тайли з кешу: інакше в його сховищі їх нема, а агент
+// вважає їх утриманими й більше не шле.
+func broadcastKeep(ns *nodeSession, raw []byte, repair [][]byte) {
+	ns.mu.Lock()
+	defer ns.mu.Unlock()
+	for _, vl := range ns.viewers {
+		if vl.tilesOut == nil {
+			continue
+		}
+		lossy := vl.tilesLossy.Swap(false)
+		enqueueStill(vl, raw)
+		if lossy {
+			for _, t := range repair {
+				enqueueTiles(vl, t, false)
+			}
+		}
+	}
+}
+
+func tileDropped(vl *viewerLeg) {
+	atomic.AddUint64(&vl.tilesDropped, 1)
+	vl.tilesLossy.Store(true)
 }
 
 // broadcastStill — як broadcastTiles, але повна черга віддає під анонс
@@ -139,11 +285,11 @@ func enqueueStill(vl *viewerLeg, raw []byte) {
 		}
 		select {
 		case <-vl.tilesOut:
-			atomic.AddUint64(&vl.tilesDropped, 1)
+			tileDropped(vl)
 		default:
 		}
 	}
-	atomic.AddUint64(&vl.tilesDropped, 1)
+	tileDropped(vl)
 }
 
 // broadcastTiles кладе повідомлення в черги всіх глядачів з відкритим каналом.
@@ -166,13 +312,13 @@ func enqueueTiles(vl *viewerLeg, raw []byte, invalidate bool) {
 	default:
 	}
 	if !invalidate {
-		atomic.AddUint64(&vl.tilesDropped, 1)
+		tileDropped(vl)
 		return
 	}
 	for {
 		select {
 		case <-vl.tilesOut:
-			atomic.AddUint64(&vl.tilesDropped, 1)
+			tileDropped(vl)
 			continue
 		default:
 		}
