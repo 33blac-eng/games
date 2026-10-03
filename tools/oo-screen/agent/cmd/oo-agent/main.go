@@ -908,6 +908,7 @@ func main() {
 	cursorLayerFlag := flag.Bool("cursor-layer", false, "шар курсора: НЕ вмальовувати вказівник у кадр, а слати форму+позицію каналом oosc-cursor (рух миші не коштує кадру); потрібен плеєр з config.cursorLayer")
 	refineFlag := flag.Bool("refine", true, "дошліфування нерухомого екрана (ТЗ P4): через 200 мс без нових кадрів 1–2 рази перекодувати останній кадр із нижчим QP; false — вимкнути")
 	textTilesFlag := flag.Bool("text-tiles", false, "текстові тайли (STAGE3-444 B): на нерухомому дошліфованому екрані один раз слати lossless PNG-тайли кольорового тексту каналом oosc-tiles (потрібен OO_SCREEN_TILES=1 на хабі і config.textTiles у плеєрі)")
+	textFPS := flag.Int("text-fps", 15, "стеля FPS у текстовому режимі (gap #2: набір/читання — дрібні dirty rects); 0 = не обмежувати. Вихід із режиму (рух) знімає стелю миттєво")
 	gopSeconds := flag.Int("gop-seconds", 2, "інтервал періодичного IDR, с (ТЗ 1.4). >3 вимагає на хабі OO_SCREEN_GOP_SPAN трохи більшого за GOP (дефолт 3s, макс 30s), інакше GOP-кеш хаба не спрацює і новий глядач чекатиме IDR через PLI/requestKeyframe")
 	flag.Parse()
 
@@ -1263,9 +1264,14 @@ func main() {
 		// refiner — автомат refine (internal/refine): коли рух стих, ще раз
 		// кодуємо останній кадр із нижчим QP. Лише апаратний D3D-шлях.
 		refiner = refine.New(refine.Config{MinGap: frameInterval})
-		// Gap #2: сигнал «текстовий режим» з площі dirty/move rects. Поки
-		// лише лог; споживач (QP/FPS-політика) — наступний крок.
+		// Gap #2: сигнал «текстовий режим» з площі dirty/move rects. Споживач —
+		// стеля FPS (-text-fps, textfps.go): у текстовому режимі кодуємо не
+		// частіше за textModeGap; затриманий кадр дошлемо, щойно щілина
+		// відкриється (textPending).
 		textDet         = textmode.New(textmode.Config{})
+		textOn          bool
+		textPending     bool
+		textThrottled   int
 		noChangeSkipped int64
 		refineErrLog    sync.Once
 		throttled       int // скільки кадрів викинув бюджет CPU софт-енкодера
@@ -1584,6 +1590,11 @@ loop:
 		}
 		waitFor := refiner.Wait(time.Now(), keepaliveAfter)
 		refineWait := waitFor < keepaliveAfter
+		textGap := textModeGap(*textFPS, s.fps, textOn)
+		waitFor, textWait := textFlushWait(textPending, textGap, time.Since(lastAdmitAt), waitFor)
+		if textWait {
+			refineWait = false // прокинулись заради дошлення, не заради refine
+		}
 		waitCtx, cancelWait := context.WithTimeout(ctx, waitFor)
 		frame, err := s.cap.NextFrame(waitCtx)
 		cancelWait()
@@ -1609,7 +1620,16 @@ loop:
 		}
 		still := false
 		refineQP := 0
+		textFlush := false
+		textCF := 1.0 // частка змінених пікселів ЦЬОГО кадру (для textCapApplies)
 		switch {
+		case (err == nil && frame.NoChange || errors.Is(err, context.DeadlineExceeded)) && ctx.Err() == nil &&
+			textFlushDue(textPending, gatePaused.Load(), s.lastFrame != nil, textGap, time.Since(lastAdmitAt)):
+			// Текстова стеля затримала зміст: шлемо останній кадр як ЗВИЧАЙНИЙ
+			// (не still — це не «нічого не змінилось», його не можна кешувати
+			// як keepalive-AU).
+			frame = s.lastFrame
+			textFlush = true
 		case err == nil && frame.NoChange:
 			// Gap #2: DXGI віддав кадр без dirty/move rects і без руху курсору —
 			// картинка та сама. НЕ кодуємо і НЕ вважаємо рухом: таймер refine
@@ -1636,14 +1656,16 @@ loop:
 			refiner.Motion(time.Now()) // новий кадр = рух: refine, що йшов, перериваємо
 			// Текстові тайли: invalidate ДО кодування цього кадру (tiles.go).
 			tilesMotion()
+			textCF = capture.ChangedFraction(frame)
 			if textDet != nil {
 				text, flipped := textDet.Update(
-					capture.ChangedFraction(frame),
+					textCF,
 					textmode.Fraction(frame.MoveArea, frame.Width, frame.Height))
+				textOn = text
 				if flipped {
 					c, m := textDet.Smoothed()
-					log.Printf("oo-agent: text mode=%v (changed≈%.3f moved≈%.3f, no-op skipped=%d)",
-						text, c, m, noChangeSkipped)
+					log.Printf("oo-agent: text mode=%v (changed≈%.3f moved≈%.3f, no-op skipped=%d, text-throttled=%d)",
+						text, c, m, noChangeSkipped, textThrottled)
 				}
 			}
 		case ctx.Err() != nil:
@@ -1764,6 +1786,16 @@ loop:
 			}
 		}
 
+		// Gap #2: текстова стеля. Стоїть ПІСЛЯ софт-бюджету — обидва мусять
+		// пропустити, тож ефективна стеля = min. still (keepalive/refine) і
+		// дошлення затриманого не чіпаємо. Вихід із текстового режиму вже
+		// обнулив textGap на цьому ж кадрі (textOn оновлено вище).
+		if g := textModeGap(*textFPS, s.fps, textCapApplies(textOn, textCF)); g > 0 && !still && !textFlush && now.Sub(lastAdmitAt) < g {
+			textPending = true
+			textThrottled++
+			continue
+		}
+
 		if !shouldAdmit(queued.Load(), now.Sub(lastAdmitAt)) {
 			dropped.Add(1)
 			if time.Since(lastLog) >= 5*time.Second {
@@ -1775,6 +1807,7 @@ loop:
 			continue
 		}
 		lastAdmitAt = now
+		textPending = false
 
 		encFrame := encode.Frame{
 			PTS: time.Duration(captureSeq) * time.Second / time.Duration(effectiveFPS),

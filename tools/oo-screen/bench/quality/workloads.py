@@ -42,8 +42,8 @@ class Typing:
     """Spreadsheet cell editing: one glyph every ~150 ms, caret blink 530 ms."""
     GW, GH, CELL_CH = 8, 14, 12
 
-    def __init__(self, s, seed=1):
-        self.s = s
+    def __init__(self, s, seed=1, glyph_ms=150):
+        self.s, self.glyph_ms = s, glyph_ms
         r = np.random.default_rng(seed)
         self.glyphs = r.random((64, self.GH, self.GW)) < 0.28
         self.x0, self.y0 = s.w // 6, s.h // 4
@@ -54,7 +54,7 @@ class Typing:
 
     def frame(self, i):
         f = self.s.sheet.copy()
-        n = int(i * 1000 / FPS // 150)  # glyphs typed so far
+        n = int(i * 1000 / FPS // self.glyph_ms)  # glyphs typed so far
         start = max(0, n - 30 * self.CELL_CH)
         for k in range(start, n):
             x, y = self._pos(k)
@@ -172,6 +172,8 @@ class Mixed:
 
 
 def make(kind, s):
+    if kind == "typing-fast":  # key repeat / fast typist / terminal output: a glyph every 40 ms (not in KINDS)
+        return Typing(s, glyph_ms=40)
     return {"idle": Idle, "typing": Typing, "scroll": Scroll, "drag": Drag, "video": Video, "mixed": Mixed}[kind](s)
 
 
