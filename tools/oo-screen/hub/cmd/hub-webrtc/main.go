@@ -47,6 +47,7 @@ import (
 	"github.com/pion/webrtc/v4"
 
 	"github.com/organicoils/oo-screen/hub"
+	"github.com/organicoils/oo-screen/internal/cursorproto"
 )
 
 const (
@@ -523,6 +524,7 @@ func closeNode(ns *nodeSession) {
 	}
 
 	reg.remove(ns.nodeID, ns)
+	forgetRelays(ns)
 	log.Printf("runtime-revoke: node=%s closed (%d viewer leg(s))", ns.nodeID, len(viewerPCs))
 }
 
@@ -1160,6 +1162,9 @@ func setupAgentLeg(ns *nodeSession, pc *webrtc.PeerConnection) error {
 				}
 				onAgentTiles(ns, msg.Data)
 			})
+		case cursorproto.ChannelLabel:
+			// Шар курсора (cursor.go): агент із -cursor-layer.
+			attachAgentRelay(ns, dc, cursorRelayConfig())
 		}
 	})
 
@@ -1405,16 +1410,19 @@ func setupViewerLeg(ns *nodeSession, pc *webrtc.PeerConnection, claims *hub.Tick
 		onInput = viewerInputHandler(ns, vl, ticket, grant)
 	}
 	tilesOn := tilesEnabled
-	if onInput != nil || tilesOn {
-		pc.OnDataChannel(func(dc *webrtc.DataChannel) {
-			switch {
-			case dc.Label() == inputChannelLabel && onInput != nil:
-				onInput(dc)
-			case dc.Label() == tilesLabel && tilesOn:
-				viewerTilesHandler(ns, vl, dc)
-			}
-		})
-	}
+	// Канал курсора (cursor.go) приймається завжди: його відкриває лише плеєр
+	// з config.cursorLayer, а дані в нього йдуть лише від агента з
+	// -cursor-layer. Без каналу від браузера обробник просто не спрацьовує.
+	pc.OnDataChannel(func(dc *webrtc.DataChannel) {
+		switch {
+		case dc.Label() == inputChannelLabel && onInput != nil:
+			onInput(dc)
+		case dc.Label() == tilesLabel && tilesOn:
+			viewerTilesHandler(ns, vl, dc)
+		case dc.Label() == cursorproto.ChannelLabel:
+			viewerRelayHandler(ns, dc, cursorRelayConfig())
+		}
+	})
 
 	pc.OnConnectionStateChange(func(s webrtc.PeerConnectionState) {
 		log.Printf("viewer leg PC state [node=%s]: %s", ns.nodeID, s)
