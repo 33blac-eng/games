@@ -20,6 +20,13 @@ func TestRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// golden — the same bytes are asserted by the player test
+	// (total-erp-app/resources/js/remote/__tests__/text-tiles.test.mjs).
+	golden := []byte{0x4f, 0x54, 0x01, 0x01, 0x07, 0, 0, 0, 0x63, 0, 0, 0, 0x40, 0, 0x80, 0,
+		0x40, 0, 0x20, 0, 0x80, 0x07, 0x38, 0x04, 0x01, 0, 0, 0, 0x03, 0, 0, 0, 1, 2, 3}
+	if !bytes.Equal(b, golden) {
+		t.Fatalf("wire changed: % x", b)
+	}
 	if len(b) != HeaderSize+3 || string(b[:2]) != "OT" {
 		t.Fatalf("bad encoding % x", b)
 	}

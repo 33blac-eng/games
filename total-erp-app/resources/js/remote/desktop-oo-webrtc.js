@@ -33,6 +33,7 @@ import {
     MESH_REFRESH_NAMES,
     findMeshCanvas,
 } from './desktop-oo.js';
+import { createTileOverlay, TILES_LABEL } from './oo-text-tiles.js';
 
 export { OO_STATE_CONNECTING, OO_STATE_LIVE, OO_STATE_FALLBACK, OO_STATE_CLOSED };
 
@@ -437,6 +438,8 @@ export function createOoWebrtcLayer(o) {
     let toggleBtn = null;
     let meshSaved = null;         // оригінальні стилі Mesh-canvas/контейнера на час 1:1
     let meshWritten = null;       // що ми самі записали в ці стилі востаннє
+    let textTiles = null;         // STAGE3-444 B: canvas з lossless тайлами тексту (config.textTiles)
+    let tilesChannel = null;
 
     const session = createOoSession({
         firstFrameMs: config.firstFrameMs,
@@ -541,6 +544,11 @@ export function createOoWebrtcLayer(o) {
         setStyle(video, 'top', (mr.top - cr.top + container.scrollTop) + 'px');
         setStyle(video, 'width', mr.width + 'px');
         setStyle(video, 'height', mr.height + 'px');
+        // Оверлей тайлів — у тому самому боксі, всередині contain-прямокутника кадру.
+        if (textTiles) {
+            textTiles.place(mr.left - cr.left + container.scrollLeft, mr.top - cr.top + container.scrollTop,
+                mr.width, mr.height);
+        }
     }
 
     // Зміна dpr (перетяг вікна на інший монітор, Ctrl+/-) ResizeObserver не
@@ -645,6 +653,11 @@ export function createOoWebrtcLayer(o) {
             if (video.parentNode) { try { video.parentNode.removeChild(video); } catch (e) { /* ignore */ } }
         }
         video = null;
+        if (tilesChannel) {
+            try { tilesChannel.onmessage = null; tilesChannel.close(); } catch (e) { /* ignore */ }
+            tilesChannel = null;
+        }
+        if (textTiles) { try { textTiles.destroy(); } catch (e) { /* ignore */ } textTiles = null; }
         if (pc) {
             // Порядок: спершу глушимо колбеки, потім close(). Інакше
             // connectionstatechange='closed' від НАШОГО ж close() прилітає як
@@ -719,6 +732,8 @@ export function createOoWebrtcLayer(o) {
             const onFrame = () => {
                 if (!session.isCurrent(gen) || !video) return;
                 session.noteFrame(gen);
+                // Кадр іншої геометрії (інший монітор) — тайли до нього не стосуються.
+                if (textTiles) textTiles.onVideoFrame(video.videoWidth | 0, video.videoHeight | 0);
                 rvfcHandle = video.requestVideoFrameCallback(onFrame);
             };
             rvfcHandle = video.requestVideoFrameCallback(onFrame);
@@ -768,6 +783,19 @@ export function createOoWebrtcLayer(o) {
         // бітово тим, що прод шле сьогодні: без аудіо-m-рядка хаб не має куди
         // покласти доріжку, навіть якщо його прапорець увімкнено.
         if (config.audio) peer.addTransceiver('audio', { direction: 'recvonly' });
+        // Текстові тайли (STAGE3-444 B) — ЛИШЕ під config.textTiles: без нього
+        // offer бітово той самий (жодного m=application). Канал створюємо ДО
+        // offer-а; хаб (OO_SCREEN_TILES=1) шле ним тайли від агента.
+        if (config.textTiles) {
+            textTiles = createTileOverlay({ doc, container, containBox });
+            syncGeometry();
+            tilesChannel = peer.createDataChannel(TILES_LABEL);
+            tilesChannel.binaryType = 'arraybuffer';
+            tilesChannel.onmessage = (ev) => {
+                if (!session.isCurrent(gen) || !textTiles) return;
+                textTiles.onMessage(ev.data);
+            };
+        }
 
         peer.ontrack = (ev) => {
             if (!session.isCurrent(gen) || !video) return;
