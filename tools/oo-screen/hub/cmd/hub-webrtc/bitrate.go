@@ -257,7 +257,7 @@ func congestion(excess time.Duration, s congSignals, lowRising bool) (bool, floa
 // після зрізу по B4 приріст не впав нижче congRebaseFrac від приросту в
 // момент зрізу — це не наша черга, і він стає локальною базою (delayBase).
 // База опускається, щойно приріст падає нижче неї. Ціна хиби — один зріз.
-func (c bitrateCtl) queueExcess(excess time.Duration, now time.Time) (bitrateCtl, time.Duration) {
+func (c bitrateCtl) queueExcess(raw, excess time.Duration, now time.Time) (bitrateCtl, time.Duration) {
 	if excess < c.delayBase {
 		c.delayBase = excess
 	}
@@ -267,19 +267,38 @@ func (c bitrateCtl) queueExcess(excess time.Duration, now time.Time) (bitrateCtl
 	// СИРОМУ приросту) потім тримав зрізану ціль усю ваду. Глибокий буфер, що
 	// наливається швидше, ловлять старі плечі rttTrend/rttLevel — вони
 	// дивляться на сирий приріст і цією базою не зачеплені.
-	if c.rttSeen > 1 {
-		if excess-c.rawPrev > congJumpMax {
-			c.delayBase += excess - c.rawPrev
+	// Стрибок рахуємо по СИРОМУ приросту (raw, до мінімуму трьох у pushRTT —
+	// згладжений бачить стрибок на два RR пізніше, коли зріз уже стався) і за
+	// ДВА RR: семпли RTT, що перекривають момент зміни шляху, розмазують його
+	// на 0 -> 120 -> 201 мс (заміряно), і покроково жоден крок не перевищує
+	// congJumpMax. jumpBase опускається разом із сирим приростом.
+	if raw < c.jumpBase {
+		c.jumpBase = raw
+	}
+	if c.rttSeen > 2 {
+		lo := c.rawPrev
+		if c.rawPrev2 < lo {
+			lo = c.rawPrev2
+		}
+		if raw-lo > congJumpMax {
+			c.jumpBase = raw
 		}
 	}
-	c.rawPrev = excess
+	c.rawPrev2, c.rawPrev = c.rawPrev, raw
 	if !c.congCutAt.IsZero() && now.Sub(c.congCutAt) >= congRebaseAfter {
 		if c.congCutExcess >= congDelayMin && float64(excess) >= float64(c.congCutExcess)*congRebaseFrac {
 			c.delayBase = excess
 		}
 		c.congCutAt = time.Time{}
 	}
-	c.lastQx = excess - c.delayBase
+	base := c.delayBase
+	if c.jumpBase > base {
+		base = c.jumpBase
+	}
+	c.lastQx = excess - base
+	if c.lastQx < 0 {
+		c.lastQx = 0
+	}
 	return c, c.lastQx
 }
 
@@ -462,6 +481,8 @@ type bitrateCtl struct {
 	lossyRuns int
 	lastQx    time.Duration
 	rawPrev   time.Duration // сирий приріст попереднього RR (queueExcess)
+	rawPrev2  time.Duration // і позапопереднього
+	jumpBase  time.Duration // база від стрибка шляху (queueExcess)
 	// upRun — швидких підйомів поспіль без зрізу (розгін кроку, fastUpStep).
 	upRun int
 	// delayBase — локальна база черги для сигналів B4 (див. queueExcess);
@@ -750,7 +771,7 @@ func (c bitrateCtl) stepSig(lossFrac float64, rttExcess time.Duration, sig congS
 	c, rttRising := c.rttTrend(excess, now)
 	c, rttHigh := c.rttLevel(excess)
 	prevQx := c.lastQx
-	c, qx := c.queueExcess(excess, now)
+	c, qx := c.queueExcess(rttExcess, excess, now)
 	c, lowRising := c.rttLowTrend(qx)
 	// Черга є і NACK-и є, але до затору ще не дотягує — підйом не пускаємо.
 	// Якщо так стоїть congRises RR поспіль — це вже затор: ціль трохи вища за

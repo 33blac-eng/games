@@ -296,17 +296,26 @@ func TestStepDelayRebasesAfterUselessCut(t *testing.T) {
 // рівномірні втрати з preLoss 2-3%. Перший прогін після B4 тут різав 8 -> 6.8
 // і тримав зрізане всю ваду; стрибок > congJumpMax іде одразу в базу.
 func TestStepPathJumpIsNotQueue(t *testing.T) {
+	// Еталон — той самий контролер БЕЗ сигналів B4: старі RTT-плечі на такий
+	// стрибок можуть зрізати самі (це не регресія B4), а B4 не має додати
+	// жодного зрізу понад них.
 	c := bitrateCtl{target: 8_000_000, startBps: 8_000_000, fastUp: true}
+	ref := c
 	now := t0
 	for i := 0; i < 40; i++ {
 		now = now.Add(time.Second)
 		ex, sig := time.Duration(0), congSignals{}
-		if i >= 10 {
+		// Стрибок розмазаний на два RR, як у стенді: 0 -> 120 -> 200 мс.
+		switch {
+		case i == 10:
+			ex, sig = 120*time.Millisecond, congSignals{preLoss: 0.007}
+		case i > 10:
 			ex, sig = 200*time.Millisecond, congSignals{preLoss: 0.025}
 		}
 		c, _ = c.stepSig(0.005, ex, sig, now)
-		if c.target != 8_000_000 {
-			t.Fatalf("на %d с ціль %d: стрибок шляху прочитано як чергу", i, c.target)
+		ref, _ = ref.step(0.005, ex, now)
+		if c.target < ref.target {
+			t.Fatalf("на %d с ціль %d < %d без B4: стрибок шляху прочитано як чергу", i, c.target, ref.target)
 		}
 	}
 }
