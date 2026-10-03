@@ -23,6 +23,7 @@ import (
 	"encoding/json"
 	"log"
 	"net/http"
+	"os"
 	"sync/atomic"
 
 	"github.com/organicoils/oo-screen/internal/control"
@@ -103,9 +104,17 @@ func handleControl(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	ns, _, status, msg := authorizeViewer(req.offerReq)
+	ns, claims, status, msg := authorizeViewer(req.offerReq)
 	if status != 0 {
 		http.Error(w, msg, status)
+		return
+	}
+	// SEC #26: перемикання монітора міняє картинку ВСІМ глядачам ноди. За
+	// OO_SCREEN_CONTROL_REQUIRES_INPUT=1 — лише квиток із grant=control (той
+	// самий, що відчиняє ввід). Дефолт — як було: ERP-консоль може слати сюди
+	// view-квитки.
+	if controlRequiresInput() && (claims == nil || claims.Grant != grantControl) {
+		http.Error(w, "control grant required", http.StatusForbidden)
 		return
 	}
 
@@ -134,4 +143,9 @@ func handleControl(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeJSON(w, outputsSnapshot(ns))
+}
+
+// controlRequiresInput — SEC #26, env OO_SCREEN_CONTROL_REQUIRES_INPUT=1.
+func controlRequiresInput() bool {
+	return os.Getenv("OO_SCREEN_CONTROL_REQUIRES_INPUT") == "1"
 }

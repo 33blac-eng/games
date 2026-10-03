@@ -393,15 +393,23 @@ func TestSecH17RevokeScoped(t *testing.T) {
 	}
 }
 
-// SecH18 (KnownFAIL): /control приймає квиток із grant=view і перемикає монітор
-// (впливає на картинку ВСІХ глядачів ноди). Відмова тут — 409 «нема control-
-// каналу», а не 403: grant ніде не перевіряється.
-func TestSecH18ControlIgnoresGrantKnownFAIL(t *testing.T) {
+// SecH18 (SEC #26): за замовчуванням /control приймає view-квиток (ERP-консоль
+// шле такі — лишено свідомо); з OO_SCREEN_CONTROL_REQUIRES_INPUT=1 — лише
+// grant=control, view-квиток отримує 403.
+func TestSecH18ControlGrantOptIn(t *testing.T) {
 	secTicketMode(t, 200, `{"user_id":"u","node_id":"A","grant":"view"}`)
 	secPublisher("A")
-	rec := secPost(t, handleControl, []byte(`{"ticket":"t","output":1}`))
-	if rec.Code == http.StatusForbidden {
-		t.Fatal("view-квиток отримав 403 — вразливість виправлено: переверніть тест")
+	if rec := secPost(t, handleControl, []byte(`{"ticket":"t","output":1}`)); rec.Code == http.StatusForbidden {
+		t.Fatal("дефолт: view-квиток отримав 403 — поведінку змінено без прапорця")
+	}
+	t.Setenv("OO_SCREEN_CONTROL_REQUIRES_INPUT", "1")
+	if rec := secPost(t, handleControl, []byte(`{"ticket":"t","output":1}`)); rec.Code != http.StatusForbidden {
+		t.Fatalf("strict: view-квиток status=%d, want 403", rec.Code)
+	}
+	secTicketMode(t, 200, `{"user_id":"u","node_id":"A","grant":"control"}`)
+	secPublisher("A")
+	if rec := secPost(t, handleControl, []byte(`{"ticket":"t","output":1}`)); rec.Code == http.StatusForbidden {
+		t.Fatalf("strict: control-квиток отримав 403")
 	}
 }
 
