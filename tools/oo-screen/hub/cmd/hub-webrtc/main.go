@@ -1300,6 +1300,9 @@ func setupAgentLeg(ns *nodeSession, pc *webrtc.PeerConnection) error {
 				agentTilesGone(ns)
 			}
 			if gone {
+				agentRelaysGone(ns)
+			}
+			if gone {
 				// Логуємо ОБОВ'ЯЗКОВО: це єдиний слід втрати публікатора.
 				// OnICEConnectionStateChange нижче пише лише стан ICE, а це
 				// ІНША машина станів — вона може мовчати, поки PeerConnection

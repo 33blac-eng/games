@@ -63,9 +63,12 @@ type dcRelay struct {
 	// owners — один канал на власника: інакше одна viewer-нога, відкривши
 	// N каналів 'oosc-cursor', зайняла б усі maxViewers місць ноди (і
 	// множила б трафік ретрансляції на себе).
-	owners  map[any]relaySink
-	sticky  map[byte][]byte
-	order   []byte // порядок липких ключів (форма раніше за позицію)
+	owners map[any]relaySink
+	sticky map[byte][]byte
+	order  []byte // порядок липких ключів (форма раніше за позицію)
+	// agent — поточний агентський канал (nil — немає). Закриття старого
+	// каналу після відкриття нового не чіпає стан нового.
+	agent   any
 	dropped uint64
 }
 
@@ -85,6 +88,28 @@ func (r *dcRelay) reset() {
 	r.mu.Lock()
 	r.sticky = map[byte][]byte{}
 	r.order = nil
+	r.mu.Unlock()
+}
+
+// setAgent — новий агентський канал: липкий стан скидається.
+func (r *dcRelay) setAgent(a any) {
+	r.mu.Lock()
+	r.agent = a
+	r.sticky = map[byte][]byte{}
+	r.order = nil
+	r.mu.Unlock()
+}
+
+// agentGone — агентський канал a закрився: липкі форма/позиція більше не
+// правда (агента немає), тож пізній глядач не має їх отримати. Якщо вже
+// відкрито новіший канал — нічого не робимо.
+func (r *dcRelay) agentGone(a any) {
+	r.mu.Lock()
+	if a == nil || r.agent == a {
+		r.agent = nil
+		r.sticky = map[byte][]byte{}
+		r.order = nil
+	}
 	r.mu.Unlock()
 }
 
@@ -210,6 +235,17 @@ func relayFor(ns *nodeSession, cfg relayConfig) *dcRelay {
 	return v.(*dcRelay)
 }
 
+// agentRelaysGone — агентська нога ноди впала (PC Failed/Closed): липкий стан
+// усіх ретрансляторів ноди забувається, навіть якщо OnClose каналу не прийшов.
+func agentRelaysGone(ns *nodeSession) {
+	relays.Range(func(k, v any) bool {
+		if k.(relayKey).ns == ns {
+			v.(*dcRelay).agentGone(nil)
+		}
+		return true
+	})
+}
+
 // forgetRelays прибирає всі ретранслятори ноди (нода зникла з реєстру).
 func forgetRelays(ns *nodeSession) {
 	relays.Range(func(k, _ any) bool {
@@ -224,7 +260,8 @@ func forgetRelays(ns *nodeSession) {
 // в ретранслятор ноди.
 func attachAgentRelay(ns *nodeSession, dc *webrtc.DataChannel, cfg relayConfig) {
 	r := relayFor(ns, cfg)
-	r.reset()
+	r.setAgent(dc)
+	dc.OnClose(func() { r.agentGone(dc) })
 	log.Printf("relay %s: agent channel open [node=%s]", cfg.label, ns.nodeID)
 	dc.OnMessage(func(m webrtc.DataChannelMessage) {
 		r.publish(m.Data, time.Now())

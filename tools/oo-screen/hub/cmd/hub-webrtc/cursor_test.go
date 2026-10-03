@@ -306,3 +306,68 @@ func TestRelayOneChannelPerViewerLeg(t *testing.T) {
 		t.Fatalf("viewers = %d, want 2", n)
 	}
 }
+
+// When the agent's cursor channel closes, the relay forgets the saved
+// shape/position so a late viewer does not get a stale cursor; a stale
+// channel closing after a newer one opened does not wipe the newer state.
+func TestCursorRelayClearsOnAgentClose(t *testing.T) {
+	r := newDCRelay(cursorRelayConfig())
+	old, cur := new(int), new(int)
+	now := time.Now()
+	r.setAgent(old)
+	r.publish(testShape(t), now)
+	r.setAgent(cur)
+	r.publish(testShape(t), now)
+	r.publish(testPos(7), now)
+	r.agentGone(old)
+	if len(r.order) != 2 {
+		t.Fatalf("stale close wiped current state: %d", len(r.order))
+	}
+	r.agentGone(cur)
+	s := newSink()
+	r.addViewer(s)
+	if s.count() != 0 || len(r.sticky) != 0 {
+		t.Fatalf("late viewer got stale cursor: %d msgs", s.count())
+	}
+
+	// End to end: closing the real agent channel clears the relay.
+	ns := &nodeSession{nodeID: "n-cursor-close"}
+	t.Cleanup(func() { forgetRelays(ns) })
+	agent, hubA := newCursorPC(t), newCursorPC(t)
+	adc, err := agent.CreateDataChannel(cursorproto.ChannelLabel, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	hubA.OnDataChannel(func(dc *webrtc.DataChannel) {
+		if dc.Label() == cursorproto.ChannelLabel {
+			attachAgentRelay(ns, dc, cursorRelayConfig())
+		}
+	})
+	opened := make(chan struct{})
+	adc.OnOpen(func() { close(opened) })
+	signalPair(t, agent, hubA)
+	select {
+	case <-opened:
+	case <-time.After(10 * time.Second):
+		t.Fatal("agent channel did not open")
+	}
+	if err := adc.Send(testShape(t)); err != nil {
+		t.Fatal(err)
+	}
+	rr := relayFor(ns, cursorRelayConfig())
+	sticky := func() int { rr.mu.Lock(); defer rr.mu.Unlock(); return len(rr.sticky) }
+	if !waitFor(5*time.Second, func() bool { return sticky() == 1 }) {
+		t.Fatal("shape never reached relay")
+	}
+	_ = adc.Close()
+	if !waitFor(10*time.Second, func() bool { return sticky() == 0 }) {
+		t.Fatal("relay kept the shape after the agent channel closed")
+	}
+
+	// Agent PC gone (no channel close seen): agentRelaysGone clears too.
+	rr.publish(testShape(t), time.Now().Add(time.Second))
+	agentRelaysGone(ns)
+	if sticky() != 0 {
+		t.Fatal("agentRelaysGone left sticky state")
+	}
+}
