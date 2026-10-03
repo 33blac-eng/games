@@ -319,3 +319,24 @@ func TestStepPathJumpIsNotQueue(t *testing.T) {
 		}
 	}
 }
+
+// Причина зміни цілі для oo_hub_bitrate_target_reason: нові гілки B4/B5 мають
+// власні мітки, а не загальне «rtt»/«loss».
+func TestStepReasonForMetrics(t *testing.T) {
+	c := bitrateCtl{target: 8_000_000, startBps: 8_000_000}
+	c, _ = c.stepSig(0.01, 100*time.Millisecond, congSignals{preLoss: 0.3}, t0)
+	if c.reason != "congestion" {
+		t.Fatalf("reason=%q, want congestion", c.reason)
+	}
+	c, _ = c.stepSig(0.10, 0, congSignals{}, t0.Add(3*time.Second))
+	if c.reason != "loss" {
+		t.Fatalf("reason=%q, want loss", c.reason)
+	}
+	// Підйом і одразу затор у межах probeWindow -> відкат проби.
+	p := bitrateCtl{target: 4_000_000, startBps: 8_000_000, probeFrom: 3_000_000,
+		lastUpAt: t0, lastSent: t0}
+	p, _ = p.stepSig(0.01, 100*time.Millisecond, congSignals{preLoss: 0.1}, t0.Add(2*time.Second))
+	if p.reason != "probe_backoff" || p.target != 3_000_000 {
+		t.Fatalf("reason=%q target=%d, want probe_backoff 3000000", p.reason, p.target)
+	}
+}
