@@ -54,6 +54,9 @@ OOS_GUID(OOS_AVEncVideoMaxNumRefFrame,    STATIC_CODECAPI_AVEncVideoMaxNumRefFra
 OOS_GUID(OOS_AVEncCommonMaxBitRate,       STATIC_CODECAPI_AVEncCommonMaxBitRate);
 OOS_GUID(OOS_AVEncCommonBufferSize,       STATIC_CODECAPI_AVEncCommonBufferSize);
 OOS_GUID(OOS_AVEncVideoForceKeyFrame,     STATIC_CODECAPI_AVEncVideoForceKeyFrame);
+/* ТЗ P8: software-only knobs (Microsoft H264 Video Encoder MFT, Win8+). */
+OOS_GUID(OOS_AVEncNumWorkerThreads,       STATIC_CODECAPI_AVEncNumWorkerThreads);
+OOS_GUID(OOS_AVEncH264CABACEnable,        STATIC_CODECAPI_AVEncH264CABACEnable);
 
 /* Static-screen refine (ТЗ P4). CODECAPI_AVEncVideoMaxQP comes from the
  * STATIC_ token list like the others; MFSampleExtension_VideoEncodeQP is a
@@ -474,6 +477,26 @@ static void configure_codecapi(oos_enc *e)
      * нашому вмісті радше ЗМЕНШУЮТЬ потік. Більше двох не беремо: без B-кадрів
      * і при GOP=2с виграш згасає, а пошук дорожчає. */
     note_cfg(e, "MaxNumRefFrame", set_codec_u32(e, &OOS_AVEncVideoMaxNumRefFrame, 2));
+
+    if (!e->is_hardware) {
+        /* ТЗ P8. Софтверний Microsoft H264 MFT без підказки бере ВСІ логічні
+         * ядра: на офісному 4-ядерному ПК кожен кадр на мить забирає весь CPU
+         * у застосунку, з яким людина працює (Excel/1С), і з нашим же
+         * захопленням/readback. Лишаємо одне ядро вільним від 4 ядер; на 1-3
+         * ядрах різати нема з чого — там бюджет тримає FPS-політика
+         * (internal/swlimit). */
+        SYSTEM_INFO si;
+        GetSystemInfo(&si);
+        ULONG n = (ULONG)si.dwNumberOfProcessors;
+        if (n >= 4) {
+            note_cfg(e, "NumWorkerThreads",
+                     set_codec_u32(e, &OOS_AVEncNumWorkerThreads, n - 1));
+        }
+        /* Main-профіль дозволяє CABAC; на тексті він дає помітно менший потік
+         * за той самий QP, тобто чіткіший текст у тому ж бюджеті. Явно, бо
+         * дефолт софт-MFT документацією не зафіксований. */
+        note_cfg(e, "CABAC", set_codec_bool(e, &OOS_AVEncH264CABACEnable, 1));
+    }
 }
 
 const char *oos_enc_cfg_report(oos_enc *e) { return (e && e->cfg_report[0]) ? e->cfg_report : ""; }
@@ -1169,6 +1192,18 @@ int oos_enc_open(const oos_enc_cfg *cfg, oos_enc **out, char *err, int32_t err_l
             }
             e->d3d = 1;
         }
+    }
+
+    /* ТЗ P8: софтверний Microsoft H264 MFT частину ICodecAPI (rate control,
+     * B-кадри, LowLatency, к-сть потоків) читає лише при узгодженні типу —
+     * MSDN «H.264 Video Encoder»: ці властивості задаються ДО SetOutputType.
+     * Тому для софту ставимо їх і до, і (як для всіх) після; повтор
+     * безпечний. Звіт cfg_report лишається від другого, остаточного, проходу. */
+    if (!e->is_hardware &&
+        SUCCEEDED(IMFTransform_QueryInterface(e->mft, &IID_ICodecAPI,
+                                              (void **)&e->codec))) {
+        configure_codecapi(e);
+        SAFE_RELEASE(e->codec);
     }
 
     /* Encoders want the output type first. */

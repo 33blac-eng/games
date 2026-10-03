@@ -40,6 +40,7 @@ import (
 	"github.com/organicoils/oo-screen/internal/envelope"
 	"github.com/organicoils/oo-screen/internal/h264"
 	"github.com/organicoils/oo-screen/internal/refine"
+	"github.com/organicoils/oo-screen/internal/swlimit"
 	"github.com/organicoils/oo-screen/internal/textmode"
 )
 
@@ -1607,6 +1608,12 @@ func main() {
 		noChangeSkipped int64
 		refineErrLog    sync.Once
 		throttled       int // скільки кадрів викинув бюджет CPU софт-енкодера
+		// ТЗ P8: адаптивна стеля FPS софт-енкодера за ЗАМІРЯНИМ часом Encode
+		// (internal/swlimit). Статичний softwareFrameGap — апріорна оцінка
+		// за ядрами; swPol доганяє реальність конкретного ПК. Перебудовується
+		// на кожен новий енкодер (зміна виводу/геометрії).
+		swPol    *swlimit.Policy
+		swPolEnc *encode.Encoder
 		// s.lastFrame — останній захоплений кадр, джерело keepalive. Тримаємо
 		// саме вказівник капчера, без копії: у zero-copy режимі це його
 		// персистентна Blt-текстура, у CPU-режимі — його ж scratch-буфери
@@ -2052,7 +2059,18 @@ loop:
 		// тут кадр іще нічого не коштував. -force-software не чіпаємо: це
 		// свідомий вибір оператора, а не машина, яка не тягне.
 		if s.software && !s.forceSoftware {
-			if gap := softwareFrameGap(runtime.NumCPU(), s.encW*s.encH, s.fps); gap > 0 && now.Sub(lastAdmitAt) < gap {
+			if swPolEnc != s.encoder() {
+				swPolEnc = s.encoder()
+				swPol = swlimit.New(swlimit.Config{
+					MaxFPS: softwareFPSCap(runtime.NumCPU(), s.encW*s.encH, s.fps),
+					Cores:  runtime.NumCPU(),
+				})
+			}
+			gap := softwareFrameGap(runtime.NumCPU(), s.encW*s.encH, s.fps)
+			if g := swPol.FrameGap(); g > gap {
+				gap = g
+			}
+			if gap > 0 && now.Sub(lastAdmitAt) < gap {
 				throttled++
 				continue
 			}
@@ -2109,7 +2127,16 @@ loop:
 				refineErrLog.Do(func() { log.Printf("oo-agent: refine restore: %v", rerr) })
 			}
 		}
+		encStart := time.Now()
 		aus, err := s.encoder().Encode(encFrame)
+		if swPol != nil && swPolEnc == s.encoder() && s.software && err == nil {
+			if d := swPol.Observe(time.Since(encStart), time.Now()); d.Changed {
+				// Роздільність софт-шлях не масштабує (submit_cpu ріже, а не
+				// скейлить — encodeGeometry), тож крок Scale поки лише радить.
+				log.Printf("oo-agent: swlimit %s -> fps cap %d, advised scale %d/%d (not applied: software path encodes native) enc=%dx%d cores=%d",
+					d.Reason, d.FPS, d.Scale.Num, d.Scale.Den, s.encW, s.encH, runtime.NumCPU())
+			}
+		}
 		if refineQP > 0 {
 			n := 0
 			for _, au := range aus {
