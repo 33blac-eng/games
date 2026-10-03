@@ -544,7 +544,10 @@ static HRESULT make_scaler(oos_enc *e)
     cd.InputHeight = (UINT)e->src_h;
     cd.OutputWidth  = (UINT)e->width;
     cd.OutputHeight = (UINT)e->height;
-    cd.Usage = D3D11_VIDEO_USAGE_PLAYBACK_NORMAL;
+    /* ТЗ P2/1.2: text on a downscaled desktop — ask the driver for its best
+     * scaler rather than the playback default (the only quality knob D3D11
+     * exposes for the resampling filter itself). */
+    cd.Usage = D3D11_VIDEO_USAGE_OPTIMAL_QUALITY;
 
     hr = ID3D11Device_QueryInterface(e->dev, &IID_ID3D11VideoDevice, (void **)&e->vdev);
     if (FAILED(hr)) return hr;
@@ -566,6 +569,38 @@ static HRESULT make_scaler(oos_enc *e)
     }
     ID3D11VideoContext_VideoProcessorSetStreamFrameFormat(e->vctx, e->vproc, 0,
             D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE);
+
+    /* ТЗ P2: no driver "enhancements" on desktop text. Auto-processing
+     * (denoise/edge/skin-tone/etc. the driver may enable on its own) off, and
+     * every filter the processor advertises explicitly disabled. Void calls:
+     * nothing to check; an unsupported filter is skipped via FilterCaps. */
+    ID3D11VideoContext_VideoProcessorSetStreamAutoProcessingMode(e->vctx, e->vproc, 0, FALSE);
+    {
+        D3D11_VIDEO_PROCESSOR_CAPS caps;
+        memset(&caps, 0, sizeof caps);
+        if (SUCCEEDED(ID3D11VideoProcessorEnumerator_GetVideoProcessorCaps(e->venum, &caps))) {
+            for (int f = D3D11_VIDEO_PROCESSOR_FILTER_BRIGHTNESS;
+                 f <= D3D11_VIDEO_PROCESSOR_FILTER_STEREO_ADJUSTMENT; f++) {
+                if (caps.FilterCaps & (1u << f))
+                    ID3D11VideoContext_VideoProcessorSetStreamFilter(e->vctx, e->vproc, 0,
+                            (D3D11_VIDEO_PROCESSOR_FILTER)f, FALSE, 0);
+            }
+        }
+    }
+
+    /* Colour: capture (agent/capture/dxgi.c) already emits studio-range BT.709
+     * NV12, and the SPS VUI signals the same. Declare BT.709 limited on BOTH
+     * sides so the scaler is a pure resample — with the defaults (stream
+     * BT.601) the driver would re-matrix 709->601 and shift colours. */
+    {
+        D3D11_VIDEO_PROCESSOR_COLOR_SPACE cs;
+        memset(&cs, 0, sizeof cs);
+        cs.Usage = 0;          /* playback */
+        cs.YCbCr_Matrix = 1;   /* BT.709 */
+        cs.Nominal_Range = D3D11_VIDEO_PROCESSOR_NOMINAL_RANGE_16_235;
+        ID3D11VideoContext_VideoProcessorSetStreamColorSpace(e->vctx, e->vproc, 0, &cs);
+        ID3D11VideoContext_VideoProcessorSetOutputColorSpace(e->vctx, e->vproc, &cs);
+    }
     return S_OK;
 }
 
