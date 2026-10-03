@@ -1182,6 +1182,9 @@ func setupAgentLeg(ns *nodeSession, pc *webrtc.PeerConnection) error {
 		ns.mu.Lock()
 		prevPC := ns.agentPC
 		ns.agentPC = pc
+		if prevPC != pc {
+			ns.gop.reset() // B2: кеш попереднього кодера новому треку чужий
+		}
 		ns.agentSSRC = webrtc.SSRC(track.SSRC())
 		ns.mu.Unlock()
 		myGen := atomic.AddUint64(&ns.generation, 1)
@@ -1274,6 +1277,9 @@ func setupAgentLeg(ns *nodeSession, pc *webrtc.PeerConnection) error {
 			up := ns.agentPC == nil
 			if up {
 				ns.agentPC = pc
+				// B2: новий publisher починає з порожнього кешу — що б там не
+				// лишилось від попереднього, його кадри цьому потоку чужі.
+				ns.gop.reset()
 			}
 			ns.mu.Unlock()
 			if up {
@@ -1288,6 +1294,12 @@ func setupAgentLeg(ns *nodeSession, pc *webrtc.PeerConnection) error {
 			gone := ns.agentPC == pc
 			if gone {
 				ns.agentPC = nil
+				// B2/B3: кеш GOP мертвого кодера — геть ОДРАЗУ, під тим самим
+				// локом, що й «агента немає». Інакше новий агент отримує глядачів
+				// зі старим кадром (recomputeBinding праймить їх раніше, ніж
+				// genSwitched у forwardToViewers встигне скинути кеш), а нода без
+				// агента до кінця життя тримає до gopMaxBytes чужих payload-ів.
+				ns.gop.reset()
 			}
 			// H-09: канали цього PC мертві — обнуляємо, інакше кожна подія
 			// вводу до реконекту агента била в «closed pipe» (534 рядки/72 год).

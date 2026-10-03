@@ -62,6 +62,9 @@ func newPrimeLeg(ns *nodeSession) *viewerLeg {
 		done: make(chan struct{}),
 	}
 	ns.mu.Lock()
+	if ns.viewers == nil {
+		ns.viewers = make(map[*webrtc.PeerConnection]*viewerLeg)
+	}
 	ns.viewers[vl.pc] = vl
 	ns.mu.Unlock()
 	markViewerReady(ns, vl)
