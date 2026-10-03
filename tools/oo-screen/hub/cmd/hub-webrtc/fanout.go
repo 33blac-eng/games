@@ -192,7 +192,10 @@ func addViewerLimit(ns *nodeSession, pc *webrtc.PeerConnection, trk *webrtc.Trac
 	log.Printf("viewer leg added [node=%s]: %d viewer(s)", ns.nodeID, n)
 
 	go vl.pump(ns)
-	go watchSessionCap(ns, vl)
+	// Стелю читаємо ТУТ, синхронно, а не в горутині сторожа: інакше читання
+	// глобалі відкладалось до планування горутини й гонило з її зміною
+	// (тести підміняють sessionCap; race detector ловив це під навантаженням).
+	go watchSessionCap(ns, vl, sessionCap)
 	return vl
 }
 
@@ -218,18 +221,18 @@ var sessionCap = envDuration("OO_SCREEN_SESSION_CAP", 120*time.Minute)
 // watchSessionCap рве ногу глядача, коли її час вичерпано. Нуль або відʼємне
 // значення вимикає стелю зовсім — для налагодження, коли сесію треба тримати
 // довго свідомо.
-func watchSessionCap(ns *nodeSession, vl *viewerLeg) {
-	if sessionCap <= 0 {
+func watchSessionCap(ns *nodeSession, vl *viewerLeg, limit time.Duration) {
+	if limit <= 0 {
 		return
 	}
-	t := time.NewTimer(sessionCap)
+	t := time.NewTimer(limit)
 	defer t.Stop()
 	select {
 	case <-vl.done:
 		// Нога знята раніше — звичайний шлях, нічого робити.
 	case <-t.C:
-		log.Printf("viewer leg [node=%s]: стеля сесії %s вичерпана — рву", ns.nodeID, sessionCap)
-		dropViewer(ns, vl, "стеля сесії "+sessionCap.String())
+		log.Printf("viewer leg [node=%s]: стеля сесії %s вичерпана — рву", ns.nodeID, limit)
+		dropViewer(ns, vl, "стеля сесії "+limit.String())
 	}
 }
 

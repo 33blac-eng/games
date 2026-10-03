@@ -28,7 +28,7 @@ func TestSessionCapDropsForgottenViewer(t *testing.T) {
 	vl := &viewerLeg{pc: pc, out: make(chan *rtp.Packet, 1), done: make(chan struct{})}
 	ns.viewers = map[*webrtc.PeerConnection]*viewerLeg{pc: vl}
 
-	go watchSessionCap(ns, vl)
+	go watchSessionCap(ns, vl, sessionCap)
 
 	deadline := time.After(3 * time.Second)
 	for {
@@ -69,7 +69,7 @@ func TestSessionCapSilentWhenViewerLeavesEarly(t *testing.T) {
 	ns.viewers = map[*webrtc.PeerConnection]*viewerLeg{pc: vl}
 
 	returned := make(chan struct{})
-	go func() { watchSessionCap(ns, vl); close(returned) }()
+	go func() { watchSessionCap(ns, vl, sessionCap); close(returned) }()
 
 	close(vl.done) // глядач пішов сам, задовго до стелі
 
@@ -97,7 +97,7 @@ func TestSessionCapZeroDisables(t *testing.T) {
 	ns := &nodeSession{nodeID: "node-off"}
 	vl := &viewerLeg{done: make(chan struct{})}
 	returned := make(chan struct{})
-	go func() { watchSessionCap(ns, vl); close(returned) }()
+	go func() { watchSessionCap(ns, vl, sessionCap); close(returned) }()
 	select {
 	case <-returned:
 	case <-time.After(time.Second):
