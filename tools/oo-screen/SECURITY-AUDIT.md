@@ -68,3 +68,27 @@
 - Потребує дій на розгортанні: випустити токени нод і перевести агентів на -token-file, після чого
   OO_SCREEN_AGENT_AUTH=strict; за потреби OO_SCREEN_CONTROL_REQUIRES_INPUT=1, OO_SCREEN_TRUSTED_PROXIES.
 - UNVERIFIED: властивості квитка на боці ERP (#6, #7), TLS/експозиція :4470 (#31), CVE агента під Windows.
+
+## Повторний аудит
+
+Незалежна друга перевірка HIGH/MEDIUM рядків тестами (`*_sec2_test.go`,
+`__tests__/security2.test.mjs`, `deploy/test/hub-deploy-sec2-test.sh`).
+
+| # | Що перевірено | Результат | Доказ |
+|---|---|---|---|
+| R1 (#17) | strict без окремого `OO_SCREEN_AGENT_SECRET`: master = T1-токен, який є на кожному ПК → будь-який ПК виковує HMAC(token, чужа нода) | **FIXED** (HIGH) | TestSec2StrictRequiresSeparateMaster; strict тепер відхиляє токени нод, якщо master == T1 (ERROR у журнал); DEPLOY.md §6 |
+| R2 (#17) | Канонікалізація node_id: токен `pc1` для `PC1`, `pc1 `, кирилична `с`, fullwidth, `\x00`, порожній; constant-time | PASS | TestSec2NodeTokenNoCanonicalisation (HMAC по точних байтах, subtle.ConstantTimeCompare) |
+| R3 (#17) | node_id з керівними символами/>256 байт (ін'єкція в журнал `[node=%s]`, роздування реєстру) | **FIXED** (LOW) | TestSec2AgentNodeIDValidation; порожній id лишено (T1/одновузловий режим) |
+| R4 (#17) | Легасі-токен за замовчуванням приймається | PASS (як задокументовано) | дефолт сумісний; strict вимикає; аварійний відкат env |
+| R5 (#21) | XFF: недовірений пір, кілька заголовків, ліве підроблене значення, сміття праворуч, IPv6-проксі, биті CIDR у списку | PASS | TestSec2XFFParsing |
+| R6 (#21) | IPv6: кошик на /128 → ротація адрес у своєму /64 обходить ліміт і роздуває мапу; v4-mapped ≠ v4 | **FIXED** (MEDIUM) | TestSec2IPv6RotationSharesBucket; rateKey: IPv6 → /64, ::ffff:a.b.c.d → IPv4 |
+| R7 (#20/#21) | Стелі глядачів/нод без гонок | PASS | addViewerLimit і getOrCreateNew перевіряють стелю під тим самим локом, що й вставка |
+| R8 (#33) | Права файлу токена агента | PASS з зауваженням | ResolveToken не перевіряє ACL файла (Windows); ACL — відповідальність розкочування (agent-deploy.ps1 файла не створює) |
+| R9 (#32) | wt cert pinning | PASS | лише leaf SHA-256, TLS1.3, без ClientSessionCache (resumption не оминає VerifyPeerCertificate); порівняння не секретне |
+| R10 (#37) | Блок-лист: 0xE05B == 0x5B+extended, биті записи — помилка | PASS | TestSec2BlocklistForms |
+| R11 (#43/#45) | Нові канали tiles/cursor: глядач не пише агенту | PASS (рев'ю) | на viewer-каналах немає OnMessage; лише агентський канал публікує; per-viewer черги/буфери обмежені |
+| R12 (#44) | PNG-бомби в плеєрі (тайли й курсор), межі srcW/x+w, len | PASS | security2.test.mjs |
+| R13 | hub-deploy.sh: журнал smoke у фіксованому `/tmp/oo-hub-smoke.log` (симлінк-атака іншого користувача VPS); `--health-url` вставлявся в `'...'` віддаленої команди | **FIXED** (LOW) | hub-deploy-sec2-test.sh; mktemp + прибирання; валідація host/URL. Host з «-» уже відсікався парсером прапорців. Відкат перевірено наявним hub-deploy-test.sh |
+| R14 | CI | PASS з зауваженням | лише push/pull_request (без pull_request_target), `permissions: contents: read`, без `${{ }}` з недовірених полів у run. Зауваження: actions за тегами, не SHA; `govulncheck@latest`; hub-deploy-sec2-test.sh у CI не підключено |
+| R15 | Секрети в репо | PASS | grep secret/token/password/key, PEM/AKIA/ghp_/sk-/xox: лише dev-дефолт `t1-dev-token` (хаб із ним не стартує) і тестові значення; .env/.pem/.key не трекаються |
+| R16 | agent-deploy.ps1 | зауваження (LOW) | SHA256 $NewExe перевіряється до копіювання (TOCTOU, якщо каталог доступний на запис не-адміну) |
