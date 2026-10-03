@@ -1,7 +1,6 @@
 //go:build windows
 
-// Windows-only: offerReq carries capture.OutputInfo, and agent/capture does
-// not build on Linux (dxgi.c carries no build constraint).
+// Windows-only: offerReq is declared in main.go, which is windows-only.
 package main
 
 import (

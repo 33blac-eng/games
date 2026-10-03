@@ -1,7 +1,7 @@
 //go:build windows
 
 // Windows-only: these tests use the stream type (agent/capture + agent/encode,
-// which do not build on Linux: dxgi.c/mft.c carry no build constraint) and the
+// used only by the windows-only main.go) and the
 // Win32 named mutex behind acquireNamedInstance.
 package main
 
