@@ -154,6 +154,12 @@ func (c *Coalescer) Due(now time.Time) (Pos, bool) {
 	return c.last, true
 }
 
-// Reset forgets what was sent (new channel / reconnect): the next Offer is
-// always sent.
-func (c *Coalescer) Reset() { *c = Coalescer{} }
+// Reset forgets what was sent (new channel / reconnect): the latest sample,
+// if any, becomes due immediately and the next Offer is always sent.
+func (c *Coalescer) Reset() {
+	cur, had := c.cur, c.sent || c.pending
+	*c = Coalescer{}
+	if had {
+		c.cur, c.pending = cur, true
+	}
+}

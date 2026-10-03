@@ -37,6 +37,7 @@ import (
 	"github.com/organicoils/oo-screen/agent/encode"
 	"github.com/organicoils/oo-screen/internal/agentcred"
 	"github.com/organicoils/oo-screen/internal/control"
+	"github.com/organicoils/oo-screen/internal/cursorproto"
 	"github.com/organicoils/oo-screen/internal/envelope"
 	"github.com/organicoils/oo-screen/internal/h264"
 	"github.com/organicoils/oo-screen/internal/refine"
@@ -483,6 +484,18 @@ func dialWebRTC(hubURL string, frameInterval time.Duration, onKeyframeRequest fu
 		if l := outputs.Load(); l != nil && len(l.Outputs) > 1 {
 			log.Printf("oo-agent: УВАГА — моніторів %d, а поверхня вводу поки що весь віртуальний робочий стіл: курсор ляже не туди. Для кількох моніторів лишається Mesh.", len(l.Outputs))
 		}
+	}
+	// Шар курсора (cursor.go) — ТРЕТІЙ DataChannel, у тому ж стилі: створює
+	// агент до offer-а, хаб ловить через OnDataChannel і ретранслює глядачам.
+	// Надійний і впорядкований (обґрунтування — internal/cursorproto).
+	if cursorLayerEnabled {
+		cur, dcErr := pc.CreateDataChannel(cursorproto.ChannelLabel, nil)
+		if dcErr != nil {
+			_ = pc.Close()
+			return nil, fmt.Errorf("create cursor datachannel: %w", dcErr)
+		}
+		cur.OnOpen(func() { cursorPub.SetSink(cur) })
+		cur.OnClose(func() { cursorPub.ClearSink(cur) })
 	}
 	track, err := webrtc.NewTrackLocalStaticSample(webrtc.RTPCodecCapability{
 		MimeType:    webrtc.MimeTypeH264,
@@ -1296,6 +1309,7 @@ func main() {
 	logPath := flag.String("log", "", "шлях до файлу логу; якщо задано — увесь вивід іде туди (GUI-режим -H windowsgui без консолі, stdout нема)")
 	audioFlag := flag.Bool("audio", false, "передавати звук ПК (перекриває env OO_SCREEN_AUDIO=1)")
 	inputFlag := flag.Bool("input", false, "приймати клавіатуру й мишу від глядача (перекриває env OO_SCREEN_INPUT=1)")
+	cursorLayerFlag := flag.Bool("cursor-layer", false, "шар курсора: НЕ вмальовувати вказівник у кадр, а слати форму+позицію каналом oosc-cursor (рух миші не коштує кадру); потрібен плеєр з config.cursorLayer")
 	refineFlag := flag.Bool("refine", true, "дошліфування нерухомого екрана (ТЗ P4): через 200 мс без нових кадрів 1–2 рази перекодувати останній кадр із нижчим QP; false — вимкнути")
 	textTilesFlag := flag.Bool("text-tiles", false, "текстові тайли (STAGE3-444 B): на нерухомому дошліфованому екрані один раз слати lossless PNG-тайли кольорового тексту каналом oosc-tiles (потрібен OO_SCREEN_TILES=1 на хабі і config.textTiles у плеєрі)")
 	gopSeconds := flag.Int("gop-seconds", 2, "інтервал періодичного IDR, с (ТЗ 1.4). >3 вимагає на хабі OO_SCREEN_GOP_SPAN трохи більшого за GOP (дефолт 3s, макс 30s), інакше GOP-кеш хаба не спрацює і новий глядач чекатиме IDR через PLI/requestKeyframe")
@@ -1309,6 +1323,13 @@ func main() {
 	// гасити те, що людина свідомо ввімкнула через середовище.
 	applyFeatureFlags(*audioFlag, *inputFlag)
 	textTilesEnabled = *textTilesFlag
+	// Шар курсора (cursor.go): лише прапорцем, типово вимкнено. Ставиться ДО
+	// першого capture.New — перемикач читається при кожному відкритті капчера.
+	if *cursorLayerFlag {
+		cursorLayerEnabled = true
+		capture.SetCursorLayer(true)
+		go cursorPub.Run(nil)
+	}
 
 	// GUI-режим (-H windowsgui) не має консолі, тож log за замовчуванням у
 	// нікуди. -log перенаправляє його у файл. Ставимо ДО першого log.Printf.
@@ -1967,6 +1988,11 @@ loop:
 		waitCtx, cancelWait := context.WithTimeout(ctx, waitFor)
 		frame, err := s.cap.NextFrame(waitCtx)
 		cancelWait()
+		// Шар курсора: позицію/форму DXGI віддає з КОЖНИМ кадром, і саме
+		// NoChange-кадри (рух миші без змін картинки) тут найчастіші.
+		if err == nil {
+			observeCursor(frame, s.cap)
+		}
 		// A-01: капчер міг пережити ACCESS_LOST і жити вже на іншому девайсі.
 		if dev, gen := s.cap.Device(), s.cap.Generation(); encoderStale(dev, gen, s.encDev, s.encGen) {
 			s.lastFrame = nil // аліасив буфери/текстуру старого девайса

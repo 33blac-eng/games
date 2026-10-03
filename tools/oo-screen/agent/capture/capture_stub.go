@@ -60,6 +60,8 @@ type NV12Frame struct {
 	MoveArea   int64
 	NoChange   bool
 
+	CursorShapeSeq uint32
+
 	Captured       time.Time
 	AcquireConvert time.Duration
 }
@@ -101,3 +103,18 @@ func (c *Capturer) NextFrame(ctx context.Context) (*NV12Frame, error) {
 func (c *Capturer) ReadBGRA() ([]byte, int, int, error) { return nil, 0, 0, ErrNotAvailable }
 
 func (c *Capturer) Close() error { return nil }
+
+// SetCursorLayer mirrors the Windows switch (no-op here).
+func SetCursorLayer(on bool) {}
+
+// RawCursorShape mirrors the Windows type.
+type RawCursorShape struct {
+	Type       CursorShapeType
+	W, H       int
+	Pitch      int
+	HotX, HotY int
+	Data       []byte
+	Seq        uint32
+}
+
+func (c *Capturer) CursorShape() (RawCursorShape, bool) { return RawCursorShape{}, false }

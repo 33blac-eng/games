@@ -23,6 +23,7 @@ import (
 	"log/slog"
 	"runtime"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 	"unsafe"
@@ -144,6 +145,10 @@ type NV12Frame struct {
 	// Such a frame carries no planes and no texture; skip it (and do not
 	// treat it as motion).
 	NoChange bool
+
+	// CursorShapeSeq bumps whenever DXGI delivered a new pointer shape; with
+	// the cursor layer on, a change means "pull CursorShape() and resend".
+	CursorShapeSeq uint32
 
 	// Captured is when NextFrame started the acquire that produced this frame.
 	Captured time.Time
@@ -317,6 +322,9 @@ func (c *Capturer) open() error {
 	if !c.readback {
 		C.oos_set_readback(handle, 0)
 	}
+	if cursorLayer.Load() {
+		C.oos_set_cursor_layer(handle, 1)
+	}
 	c.width = int(C.oos_width(handle))
 	c.height = int(C.oos_height(handle))
 	c.gen++ // A-06
@@ -358,6 +366,52 @@ func (c *Capturer) SetCPUReadback(on bool) {
 		C.oos_set_readback(c.c, v)
 	}
 	c.readback = on
+}
+
+// cursorLayer is the process-wide cursor-layer switch (agent -cursor-layer).
+var cursorLayer atomic.Bool
+
+// SetCursorLayer turns the cursor layer on/off for every capturer opened (or
+// reopened after ACCESS_LOST) from now on: the pointer is no longer composited
+// into the image and pointer-only updates come back as NoChange frames; the
+// caller ships the pointer separately (CursorShape + frame Cursor* fields).
+// Call it once at startup, before New.
+func SetCursorLayer(on bool) { cursorLayer.Store(on) }
+
+// RawCursorShape is DXGI's pointer shape as-is (see oos_cursor_shape).
+type RawCursorShape struct {
+	Type       CursorShapeType
+	W, H       int // H counts both masks for monochrome
+	Pitch      int
+	HotX, HotY int
+	Data       []byte
+	Seq        uint32
+}
+
+// CursorShape copies the cached pointer shape. ok=false when DXGI has not
+// delivered one yet. Same goroutine as NextFrame.
+func (c *Capturer) CursorShape() (RawCursorShape, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.c == nil {
+		return RawCursorShape{}, false
+	}
+	var typ, w, h, pitch, hx, hy C.int32_t
+	var n, seq C.uint32_t
+	st := C.oos_cursor_shape(c.c, &typ, &w, &h, &pitch, &hx, &hy, nil, 0, &n, &seq)
+	if st == C.OOS_ERROR || n == 0 || n > 4<<20 {
+		return RawCursorShape{}, false
+	}
+	buf := make([]byte, int(n))
+	st = C.oos_cursor_shape(c.c, &typ, &w, &h, &pitch, &hx, &hy,
+		(*C.uint8_t)(unsafe.Pointer(&buf[0])), n, &n, &seq)
+	if st != C.OOS_OK {
+		return RawCursorShape{}, false
+	}
+	return RawCursorShape{
+		Type: CursorShapeType(typ), W: int(w), H: int(h), Pitch: int(pitch),
+		HotX: int(hx), HotY: int(hy), Data: buf[:int(n)], Seq: uint32(seq),
+	}, true
 }
 
 // Device is the ID3D11Device* behind this capturer, for an encoder that wants
@@ -667,6 +721,7 @@ func fillMeta(fr *NV12Frame, f *C.oos_frame, start time.Time) {
 	fr.DirtyArea = int64(f.dirty_area)
 	fr.MoveArea = int64(f.move_area)
 	fr.NoChange = f.no_change != 0
+	fr.CursorShapeSeq = uint32(f.cursor_shape_seq)
 	fr.Captured = start
 	fr.AcquireConvert = time.Since(start)
 }

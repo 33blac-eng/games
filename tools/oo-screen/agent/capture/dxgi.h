@@ -87,6 +87,9 @@ typedef struct {
      * as last frame. Such a frame is NOT converted: the NV12 texture still
      * holds the previous image and y/uv are NULL. The consumer should skip it. */
     int32_t no_change;
+
+    /* Cursor layer: bumps whenever DXGI delivered a new pointer shape. */
+    uint32_t cursor_shape_seq;
 } oos_frame;
 
 /* Creates the pipeline for output `output_idx` of adapter 0.
@@ -136,6 +139,16 @@ void   *oos_device(oos_cap *c);
 void   *oos_nv12_texture(oos_cap *c);
 void oos_suspend(oos_cap *c);   /* A-17: drop only the duplication; oos_next re-duplicates lazily */
 void    oos_set_readback(oos_cap *c, int32_t enable);
+
+/* Cursor layer: enable=1 stops compositing the pointer into the image (both
+ * DXGI and GDI paths) and makes pointer-only updates no_change frames. */
+void    oos_set_cursor_layer(oos_cap *c, int32_t enable);
+/* Copies the cached raw DXGI pointer shape (BGRA / mono masks, `pitch` bytes
+ * per row; mono `h` counts both masks). OOS_ERROR: no shape yet.
+ * OOS_INVALID_CALL: `cap` too small, *len holds the size needed. */
+int     oos_cursor_shape(oos_cap *c, int32_t *type, int32_t *w, int32_t *h,
+                         int32_t *pitch, int32_t *hot_x, int32_t *hot_y,
+                         uint8_t *buf, uint32_t cap, uint32_t *len, uint32_t *seq);
 int64_t oos_cpu_maps(oos_cap *c);
 
 /* Number of outputs on adapter 0; <0 on failure. */

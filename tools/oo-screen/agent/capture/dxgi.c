@@ -83,6 +83,14 @@ struct oos_cap {
      * oos_gdi_next, consumed and cleared by convert_out. */
     int32_t cursor_in_bgra;
 
+    /* Cursor layer (agent -cursor-layer): 1 -> the pointer is NOT composited
+     * into the image (neither DXGI shape nor GDI DrawIconEx); it travels as a
+     * separate shape+position stream. Pointer-only updates are then no-ops.
+     * shape_seq bumps on every new DXGI shape so the consumer knows when to
+     * pull it with oos_cursor_shape. */
+    int32_t cursor_layer;
+    uint32_t shape_seq;
+
     /* Gap #2: scratch for GetFrameMoveRects/GetFrameDirtyRects, and whether
      * c->bgra holds a real desktop image yet (a no-op frame is only a no-op
      * relative to something we already converted). */
@@ -405,6 +413,7 @@ static HRESULT fetch_shape(oos_cap *c, uint32_t size)
                                                &c->shape_info);
     if (FAILED(hr)) return hr;
     c->have_shape = 1;
+    c->shape_seq++;
     return S_OK;
 }
 
@@ -663,9 +672,10 @@ int oos_next(oos_cap *c, uint32_t timeout_ms, oos_frame *frame,
      * unchanged pointer (position, visibility, shape) is a real no-op. */
     noop = c->have_image && rects.valid &&
            rects.dirty_count == 0 && rects.move_count == 0 &&
-           fi.PointerShapeBufferSize == 0 &&
-           c->cur_visible == prev_visible &&
-           (!c->cur_visible || (c->cur_x == prev_x && c->cur_y == prev_y));
+           (c->cursor_layer ||   /* pointer is not in the image: ignore it */
+            (fi.PointerShapeBufferSize == 0 &&
+             c->cur_visible == prev_visible &&
+             (!c->cur_visible || (c->cur_x == prev_x && c->cur_y == prev_y))));
     if (noop) {
         SAFE_RELEASE(res);
         c->dupl->lpVtbl->ReleaseFrame(c->dupl);
@@ -680,6 +690,7 @@ int oos_next(oos_cap *c, uint32_t timeout_ms, oos_frame *frame,
         frame->accumulated_frames = fi.AccumulatedFrames;
         frame->rects_valid = 1;
         frame->no_change = 1;
+        frame->cursor_shape_seq = c->shape_seq;
         return OOS_OK;
     }
 
@@ -725,7 +736,10 @@ static int convert_out(oos_cap *c, oos_frame *frame, int32_t mouse_only,
     int composited;
 
     /* A-24: the pointer may already be in c->bgra (GDI path drew it). */
-    if (c->cursor_in_bgra) {
+    if (c->cursor_layer) {
+        composited = 0;          /* cursor layer: pointer travels separately */
+        c->cursor_in_bgra = 0;
+    } else if (c->cursor_in_bgra) {
         composited = 1;
         c->cursor_in_bgra = 0;
     } else {
@@ -781,6 +795,7 @@ static int convert_out(oos_cap *c, oos_frame *frame, int32_t mouse_only,
     frame->cursor_y = c->cur_y;
     frame->mouse_only = mouse_only;
     frame->accumulated_frames = accumulated;
+    frame->cursor_shape_seq = c->shape_seq;
     return OOS_OK;
 }
 
@@ -882,7 +897,7 @@ int oos_gdi_next(oos_cap *c, oos_frame *frame, char *err, int32_t err_len)
      * is the FIRST frame of a session on a still desktop, and a remote desktop
      * without a mouse pointer reads as "frozen". Draw it with the same GDI we
      * already hold the DC for. */
-    gdi_draw_cursor(c, mem, &od.DesktopCoordinates);
+    if (!c->cursor_layer) gdi_draw_cursor(c, mem, &od.DesktopCoordinates);
     GdiFlush();  /* the DIB bits are written by GDI asynchronously */
 
     c->ctx->lpVtbl->UpdateSubresource(c->ctx, (ID3D11Resource *)c->bgra, 0,
@@ -904,7 +919,8 @@ done:
 }
 
 /* Text tiles (internal/tiles): copy the current BGRA desktop (pointer
- * included, exactly what was last converted) into dst. A one-shot staging
+ * included, exactly what was last converted; with the cursor layer on the
+ * pointer is never composited, so tiles are cursor-free) into dst. A one-shot staging
  * texture is created, mapped once and released: this runs at most once per
  * static episode, so keeping 8-15 MB of staging memory alive is not worth it. */
 int oos_read_bgra(oos_cap *c, uint8_t *dst, int32_t dst_pitch, char *err, int32_t err_len)
@@ -994,6 +1010,28 @@ void oos_suspend(oos_cap *c)
 }
 void *oos_nv12_texture(oos_cap *c) { return c ? (void *)c->nv12 : NULL; }
 void oos_set_readback(oos_cap *c, int32_t enable) { if (c) c->no_readback = !enable; }
+void oos_set_cursor_layer(oos_cap *c, int32_t enable) { if (c) c->cursor_layer = enable ? 1 : 0; }
+
+int oos_cursor_shape(oos_cap *c, int32_t *type, int32_t *w, int32_t *h,
+                     int32_t *pitch, int32_t *hot_x, int32_t *hot_y,
+                     uint8_t *buf, uint32_t cap, uint32_t *len, uint32_t *seq)
+{
+    uint32_t need;
+    if (!c || !c->have_shape || !c->shape) return OOS_ERROR;
+    need = c->shape_info.Pitch * c->shape_info.Height;
+    if (need > c->shape_cap) need = c->shape_cap;
+    *type = (int32_t)c->shape_info.Type;
+    *w = (int32_t)c->shape_info.Width;
+    *h = (int32_t)c->shape_info.Height;
+    *pitch = (int32_t)c->shape_info.Pitch;
+    *hot_x = (int32_t)c->shape_info.HotSpot.x;
+    *hot_y = (int32_t)c->shape_info.HotSpot.y;
+    *seq = c->shape_seq;
+    *len = need;
+    if (!buf || cap < need) return OOS_INVALID_CALL;  /* *len says how much */
+    memcpy(buf, c->shape, need);
+    return OOS_OK;
+}
 int64_t oos_cpu_maps(oos_cap *c)   { return c ? c->cpu_maps : 0; }
 
 int32_t oos_width(oos_cap *c)  { return c ? c->width : 0; }
