@@ -178,7 +178,7 @@ sudo sh -c 'umask 077; grep ^OO_SCREEN_AGENT_SECRET= /etc/oo-screen/hub.env | cu
 | `OO_SCREEN_MAX_VIEWERS` **нова** | `16` | стеля глядачів на ноду |
 | `OO_SCREEN_OFFER_RATE` **нова** | `1` | per-IP запитів/с на `/offer/*`; `0` вимикає |
 | `OO_SCREEN_OFFER_BURST` **нова** | `10` | сплеск для rate-limit |
-| `OO_SCREEN_TRUSTED_PROXIES` **нова** | порожньо | IP/CIDR через кому, чиєму `X-Forwarded-For` віримо |
+| `OO_SCREEN_TRUSTED_PROXIES` **нова** | `127.0.0.0/8,::1` (не задано); порожнє = без довіри | IP/CIDR через кому, чиєму `X-Forwarded-For` віримо |
 | `OO_SCREEN_CONTROL_REQUIRES_INPUT` **нова** | вимк. | `1` — `/control` лише з grant=control у тікеті |
 | `OO_SCREEN_SESSION_CAP` | `120m` | максимальна тривалість сесії глядача |
 | `OO_SCREEN_GOP_SPAN` | `3s` (макс 30s) | глибина GOP-кешу; більше за `-gop-seconds` агента |

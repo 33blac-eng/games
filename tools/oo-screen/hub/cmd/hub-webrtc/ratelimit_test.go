@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"testing"
 	"time"
 )
@@ -69,5 +70,37 @@ func TestSecMaxNodes(t *testing.T) {
 	}
 	if reg.getOrCreate("a") == nil {
 		t.Fatal("наявна нода недоступна на стелі")
+	}
+}
+
+// За nginx на тому ж хості (прод) без OO_SCREEN_TRUSTED_PROXIES усі клієнти
+// мали RemoteAddr=127.0.0.1 і ділили один кошик. Дефолт довіряє loopback.
+func TestSecRateLimitDefaultTrustsLoopbackProxy(t *testing.T) {
+	t.Setenv("OO_SCREEN_TRUSTED_PROXIES", "")
+	os.Unsetenv("OO_SCREEN_TRUSTED_PROXIES")
+	l := newIPLimiter(1, 1, trustedProxiesEnv())
+	now := time.Now()
+	for i, ip := range []string{"203.0.113.1", "203.0.113.2", "203.0.113.3"} {
+		r := httptest.NewRequest(http.MethodPost, "/offer/viewer", nil)
+		r.RemoteAddr = "127.0.0.1:5555"
+		r.Header.Set("X-Forwarded-For", ip)
+		if got := l.clientIP(r); got != ip {
+			t.Fatalf("#%d clientIP=%q, want %q", i, got, ip)
+		}
+		if !l.allow(l.clientIP(r), now) {
+			t.Fatalf("#%d: різні клієнти за loopback-проксі ділять кошик", i)
+		}
+	}
+	// Зовнішній peer XFF не підробить.
+	r := httptest.NewRequest(http.MethodPost, "/offer/viewer", nil)
+	r.RemoteAddr = "198.51.100.7:1"
+	r.Header.Set("X-Forwarded-For", "203.0.113.9")
+	if got := l.clientIP(r); got != "198.51.100.7" {
+		t.Fatalf("external clientIP=%q", got)
+	}
+	// Явне порожнє значення — довіри нема.
+	t.Setenv("OO_SCREEN_TRUSTED_PROXIES", "")
+	if v := trustedProxiesEnv(); v != "" {
+		t.Fatalf("explicit empty -> %q", v)
 	}
 }

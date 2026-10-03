@@ -144,8 +144,23 @@ func (l *ipLimiter) allow(ip string, now time.Time) bool {
 var offerLimiter = newIPLimiter(
 	envFloat("OO_SCREEN_OFFER_RATE", 1),
 	envPositiveInt("OO_SCREEN_OFFER_BURST", 10),
-	os.Getenv("OO_SCREEN_TRUSTED_PROXIES"),
+	trustedProxiesEnv(),
 )
+
+// defaultTrustedProxies — довіра X-Forwarded-For від loopback, коли
+// OO_SCREEN_TRUSTED_PROXIES не задано зовсім. Прод-хаб стоїть за nginx на тому
+// ж хості: без цього ВСІ /offer/* мали б RemoteAddr=127.0.0.1 і ділили б один
+// кошик (1/с, сплеск 10) — глядачі й агенти всього парку разом. Loopback-з'єднання
+// може відкрити лише локальний процес, тож довіра безпечна; без XFF клієнтом
+// лишається сам loopback (як і без довіри). Явне порожнє значення — без довіри.
+const defaultTrustedProxies = "127.0.0.0/8,::1"
+
+func trustedProxiesEnv() string {
+	if v, ok := os.LookupEnv("OO_SCREEN_TRUSTED_PROXIES"); ok {
+		return v
+	}
+	return defaultTrustedProxies
+}
 
 // rateLimited загортає хендлер у per-IP ліміт (OPTIONS не рахуються).
 func rateLimited(l *ipLimiter, h http.HandlerFunc) http.HandlerFunc {
