@@ -13,9 +13,17 @@ import (
 	"time"
 )
 
+// fakePNG — PNG signature + IHDR(w,h), padded with zeros to n bytes (n ≥ 33).
+func fakePNG(w, h uint16, n int) []byte {
+	b := make([]byte, n)
+	copy(b, []byte{0x89, 'P', 'N', 'G', '\r', '\n', 0x1a, '\n', 0, 0, 0, 13, 'I', 'H', 'D', 'R',
+		0, 0, byte(w >> 8), byte(w), 0, 0, byte(h >> 8), byte(h), 8, 6, 0, 0, 0})
+	return b
+}
+
 func TestRoundTrip(t *testing.T) {
 	in := &Msg{Type: TypeTile, Epoch: 7, Frame: 99, X: 64, Y: 128, W: 64, H: 32,
-		SrcW: 1920, SrcH: 1080, Format: FormatPNG, Payload: []byte{1, 2, 3}}
+		SrcW: 1920, SrcH: 1080, Format: FormatPNG, Payload: fakePNG(64, 32, 33)}
 	b, err := Encode(in)
 	if err != nil {
 		t.Fatal(err)
@@ -23,11 +31,12 @@ func TestRoundTrip(t *testing.T) {
 	// golden — the same bytes are asserted by the player test
 	// (total-erp-app/resources/js/remote/__tests__/text-tiles.test.mjs).
 	golden := []byte{0x4f, 0x54, 0x01, 0x01, 0x07, 0, 0, 0, 0x63, 0, 0, 0, 0x40, 0, 0x80, 0,
-		0x40, 0, 0x20, 0, 0x80, 0x07, 0x38, 0x04, 0x01, 0, 0, 0, 0x03, 0, 0, 0, 1, 2, 3}
+		0x40, 0, 0x20, 0, 0x80, 0x07, 0x38, 0x04, 0x01, 0, 0, 0, 0x21, 0, 0, 0}
+	golden = append(golden, fakePNG(64, 32, 33)...)
 	if !bytes.Equal(b, golden) {
 		t.Fatalf("wire changed: % x", b)
 	}
-	if len(b) != HeaderSize+3 || string(b[:2]) != "OT" {
+	if len(b) != HeaderSize+33 || string(b[:2]) != "OT" {
 		t.Fatalf("bad encoding % x", b)
 	}
 	out, err := Decode(b)
@@ -45,7 +54,7 @@ func TestRoundTrip(t *testing.T) {
 }
 
 func TestDecodeRejects(t *testing.T) {
-	good, _ := Encode(&Msg{Type: TypeTile, Epoch: 1, W: 4, H: 4, SrcW: 8, SrcH: 8, Format: FormatPNG, Payload: []byte{9}})
+	good, _ := Encode(&Msg{Type: TypeTile, Epoch: 1, W: 4, H: 4, SrcW: 8, SrcH: 8, Format: FormatPNG, Payload: fakePNG(4, 4, 33)})
 	mut := func(f func(b []byte) []byte) []byte { return f(append([]byte(nil), good...)) }
 	cases := map[string]struct {
 		b   []byte
@@ -73,11 +82,11 @@ func TestDecodeRejects(t *testing.T) {
 		t.Errorf("oversize encode: %v", err)
 	}
 	if _, err := Encode(&Msg{Type: TypeTile, W: 300, H: 4, SrcW: 1000, SrcH: 8, Format: FormatPNG,
-		Payload: []byte{1}}); !errors.Is(err, ErrInvalid) {
+		Payload: fakePNG(300, 4, 33)}); !errors.Is(err, ErrInvalid) {
 		t.Errorf("oversize tile: %v", err)
 	}
 	// max-size message still decodes
-	big, err := Encode(&Msg{Type: TypeTile, W: 4, H: 4, SrcW: 8, SrcH: 8, Format: FormatPNG, Payload: make([]byte, MaxPayload)})
+	big, err := Encode(&Msg{Type: TypeTile, W: 4, H: 4, SrcW: 8, SrcH: 8, Format: FormatPNG, Payload: fakePNG(4, 4, MaxPayload)})
 	if err != nil || len(big) != MaxMessage {
 		t.Fatalf("max encode: %v %d", err, len(big))
 	}
@@ -316,5 +325,40 @@ func TestSelectExcludesCursor(t *testing.T) {
 	})
 	if len(xs) != 1 || xs[0] != 64 {
 		t.Fatalf("build sent %v", xs)
+	}
+}
+
+// TestDecodeRejectsPNGBomb — a 45-byte message (32-byte header + 13 bytes) or
+// a 61-byte one with a full IHDR claiming 65535x65535 must not pass; nor a
+// tile whose source canvas would be gigantic.
+func TestDecodeRejectsPNGBomb(t *testing.T) {
+	hdr := func(w, h, srcW, srcH uint16, payload []byte) []byte {
+		b := make([]byte, HeaderSize+len(payload))
+		b[0], b[1], b[2], b[3] = 'O', 'T', Version, TypeTile
+		b[16], b[17], b[18], b[19] = byte(w), byte(w>>8), byte(h), byte(h>>8)
+		b[20], b[21], b[22], b[23] = byte(srcW), byte(srcW>>8), byte(srcH), byte(srcH>>8)
+		b[24] = FormatPNG
+		b[28] = byte(len(payload))
+		copy(b[HeaderSize:], payload)
+		return b
+	}
+	bomb45 := hdr(64, 64, 1920, 1080, fakePNG(0xFFFF, 0xFFFF, 29)[:13])
+	if len(bomb45) != 45 {
+		t.Fatalf("len %d", len(bomb45))
+	}
+	cases := map[string][]byte{
+		"bomb45":        bomb45,
+		"ihdr-mismatch": hdr(64, 64, 1920, 1080, fakePNG(0xFFFF, 0xFFFF, 33)),
+		"not-png":       hdr(64, 64, 1920, 1080, make([]byte, 33)),
+		"huge-src":      hdr(64, 64, 0xFFFF, 0xFFFF, fakePNG(64, 64, 33)),
+		"src-over":      hdr(64, 64, MaxSrcSide+1, 1080, fakePNG(64, 64, 33)),
+	}
+	for name, b := range cases {
+		if _, err := Decode(b); !errors.Is(err, ErrInvalid) {
+			t.Errorf("%s: got %v", name, err)
+		}
+	}
+	if _, err := Decode(hdr(64, 64, MaxSrcSide, MaxSrcSide, fakePNG(64, 64, 33))); err != nil {
+		t.Errorf("max src rejected: %v", err)
 	}
 }

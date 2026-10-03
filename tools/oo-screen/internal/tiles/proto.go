@@ -66,6 +66,11 @@ const (
 
 	// MaxTileSide — biggest tile edge accepted on the wire.
 	MaxTileSide = 256
+
+	// MaxSrcSide — biggest captured-desktop edge accepted on the wire. The
+	// player sizes its overlay canvas to SrcW x SrcH, so without a cap one
+	// message could ask for a 65535x65535 canvas (~17 GB RGBA).
+	MaxSrcSide = 16384
 )
 
 // Msg is one decoded message.
@@ -88,6 +93,9 @@ var (
 )
 
 func (m *Msg) validate() error {
+	if len(m.Payload) > MaxPayload {
+		return ErrTooLarge
+	}
 	switch m.Type {
 	case TypeInvalidate, TypeStill:
 		if len(m.Payload) != 0 || m.Format != FormatNone {
@@ -100,15 +108,18 @@ func (m *Msg) validate() error {
 		if m.W == 0 || m.H == 0 || m.W > MaxTileSide || m.H > MaxTileSide {
 			return fmt.Errorf("%w: tile size %dx%d", ErrInvalid, m.W, m.H)
 		}
+		if m.SrcW > MaxSrcSide || m.SrcH > MaxSrcSide {
+			return fmt.Errorf("%w: source %dx%d", ErrInvalid, m.SrcW, m.SrcH)
+		}
 		if m.SrcW == 0 || m.SrcH == 0 ||
 			uint32(m.X)+uint32(m.W) > uint32(m.SrcW) || uint32(m.Y)+uint32(m.H) > uint32(m.SrcH) {
 			return fmt.Errorf("%w: tile %d,%d %dx%d outside %dx%d", ErrInvalid, m.X, m.Y, m.W, m.H, m.SrcW, m.SrcH)
 		}
+		if err := checkPNGHeader(m.Payload, m.W, m.H); err != nil {
+			return err
+		}
 	default:
 		return fmt.Errorf("%w: type %d", ErrInvalid, m.Type)
-	}
-	if len(m.Payload) > MaxPayload {
-		return ErrTooLarge
 	}
 	return nil
 }
@@ -179,4 +190,25 @@ func Decode(b []byte) (*Msg, error) {
 		return nil, err
 	}
 	return m, nil
+}
+
+// pngMinLen is the PNG signature plus a complete IHDR chunk (8 + 4 len +
+// 4 type + 13 data); fewer bytes cannot be a usable PNG.
+const pngMinLen = 8 + 8 + 13
+
+var pngSig = [8]byte{0x89, 'P', 'N', 'G', '\r', '\n', 0x1a, '\n'}
+
+// checkPNGHeader requires the PNG's own IHDR size to equal the header's W x H
+// (mirror of cursorproto.checkPNGHeader). Without it a 45-byte message could
+// declare a 64x64 tile whose IHDR says 65535x65535, and the browser's
+// createImageBitmap would allocate for the IHDR size (decompression bomb).
+func checkPNGHeader(d []byte, w, h uint16) error {
+	if len(d) < pngMinLen || [8]byte(d[:8]) != pngSig ||
+		binary.BigEndian.Uint32(d[8:]) != 13 || string(d[12:16]) != "IHDR" {
+		return fmt.Errorf("%w: payload is not a PNG", ErrInvalid)
+	}
+	if binary.BigEndian.Uint32(d[16:]) != uint32(w) || binary.BigEndian.Uint32(d[20:]) != uint32(h) {
+		return fmt.Errorf("%w: PNG IHDR size differs from tile %dx%d", ErrInvalid, w, h)
+	}
+	return nil
 }

@@ -8,6 +8,8 @@
 // (little-endian, 32 байти заголовка + payload). Під прапорцем
 // config.textTiles; без нього цей модуль не імпортується в дію.
 
+import { pngHeaderMatches } from './desktop-oo-cursor.js';
+
 export const TILES_LABEL = 'oosc-tiles';
 export const HEADER_SIZE = 32;
 export const VERSION = 1;
@@ -26,6 +28,9 @@ export const FORMAT_NONE = 0;
 export const FORMAT_PNG = 1;
 export const MAX_MESSAGE = 64 * 1024;
 export const MAX_TILE_SIDE = 256;
+// MAX_SRC_SIDE — tiles.MaxSrcSide: canvas оверлея має розмір srcW×srcH, тож
+// без стелі одне повідомлення просило б canvas 65535×65535.
+export const MAX_SRC_SIDE = 16384;
 
 // parseTileMessage — ArrayBuffer | Uint8Array → повідомлення або null
 // (будь-яке порушення формату = null, нічого не малюємо).
@@ -58,7 +63,11 @@ export function parseTileMessage(data) {
     }
     if (m.type !== TYPE_TILE || m.format !== FORMAT_PNG || len === 0) return null;
     if (!m.w || !m.h || m.w > MAX_TILE_SIDE || m.h > MAX_TILE_SIDE) return null;
-    if (!m.srcW || !m.srcH || m.x + m.w > m.srcW || m.y + m.h > m.srcH) return null;
+    if (!m.srcW || !m.srcH || m.srcW > MAX_SRC_SIDE || m.srcH > MAX_SRC_SIDE) return null;
+    if (m.x + m.w > m.srcW || m.y + m.h > m.srcH) return null;
+    // IHDR PNG мусить збігатися з w×h заголовка (як у курсора): інакше 45-байтне
+    // повідомлення змусило б createImageBitmap виділяти під 65535×65535.
+    if (!pngHeaderMatches(m.payload, m.w, m.h)) return null;
     return m;
 }
 

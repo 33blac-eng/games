@@ -6,9 +6,20 @@ import {
 } from '../oo-text-tiles.js';
 import { containBox } from '../desktop-oo-webrtc.js';
 
+// png — сигнатура PNG + IHDR(w,h) (+ tag-байт у кінці, якщо заданий).
+function png(w, h, tag) {
+    const b = new Uint8Array(33 + (tag === undefined ? 0 : 1));
+    b.set([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0, 0, 0, 13, 0x49, 0x48, 0x44, 0x52]);
+    const dv = new DataView(b.buffer);
+    dv.setUint32(16, w); dv.setUint32(20, h);
+    b.set([8, 6, 0, 0, 0], 24);
+    if (tag !== undefined) b[33] = tag;
+    return [...b];
+}
+
 // Будує повідомлення так само, як tools/oo-screen/internal/tiles/proto.go Encode.
 function msg({ type = TYPE_TILE, epoch = 1, frame = 2, x = 64, y = 0, w = 64, h = 64,
-    srcW = 1920, srcH = 1080, format = FORMAT_PNG, payload = [1, 2, 3] } = {}) {
+    srcW = 1920, srcH = 1080, format = FORMAT_PNG, payload = png(w, h) } = {}) {
     const b = new Uint8Array(HEADER_SIZE + payload.length);
     const dv = new DataView(b.buffer);
     b[0] = 0x4F; b[1] = 0x54; b[2] = 1; b[3] = type;
@@ -24,14 +35,14 @@ function msg({ type = TYPE_TILE, epoch = 1, frame = 2, x = 64, y = 0, w = 64, h 
 const still = (epoch) => msg({ type: TYPE_STILL, epoch, w: 0, h: 0, x: 0, format: 0, payload: [] });
 const inval = (epoch) => msg({ type: TYPE_INVALIDATE, epoch, w: 0, h: 0, x: 0, format: 0, payload: [] });
 
-// Еталон із Go: tiles.Encode{Tile, epoch 7, frame 99, 64,128 64x32, 1920x1080, PNG, [1 2 3]}.
+// Еталон із Go: tiles.Encode{Tile, epoch 7, frame 99, 64,128 64x32, 1920x1080, PNG, fakePNG(64,32,33)}.
 const golden = Uint8Array.from([0x4f, 0x54, 0x01, 0x01, 0x07, 0, 0, 0, 0x63, 0, 0, 0, 0x40, 0, 0x80, 0,
-    0x40, 0, 0x20, 0, 0x80, 0x07, 0x38, 0x04, 0x01, 0, 0, 0, 0x03, 0, 0, 0, 1, 2, 3]);
+    0x40, 0, 0x20, 0, 0x80, 0x07, 0x38, 0x04, 0x01, 0, 0, 0, 0x21, 0, 0, 0, ...png(64, 32)]);
 {
     const m = parseTileMessage(golden.buffer);
     assert.equal(m.type, TYPE_TILE);
     assert.deepEqual([m.epoch, m.frame, m.x, m.y, m.w, m.h, m.srcW, m.srcH], [7, 99, 64, 128, 64, 32, 1920, 1080]);
-    assert.deepEqual([...m.payload], [1, 2, 3]);
+    assert.deepEqual([...m.payload], png(64, 32));
 }
 // Uint8Array-вид зі зсувом теж парситься
 {
@@ -54,10 +65,18 @@ const bad = {
     outside: msg({ x: 1900 }),
     zeroW: msg({ w: 0 }),
     huge: msg({ w: 300, srcW: 4000 }),
+    // PNG-бомба: 45 байт (32 заголовок + 13), IHDR обрізаний/65535×65535
+    bomb45: msg({ payload: png(65535, 65535).slice(0, 13) }),
+    ihdrMismatch: msg({ payload: png(65535, 65535) }),
+    notPng: msg({ payload: new Array(33).fill(0) }),
+    hugeSrc: msg({ srcW: 65535, srcH: 65535 }),
+    srcOver: msg({ srcW: 16385 }),
     invWithPayload: msg({ type: TYPE_INVALIDATE, format: 0 }),
     tooBig: new Uint8Array(MAX_MESSAGE + 1),
     notBinary: 'OT',
 };
+assert.equal(msg({ payload: png(65535, 65535).slice(0, 13) }).length, 45);
+assert.ok(parseTileMessage(msg({ srcW: 16384, srcH: 16384 })), 'max src');
 for (const [k, v] of Object.entries(bad)) assert.equal(parseTileMessage(v), null, k);
 
 // стан епох
@@ -94,16 +113,16 @@ for (const [k, v] of Object.entries(bad)) assert.equal(parseTileMessage(v), null
     const gate = new Promise((r) => { release = r; });
     const ov = createTileOverlay({
         doc, container, containBox,
-        decode: async (p) => { if (p[0] === 9) await gate; return 'bmp' + p[0]; },
+        decode: async (p) => { const t = p[p.length - 1]; if (t === 9) await gate; return 'bmp' + t; },
     });
     ov.place(10, 20, 1000, 540);
-    await ov.onMessage(msg({ epoch: 1, x: 64, y: 64, payload: [1] }).buffer);
+    await ov.onMessage(msg({ epoch: 1, x: 64, y: 64, payload: png(64, 64, 1) }).buffer);
     assert.equal(canvas.width, 1920);
     assert.equal(canvas.style.left, '30px'); // (1000-960)/2 + 10
     assert.equal(canvas.style.width, '960px');
     assert.ok(ops.includes('draw:bmp1@64,64'));
     // тайл, що декодується, поки приходить invalidate, — не малюється
-    const p = ov.onMessage(msg({ epoch: 1, payload: [9] }).buffer);
+    const p = ov.onMessage(msg({ epoch: 1, payload: png(64, 64, 9) }).buffer);
     await ov.onMessage(inval(2).buffer);
     release();
     await p;
@@ -112,7 +131,7 @@ for (const [k, v] of Object.entries(bad)) assert.equal(parseTileMessage(v), null
     // сміття ігнорується
     await ov.onMessage(new Uint8Array(5).buffer);
     // кадр відео іншої пропорції стирає тайли
-    await ov.onMessage(msg({ epoch: 2, payload: [1] }).buffer);
+    await ov.onMessage(msg({ epoch: 2, payload: png(64, 64, 1) }).buffer);
     ops.length = 0;
     ov.onVideoFrame(1280, 1024);
     assert.deepEqual(ops, ['clear']);

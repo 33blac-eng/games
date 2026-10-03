@@ -24,7 +24,7 @@ func withTilesFlag(t *testing.T, on bool) {
 func tileMsg(t *testing.T, epoch uint32, x uint16, size int) []byte {
 	t.Helper()
 	b, err := tiles.Encode(&tiles.Msg{Type: tiles.TypeTile, Epoch: epoch, X: x, W: 64, H: 64,
-		SrcW: 1920, SrcH: 1080, Format: tiles.FormatPNG, Payload: make([]byte, size)})
+		SrcW: 1920, SrcH: 1080, Format: tiles.FormatPNG, Payload: tilePNG(size)})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -353,4 +353,15 @@ func TestTilesDuplicateViewerChannels(t *testing.T) {
 	if !waitFor(10*time.Second, func() bool { return tilesPumps.Load() == basePumps }) {
 		t.Fatalf("pump survived its channel: %d", tilesPumps.Load()-basePumps)
 	}
+}
+
+// tilePNG — PNG signature + IHDR 64x64, padded with zeros to size bytes.
+func tilePNG(size int) []byte {
+	if size < 33 {
+		size = 33
+	}
+	b := make([]byte, size)
+	copy(b, []byte{0x89, 'P', 'N', 'G', '\r', '\n', 0x1a, '\n', 0, 0, 0, 13, 'I', 'H', 'D', 'R',
+		0, 0, 0, 64, 0, 0, 0, 64, 8, 6, 0, 0, 0})
+	return b
 }
