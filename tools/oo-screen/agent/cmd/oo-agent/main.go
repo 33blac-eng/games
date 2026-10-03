@@ -1276,7 +1276,7 @@ func main() {
 	audioFlag := flag.Bool("audio", false, "передавати звук ПК (перекриває env OO_SCREEN_AUDIO=1)")
 	inputFlag := flag.Bool("input", false, "приймати клавіатуру й мишу від глядача (перекриває env OO_SCREEN_INPUT=1)")
 	refineFlag := flag.Bool("refine", true, "дошліфування нерухомого екрана (ТЗ P4): через 200 мс без нових кадрів 1–2 рази перекодувати останній кадр із нижчим QP; false — вимкнути")
-	gopSeconds := flag.Int("gop-seconds", 2, "інтервал періодичного IDR, с (ТЗ 1.4). >3 вимикає GOP-кеш хаба (gopMaxSpan=3s, gopMaxPackets=512): новий глядач чекатиме IDR через PLI/requestKeyframe")
+	gopSeconds := flag.Int("gop-seconds", 2, "інтервал періодичного IDR, с (ТЗ 1.4). >3 вимагає на хабі OO_SCREEN_GOP_SPAN трохи більшого за GOP (дефолт 3s, макс 30s), інакше GOP-кеш хаба не спрацює і новий глядач чекатиме IDR через PLI/requestKeyframe")
 	flag.Parse()
 
 	// Прапорці перекривають env з тієї ж причини, що й -token вище: агента

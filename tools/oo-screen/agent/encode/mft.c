@@ -30,7 +30,6 @@
 #include <mftransform.h>
 #include <mferror.h>
 #include <codecapi.h>
-#include <icodecapi.h>
 #include <d3d11.h>
 #include <stdio.h>
 #include <stdlib.h>
