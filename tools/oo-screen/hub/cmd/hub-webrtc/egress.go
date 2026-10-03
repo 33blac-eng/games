@@ -61,7 +61,8 @@ type egressConn struct {
 	pool  sync.Pool
 	gso   atomic.Bool
 	errs  atomic.Uint64
-	lastE atomic.Int64 // unix-нс останнього логу помилки
+	full  atomic.Uint64 // скільки разів черга була повна (писар блокувався)
+	lastE atomic.Int64  // unix-нс останнього логу помилки
 }
 
 func newEgressConn(c *net.UDPConn) *egressConn {
@@ -73,6 +74,7 @@ func newEgressConn(c *net.UDPConn) *egressConn {
 	}
 	e.pool.New = func() any { b := make([]byte, 0, 1500); return &b }
 	e.gso.Store(gsoSupported(c))
+	registerEgress(e)
 	go e.writer()
 	return e
 }
@@ -104,6 +106,12 @@ func (e *egressConn) WriteToAddrPort(b []byte, to netip.AddrPort) (int, error) {
 	select {
 	case e.q <- egressPkt{bp, to}:
 		return len(b), nil
+	default:
+		e.full.Add(1)
+	}
+	select {
+	case e.q <- egressPkt{bp, to}:
+		return len(b), nil
 	case <-e.done:
 		e.pool.Put(bp)
 		return 0, net.ErrClosed
@@ -113,6 +121,7 @@ func (e *egressConn) WriteToAddrPort(b []byte, to netip.AddrPort) (int, error) {
 func (e *egressConn) Close() error {
 	var err error
 	e.once.Do(func() {
+		unregisterEgress(e)
 		close(e.done)
 		<-e.exit
 		err = e.c.Close()

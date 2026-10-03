@@ -318,6 +318,9 @@ type nodeSession struct {
 	// кожному пакеті агентської ноги без ns.mu.
 	viewerCount atomic.Int32
 
+	// m — лічильники /metrics цієї ноди (metrics.go).
+	m nodeMetrics
+
 	// egress seq/ts — МОНОТОННІ на весь час життя ноди, ніколи не скидаються
 	// при заміні агента (generation): для кожного вхідного пакета egress =
 	// попередній egress + delta(вхід). haveEgress ініціалізується один раз, при
@@ -1289,6 +1292,7 @@ func setupAgentLeg(ns *nodeSession, pc *webrtc.PeerConnection) error {
 						ns.rec.Store(rec)
 					}
 				}
+				metricsAgentPacket(ns, pkt, time.Now())
 				rec.offer(pkt)
 				forwardToViewers(ns, myGen, pkt)
 			}
@@ -1491,6 +1495,7 @@ func setupViewerLeg(ns *nodeSession, pc *webrtc.PeerConnection, claims *hub.Tick
 				// яку веде найгірша нога (worstViewerRR). resetBitrate сам шле
 				// і ціль, і keyframe.
 				resetBitrate(ns)
+				metricsNoteBitrate(ns, 0, "reset", 0)
 			} else if !viewerPrimed(ns, vl) {
 				// Новий глядач посеред потоку не має чекати природного IDR
 				// (GOP 2с) — просимо keyframe (дебаунс усередині). Пункт 41:
@@ -1527,6 +1532,7 @@ func setupViewerLeg(ns *nodeSession, pc *webrtc.PeerConnection, claims *hub.Tick
 			for _, p := range pkts {
 				switch pkt := p.(type) {
 				case *rtcp.PictureLossIndication:
+					ns.m.pliFromViewers.Add(1)
 					propagatePLI(ns)
 				case *rtcp.TransportLayerNack:
 					// NACK responder pion відповідає на цей же пакет сам
@@ -1536,6 +1542,7 @@ func setupViewerLeg(ns *nodeSession, pc *webrtc.PeerConnection, claims *hub.Tick
 					// нозі більше не рятує, переходимо на keyframe (nack.go).
 					st := onNack(ns, vl, pkt, time.Now())
 					logNackWindow(ns.nodeID, st)
+					metricsNack(ns, pkt, st)
 					if st.escalate {
 						propagatePLI(ns)
 					}
@@ -1545,7 +1552,9 @@ func setupViewerLeg(ns *nodeSession, pc *webrtc.PeerConnection, claims *hub.Tick
 					// браузер бачить, що черга наливається, ще до першого
 					// втраченого пакета. Ціль = min(REMB, рішення по втратах),
 					// див. bitrateCtl.withRemb.
+					prev := bitrateTarget(ns)
 					onRembEstimate(ns, uint64(pkt.Bitrate), time.Now())
+					metricsNoteBitrate(ns, prev, "remb", 0)
 				case *rtcp.ReceiverReport:
 					// На цій нозі рівно один відеотрек, тож і reception report
 					// один; цикл — на випадок, коли їх складено кілька в пакет.
@@ -1559,7 +1568,9 @@ func setupViewerLeg(ns *nodeSession, pc *webrtc.PeerConnection, claims *hub.Tick
 						// контролер веде НАЙГІРША нога, а не та, чий RR
 						// щойно прийшов (див. worstViewerRR).
 						loss, jitter, rttExcess := worstViewerRR(ns, vl, float64(rr.FractionLost)/256, rr.Jitter, rtt, now)
+						prev := bitrateTarget(ns)
 						onReceiverReport(ns, loss, jitter, rttExcess, now)
+						metricsNoteBitrate(ns, prev, "", loss)
 					}
 				}
 			}
@@ -1679,6 +1690,7 @@ func drainRTCP(read func([]byte) (int, interceptor.Attributes, error), tag strin
 // переповнить, і рвемо саме його ногу.
 func forwardToViewers(ns *nodeSession, gen uint64, pkt *rtp.Packet) {
 	ns.mu.Lock()
+	metricsObserveKeyframeReqLocked(ns)
 	if !hasLiveViewerLocked(ns) {
 		ns.mu.Unlock()
 		return
@@ -1763,6 +1775,7 @@ func forwardToViewers(ns *nodeSession, gen uint64, pkt *rtp.Packet) {
 		}
 		if vl.discarding {
 			if !isKey {
+				ns.m.viewerDrops.Add(1)
 				continue // кадр у смітник: нога зараз наздоганяє
 			}
 			// Ключовий набір — точка, з якої декодер уміє почати заново.
@@ -1785,6 +1798,7 @@ func forwardToViewers(ns *nodeSession, gen uint64, pkt *rtp.Packet) {
 			}
 		}
 		if !sent {
+			ns.m.viewerDrops.Add(1)
 			now := time.Now()
 			if vl.overflowAt.IsZero() || now.Sub(vl.overflowAt) > viewerOverflowWindow {
 				vl.overflowStreak = 1 // попереднє переповнення було давно — це новий епізод
@@ -2153,6 +2167,7 @@ func sendPLIToAgent(ns *nodeSession) bool {
 		log.Printf("PLI агенту [node=%s]: %v", ns.nodeID, err)
 		return false
 	}
+	ns.m.agentPLISent.Add(1)
 	return true
 }
 
@@ -2246,6 +2261,9 @@ func main() {
 			log.Printf("pprof exited: %v", http.ListenAndServe(addr, nil))
 		}()
 	}
+
+	// /metrics — окремий слухач, лише за OO_SCREEN_METRICS_ADDR (metrics.go).
+	startMetricsServer(os.Getenv("OO_SCREEN_METRICS_ADDR"))
 
 	mux := http.NewServeMux()
 	// SEC #21: per-IP rate-limit (ratelimit.go) — кожен viewer-offer це виклик ERP.

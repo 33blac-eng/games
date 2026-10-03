@@ -142,6 +142,10 @@ type viewerLeg struct {
 	tilesOut     chan []byte
 	tilesSent    uint64
 	tilesDropped uint64
+
+	// born — момент створення ноги: старт відліку time-to-first-frame
+	// (/metrics, metrics.go). Пишеться раз, до pump.
+	born time.Time
 }
 
 // addViewer реєструє нову viewer-ногу ноди й піднімає її pump. Нога ще НЕ live:
@@ -162,6 +166,7 @@ func addViewerLimit(ns *nodeSession, pc *webrtc.PeerConnection, trk *webrtc.Trac
 		userID: userID,
 		out:    make(chan *rtp.Packet, viewerQueueDepth+gopMaxPackets), // + місце під кеш GOP
 		done:   make(chan struct{}),
+		born:   time.Now(),
 	}
 	// Черга звуку існує ЛИШЕ під прапорцем: без нього нога має бути бітово
 	// такою, як до появи звуку (nil-канал forwardAudioToViewers пропускає).
@@ -472,7 +477,9 @@ func (vl *viewerLeg) pump(ns *nodeSession) {
 			// viewerQueueDepth пакетів, і на цю різницю поїхала б оцінка
 			// NACK_recovered_ratio (nack.go).
 			atomic.StoreUint32(&vl.lastSeq, uint32(pkt.SequenceNumber))
-			atomic.AddUint64(&vl.sent, 1)
+			if atomic.AddUint64(&vl.sent, 1) == 1 && !vl.born.IsZero() {
+				metricsTTFF(ns, time.Since(vl.born))
+			}
 		}
 	}
 }

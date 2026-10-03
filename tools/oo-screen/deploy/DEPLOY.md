@@ -193,6 +193,7 @@ sudo sh -c 'umask 077; grep ^OO_SCREEN_AGENT_SECRET= /etc/oo-screen/hub.env | cu
 | `OO_SCREEN_RECORD` | вимк. | `1` — запис сесій у MKV |
 | `OO_SCREEN_RECORD_DIR` | `recordings` | каталог записів (0700, файли 0600; 14 днів / 8 ГіБ) |
 | `OO_SCREEN_PPROF_ADDR` | порожньо | адреса pprof (окремий слухач); ставити лише 127.0.0.1:порт |
+| `OO_SCREEN_METRICS_ADDR` | порожньо (вимк.) | адреса окремого слухача Prometheus `/metrics` (мітка `node`: ноди, глядачі, ingress bps/fps, keyframes/хв, ціль бітрейту + причина, loss/RTT max/avg, NACK/PLI, кеш GOP, TTFF, черги egress/глядачів, процес); ставити лише 127.0.0.1:порт |
 
 ### Агент (`agent/`, `internal/agentcred`)
 
