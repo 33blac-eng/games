@@ -159,3 +159,31 @@ func TestStepRembClampIsCut(t *testing.T) {
 		t.Fatalf("серія «чисто» не обірвана зрізом")
 	}
 }
+
+// cutFrom не вічний: тривалий чистий період його знімає, і швидкий режим
+// знову може йти вище за 0.85× старого низького рівня.
+func TestCutFromExpiresAfterCleanPeriod(t *testing.T) {
+	c := bitrateCtl{target: 500_000, startBps: 8_000_000, fastUp: true, cutFrom: 600_000}
+	for i := 1; i <= 120; i++ {
+		c, _ = c.step(0, 0, t0.Add(time.Duration(i)*time.Second))
+	}
+	if c.cutFrom != 0 {
+		t.Fatalf("cutFrom=%d не знято після тривалого чистого", c.cutFrom)
+	}
+	if c.target <= 2_000_000 {
+		t.Fatalf("ціль %d застрягла біля старого cutFrom", c.target)
+	}
+}
+
+// Повільний підйом пройшов рівень затору — cutFrom знято.
+func TestCutFromClearedWhenTargetPassesIt(t *testing.T) {
+	c := bitrateCtl{target: 1_000_000, startBps: 8_000_000, cutFrom: 1_040_000,
+		goodSince: t0.Add(-time.Minute), cleanSince: t0}
+	c, s := c.step(0, 0, t0.Add(time.Second))
+	if !s || c.target < 1_040_000 {
+		t.Fatalf("очікували підйом: s=%v target=%d", s, c.target)
+	}
+	if c.cutFrom != 0 {
+		t.Fatalf("cutFrom=%d не знято після проходу рівня", c.cutFrom)
+	}
+}

@@ -315,6 +315,10 @@ const (
 	fastUpPerSec   = 1.08 // +8%/с еквівалент
 	fastUpMaxStep  = 1.30 // не більше +30% за один крок, хоч би скільки минуло
 	fastUpCapFrac  = 0.85 // межа швидкого режиму відносно cutFrom
+	// cutFromExpire — після стількох безперервно чистих секунд рівень старого
+	// затору вже нічого не каже про канал: cutFrom забуваємо, і швидкий режим
+	// знову може йти до startBps/REMB.
+	cutFromExpire = 60 * time.Second
 )
 
 // fastRecoveryDefault — env-ручка; читається в newBitrateCtl.
@@ -520,6 +524,9 @@ func (c bitrateCtl) step(lossFrac float64, rttExcess time.Duration, now time.Tim
 		if c.cleanSince.IsZero() {
 			c.cleanSince = now
 		}
+		if c.cutFrom > 0 && now.Sub(c.cleanSince) >= cutFromExpire {
+			c.cutFrom = 0
+		}
 		if n, ok := c.fastUpStep(now); ok {
 			next, up, fast = n, true, true
 		} else if now.Sub(c.goodSince) >= goodStreak {
@@ -574,6 +581,9 @@ func (c bitrateCtl) step(lossFrac float64, rttExcess time.Duration, now time.Tim
 	}
 	if up {
 		c.goodSince = now // серія рахується заново від цього підйому
+		if c.cutFrom > 0 && next >= c.cutFrom {
+			c.cutFrom = 0 // повільний підйом пройшов рівень затору — межа знята
+		}
 	} else if next < c.target {
 		c.cutFrom = c.target // рівень, де був затор: межа швидкого режиму
 	}
