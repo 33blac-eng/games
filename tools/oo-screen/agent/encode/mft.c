@@ -55,15 +55,11 @@ OOS_GUID(OOS_AVEncCommonMaxBitRate,       STATIC_CODECAPI_AVEncCommonMaxBitRate)
 OOS_GUID(OOS_AVEncCommonBufferSize,       STATIC_CODECAPI_AVEncCommonBufferSize);
 OOS_GUID(OOS_AVEncVideoForceKeyFrame,     STATIC_CODECAPI_AVEncVideoForceKeyFrame);
 
-/* Static-screen refine (ТЗ P4). Literal values from the Windows SDK
- * (codecapi.h / mfapi.h) — mingw may lack the STATIC_ token lists for these.
- * UNVERIFIED against a real SDK build here: no mingw in CI.
- *   CODECAPI_AVEncVideoMaxQP          {3DAF6F66-A6A7-45E0-A8E5-F2743F46A3A2}
- *   MFSampleExtension_VideoEncodeQP   {B2EFE478-F979-4C66-B95E-EE2B82C82F36} */
-DEFINE_GUID(OOS_AVEncVideoMaxQP,
-            0x3daf6f66, 0xa6a7, 0x45e0, 0xa8,0xe5, 0xf2,0x74,0x3f,0x46,0xa3,0xa2);
-DEFINE_GUID(OOS_MFSampleExtension_VideoEncodeQP,
-            0xb2efe478, 0xf979, 0x4c66, 0xb9,0x5e, 0xee,0x2b,0x82,0xc8,0x2f,0x36);
+/* Static-screen refine (ТЗ P4). CODECAPI_AVEncVideoMaxQP comes from the
+ * STATIC_ token list like the others; MFSampleExtension_VideoEncodeQP is a
+ * plain DEFINE_GUID in mfapi.h (storage allocated via INITGUID). Verified
+ * against mingw-w64 headers. */
+OOS_GUID(OOS_AVEncVideoMaxQP,             STATIC_CODECAPI_AVEncVideoMaxQP);
 
 /* IID_ICodecAPI: mingw declares it extern in strmif.h, but icodecapi.h (which
  * would define it) redefines struct CodecAPIEventData and cannot be included
@@ -835,7 +831,7 @@ static void apply_refine_qp(oos_enc *e, IMFSample *sample)
 {
     if (e->refine_qp > 0)
         IMFSample_SetUINT64(sample,
-                            &OOS_MFSampleExtension_VideoEncodeQP,
+                            &MFSampleExtension_VideoEncodeQP,
                             (UINT64)e->refine_qp);
 }
 
