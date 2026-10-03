@@ -42,7 +42,12 @@ def q8(p):
 
 
 def sub420(c):
+    """2x2 box average; odd width/height are edge-replicated, giving the
+    ceil(h/2) x ceil(w/2) chroma plane that yuv420p uses."""
     h, w = c.shape
+    if h % 2 or w % 2:
+        c = np.pad(c, ((0, h % 2), (0, w % 2)), mode="edge")
+        h, w = c.shape
     return c.reshape(h // 2, 2, w // 2, 2).mean(axis=(1, 3))
 
 
@@ -68,7 +73,7 @@ def x264(planes, w, h, chroma, kbps, frames=30, fps=30):
         subprocess.run(common + ["-i", enc, "-f", "rawvideo", "-pix_fmt", pix, dec], check=True)
         data = np.fromfile(dec, dtype=np.uint8)
         bits = os.path.getsize(enc) * 8
-    cw, ch = (w // 2, h // 2) if chroma == "420" else (w, h)
+    cw, ch = ((w + 1) // 2, (h + 1) // 2) if chroma == "420" else (w, h)
     fsz = w * h + 2 * cw * ch
     last = data[-fsz:]
     y = last[:w * h].reshape(h, w)
