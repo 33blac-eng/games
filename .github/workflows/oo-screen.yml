@@ -1,0 +1,140 @@
+name: oo-screen
+
+on:
+  push:
+    paths:
+      - "tools/oo-screen/**"
+      - "total-erp-app/resources/js/remote/**"
+      - ".github/workflows/oo-screen.yml"
+  pull_request:
+    paths:
+      - "tools/oo-screen/**"
+      - "total-erp-app/resources/js/remote/**"
+      - ".github/workflows/oo-screen.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: oo-screen-${{ github.ref }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    shell: bash
+    working-directory: tools/oo-screen
+
+jobs:
+  linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: tools/oo-screen/go.mod
+          cache: true
+          cache-dependency-path: tools/oo-screen/go.sum
+      - name: go vet
+        run: go vet ./...
+      - name: go test -race
+        run: go test -race -count=1 ./...
+      - name: gofmt (CRLF-tolerant)
+        # Sources use CRLF; ci/gofmt-check.sh strips CR before gofmt -l so only
+        # real formatting issues fail. Non-blocking until the files it currently
+        # reports (agent/input/input.go, hub/cmd/hub-webrtc/{gop,main}.go,
+        # internal/envelope/envelope.go, internal/h264/annexb.go) are gofmt'd;
+        # then delete continue-on-error.
+        continue-on-error: true
+        run: ./ci/gofmt-check.sh
+
+  windows-cross:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: tools/oo-screen/go.mod
+          cache: true
+          cache-dependency-path: tools/oo-screen/go.sum
+      - name: Install mingw-w64
+        run: sudo apt-get update && sudo apt-get install -y gcc-mingw-w64-x86-64
+      - name: Cross build, vet agent, compile agent tests (windows/amd64, cgo)
+        run: ./ci/windows-cross.sh
+
+  windows-native:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: tools/oo-screen/go.mod
+          cache: true
+          cache-dependency-path: tools/oo-screen/go.sum
+      - name: go test ./agent/...
+        # Hosted runners have no GPU; DXGI/MFT probes skip on ErrNotAvailable.
+        env:
+          CGO_ENABLED: "1"
+        run: go test -count=1 ./agent/...
+
+  js:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: total-erp-app/resources/js/remote
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: node --check
+        run: for f in *.js; do echo "check $f"; node --check "$f"; done
+      - name: Run tests
+        run: for t in __tests__/*.mjs; do echo "== $t"; node "$t"; done
+
+  bench-python:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: tools/oo-screen/bench/quality
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install deps
+        run: |
+          sudo apt-get update && sudo apt-get install -y ffmpeg
+          python -m pip install numpy pillow
+      - name: unittest
+        run: python -m unittest discover -v
+
+  deploy-scripts:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: bash -n
+        run: for f in deploy/*.sh deploy/test/*.sh ci/*.sh; do bash -n "$f"; done
+      - name: shellcheck
+        run: shellcheck deploy/*.sh deploy/test/*.sh ci/*.sh
+      - name: hub-deploy test
+        run: bash deploy/test/hub-deploy-test.sh
+
+  govulncheck:
+    # Blocking. Uses the latest 1.26 patch release rather than the exact go.mod
+    # version: the scan is about our code + deps, and stdlib advisories are
+    # fixed by rebuilding with a patched toolchain (bump go.mod's `go` line for
+    # release builds to pick them up).
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.26.x"
+          check-latest: true
+          cache: true
+          cache-dependency-path: tools/oo-screen/go.sum
+      - name: govulncheck
+        run: |
+          go install golang.org/x/vuln/cmd/govulncheck@latest
+          "$(go env GOPATH)/bin/govulncheck" ./...
