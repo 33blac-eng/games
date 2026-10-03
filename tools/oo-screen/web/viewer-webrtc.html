@@ -1,0 +1,214 @@
+<!doctype html>
+<html lang="uk">
+<head>
+<meta charset="utf-8">
+<title>oo-screen T1 — WebRTC viewer (кандидат A)</title>
+<style>
+  body { font-family: system-ui, sans-serif; background:#111; color:#eee; margin:0; padding:16px; }
+  video { width: 100%; max-width: 960px; background:#000; display:block; }
+  #status { font-family: monospace; white-space: pre-wrap; margin-top: 8px; }
+  button { margin-top: 8px; padding: 8px 16px; }
+</style>
+</head>
+<body>
+<h3>oo-screen T1 — кандидат A (WebRTC/Pion), hub RTP-forward</h3>
+<video id="v" autoplay muted playsinline></video>
+<button id="dl">Download metrics</button>
+<div id="status">idle</div>
+<script>
+const params = new URLSearchParams(location.search);
+const token = params.get("token") || "t1-dev-token";
+// hubHost — опційний override (host:port) для матричного ранера, щоб бити у
+// віддалений VPS-hub замість дефолтного localhost:4470.
+const HUB_OFFER_URL = params.get("hub")
+  ? `http://${params.get("hub")}/offer/viewer`
+  : "http://127.0.0.1:4470/offer/viewer";
+
+const statusEl = document.getElementById("status");
+const video = document.getElementById("v");
+let ndjson = [];
+let seq = 0;
+
+function logLine(obj) {
+  ndjson.push(JSON.stringify(obj));
+}
+
+async function start() {
+  const pc = new RTCPeerConnection({ iceServers: [] });
+  // Навмисно назовні: сторінка перевірочна, і без доступу до зʼєднання
+  // жодну машинну перевірку (getStats, getSynchronizationSources) з неї
+  // не зробиш — лишалось би «на вигляд працює».
+  window.__ooPc = pc;
+  pc.addTransceiver("video", { direction: "recvonly" });
+  // ?audio=1 — просити ще й звукову доріжку. Вимкнено за замовчуванням
+  // навмисно: сторінка лежить у репо як перевірочна, і ніхто не має
+  // несподівано почути чужий кабінет, відкривши її "просто подивитись".
+  if (params.get("audio") === "1") {
+    pc.addTransceiver("audio", { direction: "recvonly" });
+  }
+
+  pc.ontrack = (ev) => {
+    video.srcObject = ev.streams[0];
+  };
+
+  pc.oniceconnectionstatechange = () => {
+    statusEl.textContent = "ICE: " + pc.iceConnectionState;
+  };
+
+  const offer = await pc.createOffer();
+  await pc.setLocalDescription(offer);
+  await new Promise((resolve) => {
+    if (pc.iceGatheringState === "complete") return resolve();
+    pc.onicegatheringstatechange = () => {
+      if (pc.iceGatheringState === "complete") resolve();
+    };
+  });
+
+  const resp = await fetch(HUB_OFFER_URL, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ sdp: pc.localDescription.sdp, token }),
+  });
+  if (!resp.ok) {
+    statusEl.textContent = "offer/viewer failed: " + resp.status;
+    return;
+  }
+  const answer = await resp.json();
+  await pc.setRemoteDescription({ type: "answer", sdp: answer.sdp });
+
+  // Презентовані кадри: браузерний seq недоступний з WebRTC API, тож
+  // локальний `seq` тут — лише монотонний лічильник ВИКЛИКІВ rVFC
+  // (перенумеровує презентовані кадри з нуля, не фрейми джерела) — його
+  // не можна зіставити з frame_seq кандидата B (finding 13).
+  //
+  // Натомість rVFC(now, metadata) віддає mediaTime — час презентації у
+  // ЧАСОВІЙ ШКАЛІ ВІДЕОТРЕКУ, яка успадковує RTP timestamp джерела
+  // (WebRTC video track timeline тактується від того самого 90kHz clock,
+  // що й вхідний H.264 RTP). Мапінг для зіставлення з PTS/frame_seq
+  // кандидата B:
+  //   pts_us    = mediaTime * 1e6                (мікросекунди від старту треку)
+  //   frame_seq = round(mediaTime * 60)           (джерело — 60fps corpus)
+  // presentedFrames з metadata — власний монотонний лічильник браузера
+  // (не наш локальний `seq`) і теж пишеться для крос-перевірки.
+  //
+  // `key` навмисно лишається false: браузер (Media Capture / rVFC API)
+  // НЕ експонує ознаку keyframe на video-шляху відтворення — немає
+  // жодного публічного поля ні в VideoFrameCallbackMetadata, ні в
+  // getStats() inbound-rtp, яке б позначало кадр як I/IDR. Чесна межа
+  // browser API, не недогляд.
+  function onFrame(now, metadata) {
+    logLine({
+      seq: seq++,
+      t_rendered_ms: now,
+      key: false,
+      presentedFrames: metadata.presentedFrames,
+      mediaTime: metadata.mediaTime,
+      presentationTime: metadata.presentationTime,
+      expectedDisplayTime: metadata.expectedDisplayTime,
+      receiveTime: metadata.receiveTime !== undefined ? metadata.receiveTime : null,
+      pts_us: Math.round(metadata.mediaTime * 1e6),
+      frame_seq_est: Math.round(metadata.mediaTime * 60),
+    });
+    video.requestVideoFrameCallback(onFrame);
+  }
+  if ("requestVideoFrameCallback" in video) {
+    video.requestVideoFrameCallback(onFrame);
+  } else {
+    statusEl.textContent += "\n(requestVideoFrameCallback unsupported)";
+  }
+
+  // getStats() раз/с — окремий NDJSON-рядок зі схемою {"stats":{...}}.
+  setInterval(async () => {
+    const stats = await pc.getStats();
+    let out = {};
+    stats.forEach((r) => {
+      if (r.type === "inbound-rtp" && r.kind === "video") {
+        out = {
+          framesDecoded: r.framesDecoded,
+          framesDropped: r.framesDropped,
+          jitterBufferDelay: r.jitterBufferDelay,
+          bytesReceived: r.bytesReceived,
+          packetsReceived: r.packetsReceived,
+          packetsLost: r.packetsLost,
+          nackCount: r.nackCount,
+          pliCount: r.pliCount,
+        };
+      }
+    });
+    logLine({ stats: out, t_ms: performance.now() });
+    statusEl.textContent = "ICE: " + pc.iceConnectionState + "\nlast stats: " + JSON.stringify(out);
+  }, 1000);
+}
+
+document.getElementById("dl").addEventListener("click", () => {
+  const blob = new Blob([ndjson.join("\n") + "\n"], { type: "application/x-ndjson" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = "metrics-webrtc.ndjson";
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  URL.revokeObjectURL(url);
+});
+
+
+// ── Перевірка звуку на місці ───────────────────────────────────────────────
+// Навіщо: «доріжка прийшла» ще не означає «звук є» — семпли можуть бути
+// тишею. Єдиний чесний доказ — виміряти саму хвилю: якщо в потоці тестовий
+// тон 440 Гц, значить Opus доїхав, декодер браузера його розібрав, і тракт
+// цілий від хаба до динаміка.
+//
+// Чому по кліку, а не само: AudioContext стартує suspended, і відновити його
+// можна ЛИШЕ всередині обробника справжнього натискання — така політика
+// браузера. Заодно ніхто не почує чужий кабінет випадково.
+if (params.get("audio") === "1") {
+  const hint = document.createElement("div");
+  hint.style.cssText = "margin-top:8px;font:13px monospace;color:#8f8";
+  hint.textContent = "натисніть тут, щоб виміряти звук";
+  document.body.appendChild(hint);
+  hint.addEventListener("click", async () => {
+    const st = document.getElementById("v").srcObject;
+    const tr = st && st.getAudioTracks()[0];
+    if (!tr) { hint.textContent = "звукової доріжки немає"; return; }
+    const ctx = new AudioContext();
+    ctx.resume();                       // саме тут, у жесті
+    const an = ctx.createAnalyser();
+    an.fftSize = 32768;
+    const g = ctx.createGain();
+    g.gain.value = 0;                   // граф має дійти до виходу, але тихо
+    ctx.createMediaStreamSource(new MediaStream([tr])).connect(an);
+    an.connect(g); g.connect(ctx.destination);
+    await new Promise((r) => setTimeout(r, 1200));
+    const td = new Float32Array(an.fftSize);
+    an.getFloatTimeDomainData(td);
+    let sum = 0;
+    for (const x of td) sum += x * x;
+    const rms = Math.sqrt(sum / td.length);
+    const fd = new Float32Array(an.frequencyBinCount);
+    an.getFloatFrequencyData(fd);
+    let bi = 1;
+    for (let i = 2; i < fd.length; i++) if (fd[i] > fd[bi]) bi = i;
+    const hz = bi * ctx.sampleRate / an.fftSize;
+    // Пороги не з голови. Заміряно 30.08 на тому самому тоні:
+    //   Chrome  439.5 Гц, RMS 0.0624
+    //   Brave   439.5 Гц, RMS 0.0577
+    // Частота збіглась до десятої, амплітуда розійшлась на ~7.5% — це слід
+    // захисту Brave від відбитків браузера: він підмішує шум саме у Web
+    // Audio. Тому вердикт спирається насамперед на ЧАСТОТУ, а поріг RMS
+    // узятий на порядок нижче за обидва виміри — щоб farbling не зробив
+    // хибний червоний, але тиша (RMS ~1e-5) не пройшла.
+    const ok = rms > 0.005 && Math.abs(hz - 440) < 15;
+    hint.style.color = ok ? "#8f8" : "#f88";
+    hint.textContent = (ok ? "ЗВУК Є: " : "ЗВУКУ НЕМА: ")
+      + hz.toFixed(1) + " Гц (чекали 440), RMS " + rms.toFixed(4);
+  });
+}
+
+start().catch((err) => {
+  statusEl.textContent = "error: " + err;
+  console.error(err);
+});
+</script>
+</body>
+</html>

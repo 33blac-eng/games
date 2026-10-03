@@ -1,0 +1,119 @@
+<!doctype html>
+<html lang="uk">
+<head>
+<meta charset="utf-8" />
+<title>oo-screen — viewer B (WebTransport)</title>
+<style>
+  body { font-family: system-ui, sans-serif; background: #111; color: #eee; margin: 0; padding: 16px; }
+  #wrap { display: flex; gap: 16px; flex-wrap: wrap; }
+  canvas { background: #000; max-width: 100%; border: 1px solid #333; }
+  input, button { font-size: 14px; padding: 6px 10px; margin: 4px 0; }
+  #ctrl { display: flex; flex-direction: column; gap: 6px; min-width: 320px; }
+  #log { white-space: pre-wrap; font-family: monospace; font-size: 12px; background: #000; padding: 8px; height: 200px; overflow-y: auto; }
+  label { font-size: 12px; color: #aaa; }
+</style>
+</head>
+<body>
+<h2>oo-screen — Candidate B (WebTransport) viewer</h2>
+<div id="wrap">
+  <canvas id="canvas" width="1920" height="1080"></canvas>
+  <div id="ctrl">
+    <label>Hub WebTransport URL (без token/certhash)</label>
+    <input id="url" value="https://localhost:4461/wt" />
+    <label>Token</label>
+    <input id="token" value="t1-dev-token" />
+    <label>Server certificate hash (base64, з CERT_HASH= у stdout hub-wt)</label>
+    <input id="certhash" value="" />
+    <button id="connect">Connect</button>
+    <button id="download">Download metrics (NDJSON)</button>
+    <div id="log"></div>
+  </div>
+</div>
+<script>
+const $ = (id) => document.getElementById(id);
+const logEl = $("log");
+function log(msg) {
+  logEl.textContent += msg + "\n";
+  logEl.scrollTop = logEl.scrollHeight;
+}
+
+// ?certhash= у query — зручно для bench/run_b.sh, який друкує готове посилання.
+const params = new URLSearchParams(location.search);
+// "+" у base64 декодується з query як пробіл — відновлюємо (пастка URL-енкодингу)
+if (params.get("certhash")) $("certhash").value = params.get("certhash").replace(/ /g, "+");
+if (params.get("token")) $("token").value = params.get("token");
+if (params.get("url")) $("url").value = params.get("url");
+
+const canvas = $("canvas");
+const offscreen = canvas.transferControlToOffscreen();
+const worker = new Worker("wt-worker.js");
+worker.postMessage({ type: "init", canvas: offscreen }, [offscreen]);
+
+worker.onmessage = (ev) => {
+  const msg = ev.data;
+  if (msg.type === "started") {
+    log("[worker] перший keyframe отримано, декодер сконфігуровано");
+  } else if (msg.type === "error") {
+    log("[worker error] " + msg.message);
+  } else if (msg.type === "metrics-blob") {
+    saveBlob(msg.blob);
+  }
+};
+
+function saveBlob(blob) {
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(blob);
+  a.download = "metrics-b-" + Date.now() + ".ndjson";
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+}
+
+$("download").addEventListener("click", () => {
+  worker.postMessage({ type: "download" });
+});
+
+$("connect").addEventListener("click", async () => {
+  const base = $("url").value;
+  const token = $("token").value;
+  const certHashB64 = $("certhash").value.trim().replace(/ /g, "+");
+
+  const wtUrl = base + "?token=" + encodeURIComponent(token);
+
+  const opts = {};
+  if (certHashB64) {
+    const bytes = Uint8Array.from(atob(certHashB64), (c) => c.charCodeAt(0));
+    opts.serverCertificateHashes = [{ algorithm: "sha-256", value: bytes.buffer }];
+  }
+
+  log("connecting to " + wtUrl);
+  try {
+    const wt = new WebTransport(wtUrl, opts);
+    await wt.ready;
+    log("WebTransport session ready");
+
+    // Другий, окремий bidi-стрім control (hello/decoder_ready/
+    // keyframe_request/heartbeat) — глядач сам його ВІДКРИВАЄ, hub приймає
+    // через sess.AcceptStream. Незалежний від uni-стріму з відео нижче.
+    const ctrlStream = await wt.createBidirectionalStream();
+    log("opened control bidi-stream, handing writable side to worker");
+    worker.postMessage(
+      { type: "control-stream", writable: ctrlStream.writable, token },
+      [ctrlStream.writable]
+    );
+
+    const reader = wt.incomingUnidirectionalStreams.getReader();
+    const { value: recvStream, done } = await reader.read();
+    if (done || !recvStream) {
+      log("no incoming uni-stream from hub");
+      return;
+    }
+    log("got incoming uni-stream from hub, handing to worker");
+    worker.postMessage({ type: "stream", stream: recvStream }, [recvStream]);
+  } catch (e) {
+    log("connect failed: " + e);
+  }
+});
+</script>
+</body>
+</html>
