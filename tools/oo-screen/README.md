@@ -12,6 +12,18 @@
 > Здоровʼя: `deploy/ops/oo_screen_health.py`. Легасі `hub-wt` (:4460 QUIC)
 > на проді ВИМКНЕНО. Усе нижче — про локальний T1-стенд, не про прод.
 
+## Що нового (жовтень 2026)
+- Дослідження лідерів і план: [`RESEARCH-leaders.md`](RESEARCH-leaders.md); статуси й
+  усі прапорці/env — у `TZ-oo-screen.md` (корінь репо), розділи 8–9.
+- Якість: нативна роздільність замість примусових 1080p, дошліфування статичного
+  екрана (`-refine`, QP 22→18), lossless текстові тайли (`-text-tiles` +
+  `OO_SCREEN_TILES=1`), курсор окремим шаром (`-cursor-layer`). Оцінка до/після
+  (симуляція): [`bench/quality/RESULTS-final.md`](bench/quality/RESULTS-final.md).
+- 4:4:4 / VP9 / тайли — дослідження: [`bench/quality/STAGE3-444.md`](bench/quality/STAGE3-444.md).
+- ПК без GPU: [`bench/SOFTWARE-ENCODER.md`](bench/SOFTWARE-ENCODER.md).
+- Безпека: [`SECURITY-AUDIT.md`](SECURITY-AUDIT.md).
+- Викочування хаба й агента: [`deploy/DEPLOY.md`](deploy/DEPLOY.md).
+
 ## T1-стенд (історично)
 
 План: `docs/superpowers/plans/2026-08-26-oo-screen-core-plan.md` (єдине джерело).

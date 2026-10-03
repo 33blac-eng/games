@@ -103,16 +103,92 @@ Chrome через WebRTC не приймає H.264 High 4:4:4, тому потр
 
 ## 8. План виконання після дослідження (`tools/oo-screen/RESEARCH-leaders.md`)
 
-| # | Пункт | Статус |
-|---|---|---|
-| 1 | Дослідження 20 параметрів лідерів | ✅ готово |
-| 2 | Плеєр: пропорції + режим 1:1 (P6) | ✅ закомічено, браузер — UNVERIFIED |
-| 3 | SPS VUI: BT.709 limited (P3) | ✅ закомічено, Windows-збірка — UNVERIFIED |
-| 4 | Прапорець `-gop-seconds` (P5, частково) | ✅ закомічено |
-| 5 | Хаб: GOP-кеш за байтами (передумова довгого GOP) | в роботі |
-| 6 | Дошліфування статичного екрана (P4) + якість скейлера (P2) | в роботі |
-| 7 | Бітрейт: швидше відновлення, режим «Текст», оцінка GCC/TWCC (P7) | в роботі |
-| 8 | Вимірювальний стенд `bench/quality` (P9) | в роботі |
-| 9 | Пропуск незмінених кадрів (dirty rects), курсор окремим шаром | наступна хвиля |
-| 10 | Програмний енкодер (openh264/x264) для ПК без GPU (P8) | наступна хвиля |
-| 11 | 4:4:4 (AVC444 у браузері) / VP9/AV1 — дослідження з прототипом | наступна хвиля |
+Фінальні статуси (жовтень 2026). Оцінка якості до/після — симуляція, див.
+`tools/oo-screen/bench/quality/RESULTS-final.md`. «UNVERIFIED» — не перевірено
+на реальному Windows-ПК / в браузері.
+
+| # | Пункт | Статус | Коміти |
+|---|---|---|---|
+| 1 | Дослідження 20 параметрів лідерів | ✅ готово | `43bdb82`, `78fc3d8` |
+| 2 | Плеєр: пропорції + режим 1:1 (P6) | ✅ закомічено, браузер — UNVERIFIED | `4e458ce` |
+| 3 | SPS VUI: BT.709 limited (P3) | ✅ закомічено, Windows-збірка — UNVERIFIED | `37ed22b` |
+| 4 | Прапорець `-gop-seconds` (P5) | ✅ готово | `fa26303`, `e8c12b9` |
+| 5 | Хаб: GOP-кеш за байтами (передумова довгого GOP) | ✅ готово | `d2e58fb`, `c92517b` |
+| 6 | Дошліфування статичного екрана (P4) + якість скейлера (P2) | ✅ закомічено (`-refine` увімкнено), Windows — UNVERIFIED | `a3620fc`, `f60072c`, `8ddb6bc`, `a6b31a0` |
+| 7 | Бітрейт: швидше відновлення, режим «Текст», оцінка GCC/TWCC (P7) | ✅ закомічено (fast-up opt-in) | `a350d67`, `6012c95`, `7dfbf3f`, `c553308` |
+| 8 | Вимірювальний стенд `bench/quality` (P9) | ✅ готово, підсумок до/після — симуляція | `dd9c503`, `136cce7`, `7fa4994` |
+| 9 | Пропуск незмінених кадрів (dirty rects), курсор окремим шаром | ✅ закомічено (`-cursor-layer` opt-in) | `1c5acee`, `17c7436`, `f335bfd`, `0080faa`, `10b7aa0`, `38552d4` |
+| 10 | Програмний енкодер для ПК без GPU (P8) | ✅ MS MFT-шлях + адаптивний FPS; OpenH264 — лише дизайн | `bafe844`, `1ee8ac2`, `64de216`, `bd8dbca` |
+| 11 | 4:4:4 / VP9 / AV1 — дослідження з прототипом | ✅ дослідження (`STAGE3-444.md`); впроваджено варіант B — lossless текстові тайли (opt-in) | `3528932`, `47a2651`, `4003793`, `cabd07f`, `8327412`, `d423221`, `e25438c` |
+| 12 | Безпековий аудит (`SECURITY-AUDIT.md`) і виправлення | ✅ готово | `d04db5b`, `f81d85f`, `76e7e13`, `6dda18b`, `c28b907`, `27c78bc`, `79654fb`, `8fde92b`, `e094d86` |
+| 13 | Комплект викочування (`deploy/DEPLOY.md`) | ✅ готово | `80bb7f4` |
+
+## 9. Прапорці та змінні середовища
+
+### 9.1 Агент `oo-agent` (прапорці)
+
+| Прапорець | Дефолт | Рекомендовано на проді | Призначення |
+|---|---|---|---|
+| `-transport` | `webrtc` | `webrtc` | `wt` — лише легасі T1-стенд |
+| `-hub` | — | `https://remote.organicoils.com.ua/offer/agent` | адреса хаба |
+| `-node` | — | node_id ПК | mesh-ідентифікатор ноди |
+| `-fps` | 30 | 30 | 60 — лише для стенда |
+| `-bitrate` | 0 (авто за пікселями) | 0 | CBR, біт/с |
+| `-width` / `-height` | 0 (рідна роздільність) | 0 | більше немає примусових 1080p |
+| `-output` | 0 | 0 | індекс монітора на старті |
+| `-force-software` | false | false | примусовий софт-енкодер (діагностика) |
+| `-gop-seconds` | 2 | 2 (>3 — лише разом з `OO_SCREEN_GOP_SPAN` на хабі) | інтервал IDR |
+| `-refine` | true | true | дошліфування нерухомого екрана (QP 22→18) |
+| `-text-tiles` | false | true після пілоту (потрібні `OO_SCREEN_TILES=1` і `config.textTiles`) | lossless тайли кольорового тексту |
+| `-cursor-layer` | false | true після пілоту (потрібен `config.cursorLayer`) | курсор окремим каналом |
+| `-audio` | false | за потребою | перекриває `OO_SCREEN_AUDIO=1` |
+| `-input` | false | true для керування | перекриває `OO_SCREEN_INPUT=1` |
+| `-token-file` | — | файл з ACL SYSTEM/Administrators | hub-токен агента |
+| `-token` | — | не використовувати (застаріло, видно в командному рядку) | — |
+| `-wt-cert-sha256` | — | — (лише `wt`) | пінінг сертифіката hub-wt |
+| `-wt-insecure` | false | false | лише стенд |
+| `-log` | — | файл у каталозі агента (GUI-режим без консолі) | файл журналу |
+
+### 9.2 Змінні середовища агента
+
+| Змінна | Дефолт | Рекомендовано | Призначення |
+|---|---|---|---|
+| `OO_AGENT_TOKEN` | — | або `-token-file` | hub-токен агента |
+| `OO_AGENT_INPUT_BLOCK_KEYS` | порожньо | за політикою (напр. Win-клавіші) | блок-лист клавіш віддаленого вводу |
+| `OO_SCREEN_AUDIO` | 0 | за потребою | звук ПК (на агенті і хабі) |
+| `OO_SCREEN_INPUT` | 0 | 1 там, де потрібне керування | ввід (на агенті і хабі) |
+
+### 9.3 Змінні середовища хаба `hub-webrtc`
+
+| Змінна | Дефолт | Рекомендовано на проді | Призначення |
+|---|---|---|---|
+| `OO_SCREEN_HUB_ADDR` | вбудований | за nginx | адреса сигналінгу |
+| `OO_SCREEN_PUBLIC_IP` | — | публічна IP VPS | NAT 1:1 для ICE |
+| `OO_SCREEN_ICE_PORT` (`OO_SCREEN_UDP_PORT_MIN`) | 4544 | 4544 | один UDP ICE-сокет |
+| `OO_SCREEN_ICE_TCP_PORT` | 0 (вимкнено) | 0 або порт за потребою | ICE-TCP |
+| `OO_SCREEN_STUN_URLS`, `OO_SCREEN_TURN_URL/USER/PASS` | — | за мережею | ICE-сервери для глядачів |
+| `OO_SCREEN_T1_TOKEN` | dev-токен | секрет у `/etc/oo-screen/hub.env` | спільний токен / майстер для легасі |
+| `OO_SCREEN_AGENT_SECRET` | — (fallback `OO_SCREEN_T1_TOKEN`) | окремий секрет | майстер HMAC(master,node) токенів агентів |
+| `OO_SCREEN_AGENT_AUTH` | нестрогий | `strict` | лише per-node токени |
+| `OO_SCREEN_LEGACY_AGENT_TOKEN` | 0 | 0 | дозволити спільний токен агентам |
+| `OO_SCREEN_AGENT_NODE_ID` | — | — | node для старого T1-режиму |
+| `OO_SCREEN_ERP_BASE`, `OO_SCREEN_HUB_KEY` | — | прод-ERP / секрет | інтеграція з ERP |
+| `OO_SCREEN_REVOKE_TIMEOUT` | 8s | 8s | таймаут запиту відкликань |
+| `OO_SCREEN_REVOKE_STALE_AFTER` | 90s | 90s | fail-closed при недоступності ERP |
+| `OO_SCREEN_CONTROL_REQUIRES_INPUT` | 0 | 1 | `/control` лише з grant=control |
+| `OO_SCREEN_MAX_NODES` | 500 | 500 | стеля нод |
+| `OO_SCREEN_MAX_VIEWERS` | 16 | 16 | стеля глядачів на ноду |
+| `OO_SCREEN_OFFER_RATE` / `OO_SCREEN_OFFER_BURST` | 1/с / 10 | 1 / 10 | per-IP rate-limit `/offer/*` |
+| `OO_SCREEN_TRUSTED_PROXIES` | — | `127.0.0.1` (nginx) | звідки довіряти X-Forwarded-For |
+| `OO_SCREEN_SESSION_CAP` | 120m | 120m | максимальна тривалість сесії |
+| `OO_SCREEN_START_BITRATE` | 8000000 | 8000000 | стартовий бітрейт, біт/с |
+| `OO_SCREEN_BITRATE_FASTUP` | 0 | 1 після пілоту | швидке відновлення бітрейту |
+| `OO_SCREEN_GOP_SPAN` | 3s (макс 30s) | 3s, або трохи більше за `-gop-seconds` | байтовий GOP-кеш |
+| `OO_SCREEN_STRICT_CODEC` | 0 | 0 | різати сесію при неузгодженому профілі H.264 |
+| `OO_SCREEN_TILES` | 0 | 1 разом з `-text-tiles` | пересилати канал `oosc-tiles` |
+| `OO_SCREEN_RECORD` / `OO_SCREEN_RECORD_DIR` | 0 / `recordings` | за політикою | запис сесій (0700/0600) |
+| `OO_SCREEN_AUDIO`, `OO_SCREEN_INPUT` | 0 | як на агенті | дозволи на стороні хаба |
+| `OO_SCREEN_PPROF_ADDR` | — | не задавати | pprof (лише налагодження) |
+
+Стендові утиліти: `OO_SCREEN_HUB_URL` (corpus-player-webrtc, дефолт
+`http://127.0.0.1:4470/offer/agent`), `OO_SCREEN_T1_TOKEN` (corpus-player-*, hub-wt).
