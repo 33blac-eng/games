@@ -56,6 +56,16 @@ OOS_GUID(OOS_AVEncCommonMaxBitRate,       STATIC_CODECAPI_AVEncCommonMaxBitRate)
 OOS_GUID(OOS_AVEncCommonBufferSize,       STATIC_CODECAPI_AVEncCommonBufferSize);
 OOS_GUID(OOS_AVEncVideoForceKeyFrame,     STATIC_CODECAPI_AVEncVideoForceKeyFrame);
 
+/* Static-screen refine (ТЗ P4). Literal values from the Windows SDK
+ * (codecapi.h / mfapi.h) — mingw may lack the STATIC_ token lists for these.
+ * UNVERIFIED against a real SDK build here: no mingw in CI.
+ *   CODECAPI_AVEncVideoMaxQP          {3DAF6F66-A6A7-45E0-A8E5-F2743F46A3A2}
+ *   MFSampleExtension_VideoEncodeQP   {B2EFE478-F979-4C66-B95E-EE2B82C82F36} */
+DEFINE_GUID(OOS_AVEncVideoMaxQP,
+            0x3daf6f66, 0xa6a7, 0x45e0, 0xa8,0xe5, 0xf2,0x74,0x3f,0x46,0xa3,0xa2);
+DEFINE_GUID(OOS_MFSampleExtension_VideoEncodeQP,
+            0xb2efe478, 0xf979, 0x4c66, 0xb9,0x5e, 0xee,0x2b,0x82,0xc8,0x2f,0x36);
+
 /* CLSID of the built-in "Microsoft H264 Video Encoder MFT" (wmcodecdsp.h). We
  * define it locally rather than pulling the whole wmcodecdsp.h COBJMACROS surface
  * in. INITGUID is set above, so this also allocates the storage. */
@@ -150,6 +160,7 @@ struct oos_enc {
     int32_t  draining;
     int32_t  mf_held;       /* this encoder holds a ref on the MTA anchor */
     int64_t  last_pts;
+    int32_t  refine_qp;     /* >0: per-frame QP for the following submits (ТЗ P4) */
 
     /* Timing of the last submit, split so the gate can tell the MFT's own cost
      * apart from back-pressure (waiting for METransformNeedInput). */
@@ -778,6 +789,16 @@ static LONGLONG sample_dur(oos_enc *e, int64_t pts_100ns)
     return d;
 }
 
+/* Refine frame: ask for a fixed QP on this sample. Best effort — an MFT that
+ * ignores the attribute still has MaxQP clamped by oos_enc_set_refine_qp. */
+static void apply_refine_qp(oos_enc *e, IMFSample *sample)
+{
+    if (e->refine_qp > 0)
+        IMFSample_SetUINT64(sample,
+                            &OOS_MFSampleExtension_VideoEncodeQP,
+                            (UINT64)e->refine_qp);
+}
+
 static int submit_sample(oos_enc *e, IMFSample *sample, char *err, int32_t err_len)
 {
     HRESULT hr;
@@ -1200,6 +1221,7 @@ int oos_enc_submit_cpu(oos_enc *e,
     IMFSample_SetSampleTime(sample, (LONGLONG)pts_100ns);
     IMFSample_SetSampleDuration(sample, sample_dur(e, pts_100ns));
     e->last_pts = pts_100ns;
+    apply_refine_qp(e, sample);
 
     int rc = submit_sample(e, sample, err, err_len);
     SAFE_RELEASE(sample);
@@ -1292,6 +1314,7 @@ int oos_enc_submit_texture(oos_enc *e, uintptr_t tex, uint64_t gen,
     IMFSample_SetSampleTime(sample, (LONGLONG)pts_100ns);
     IMFSample_SetSampleDuration(sample, sample_dur(e, pts_100ns));
     e->last_pts = pts_100ns;
+    apply_refine_qp(e, sample);
 
     int rc = submit_sample(e, sample, err, err_len);
     SAFE_RELEASE(sample);
@@ -1368,6 +1391,21 @@ int oos_enc_set_bitrate(oos_enc *e, int32_t bps, char *err, int32_t err_len)
      * MF_MT_AVG_BITRATE on every output-type renegotiation, which would
      * otherwise resurrect the value from open time. */
     e->bitrate = bps;
+    return OOS_ENC_OK;
+}
+
+int oos_enc_set_refine_qp(oos_enc *e, int32_t qp, char *err, int32_t err_len)
+{
+    if (!e) return OOS_ENC_ERROR;
+    if (qp < 0 || qp > 51) { set_msg(err, err_len, "refine qp out of range"); return OOS_ENC_ERROR; }
+    e->refine_qp = qp;
+    if (!e->codec) return OOS_ENC_OK; /* sample attribute alone */
+    /* MaxQP caps the rate controller from above, so the frame cannot come out
+     * blurrier than qp even if the per-sample QP is ignored. 51 = no cap.
+     * MaxBitRate/BufferSize stay untouched: the HRD still bounds the burst. */
+    HRESULT hr = set_codec_u32(e, &OOS_AVEncVideoMaxQP, (ULONG)(qp > 0 ? qp : 51));
+    if (FAILED(hr)) { set_err(err, err_len, "AVEncVideoMaxQP", hr);
+                      return OOS_ENC_ERROR; }
     return OOS_ENC_OK;
 }
 

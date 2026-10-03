@@ -57,5 +57,6 @@ func (e *Encoder) HeaderStats() (int, int)    { return 0, 0 }
 func (e *Encoder) Encode(Frame) ([]AU, error) { return nil, ErrNoHardware }
 func (e *Encoder) ForceIDR() error            { return ErrNoHardware }
 func (e *Encoder) SetBitrate(int) error       { return ErrNoHardware }
+func (e *Encoder) SetRefineQP(int) error      { return ErrNoHardware }
 func (e *Encoder) Flush() error               { return ErrNoHardware }
 func (e *Encoder) Close() error               { return nil }

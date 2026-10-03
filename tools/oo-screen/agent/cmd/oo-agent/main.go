@@ -39,6 +39,7 @@ import (
 	"github.com/organicoils/oo-screen/internal/h264"
 	"github.com/organicoils/oo-screen/internal/control"
 	"github.com/organicoils/oo-screen/internal/envelope"
+	"github.com/organicoils/oo-screen/internal/refine"
 )
 
 const (
@@ -1274,6 +1275,7 @@ func main() {
 	logPath := flag.String("log", "", "шлях до файлу логу; якщо задано — увесь вивід іде туди (GUI-режим -H windowsgui без консолі, stdout нема)")
 	audioFlag := flag.Bool("audio", false, "передавати звук ПК (перекриває env OO_SCREEN_AUDIO=1)")
 	inputFlag := flag.Bool("input", false, "приймати клавіатуру й мишу від глядача (перекриває env OO_SCREEN_INPUT=1)")
+	refineFlag := flag.Bool("refine", true, "дошліфування нерухомого екрана (ТЗ P4): через 200 мс без нових кадрів 1–2 рази перекодувати останній кадр із нижчим QP; false — вимкнути")
 	gopSeconds := flag.Int("gop-seconds", 2, "інтервал періодичного IDR, с (ТЗ 1.4). >3 вимикає GOP-кеш хаба (gopMaxSpan=3s, gopMaxPackets=512): новий глядач чекатиме IDR через PLI/requestKeyframe")
 	flag.Parse()
 
@@ -1594,7 +1596,12 @@ func main() {
 		sent       atomic.Int64
 		lastLog    = time.Now()
 		keepalives int // скільки разів переслали останній кадр (нерухомий екран)
-		throttled  int // скільки кадрів викинув бюджет CPU софт-енкодера
+		refines    int // скільки refine-кадрів закодовано (ТЗ P4)
+		// refiner — автомат refine (internal/refine): коли рух стих, ще раз
+		// кодуємо останній кадр із нижчим QP. Лише апаратний D3D-шлях.
+		refiner      = refine.New(refine.Config{MinGap: frameInterval})
+		refineErrLog sync.Once
+		throttled    int // скільки кадрів викинув бюджет CPU софт-енкодера
 		// s.lastFrame — останній захоплений кадр, джерело keepalive. Тримаємо
 		// саме вказівник капчера, без копії: у zero-copy режимі це його
 		// персистентна Blt-текстура, у CPU-режимі — його ж scratch-буфери
@@ -1894,7 +1901,16 @@ loop:
 		// екрані не повернеться НІКОЛИ (її ж коментар: "Give it a deadline if
 		// you need 'no news' reported back"). Дедлайн — єдиний спосіб дізнатись,
 		// що екран стоїть, а не що ми ще чекаємо.
-		waitCtx, cancelWait := context.WithTimeout(ctx, keepaliveAfter)
+		//
+		// Refine (ТЗ P4) лише вкорочує цей дедлайн: якщо рух стих, прокидаємось
+		// у мить, коли час refine, а не через повний keepaliveAfter.
+		refineOn := *refineFlag && !s.software && !gatePaused.Load() && s.lastFrame != nil
+		if !refineOn {
+			refiner.Disarm()
+		}
+		waitFor := refiner.Wait(time.Now(), keepaliveAfter)
+		refineWait := waitFor < keepaliveAfter
+		waitCtx, cancelWait := context.WithTimeout(ctx, waitFor)
 		frame, err := s.cap.NextFrame(waitCtx)
 		cancelWait()
 		// A-01: капчер міг пережити ACCESS_LOST і жити вже на іншому девайсі.
@@ -1913,11 +1929,28 @@ loop:
 			}
 		}
 		still := false
+		refineQP := 0
 		switch {
 		case err == nil:
 			s.lastFrame = frame
+			refiner.Motion(time.Now()) // новий кадр = рух: refine, що йшов, перериваємо
 		case ctx.Err() != nil:
 			break loop // зупиняють агента, а не просто екран стоїть
+		case refineWait && errors.Is(err, context.DeadlineExceeded):
+			// Дедлайн вкоротив refine, а не keepalive: keepalive тут не шлемо.
+			qp, due := refiner.Due(time.Now())
+			if !due || gatePaused.Load() || s.lastFrame == nil {
+				continue
+			}
+			if queued.Load() > 0 {
+				// Канал ще не відправив попереднє: refine не має права його
+				// топити (бюджет ≤ пікового бітрейту) — відкладаємо на кадр.
+				refiner.Postpone(time.Now(), frameInterval)
+				continue
+			}
+			frame = s.lastFrame
+			still = true
+			refineQP = qp
 		case shouldKeepalive(err, gatePaused.Load(), s.lastFrame != nil):
 			// Екран нерухомий: пересилаємо ОСТАННІЙ кадр. Декодер отримує
 			// крихітний P-кадр «нічого не змінилось», сторож у браузері бачить
@@ -2030,7 +2063,27 @@ loop:
 			// СТАРІЙ текстурі, якщо перебудований капчер отримав ту саму адресу.
 			encFrame.TextureGen = frame.TextureGen
 		}
+		if refineQP > 0 {
+			if rerr := s.encoder().SetRefineQP(refineQP); rerr != nil {
+				// MaxQP відмовлено — per-sample QP усе одно стоїть; логуємо раз.
+				refineErrLog.Do(func() { log.Printf("oo-agent: refine: %v", rerr) })
+			}
+		} else if refiner.NeedRestore() {
+			if rerr := s.encoder().SetRefineQP(0); rerr != nil {
+				refineErrLog.Do(func() { log.Printf("oo-agent: refine restore: %v", rerr) })
+			}
+		}
 		aus, err := s.encoder().Encode(encFrame)
+		if refineQP > 0 {
+			n := 0
+			for _, au := range aus {
+				n += len(au.Data)
+			}
+			// Бюджет: наступний refine — не раніше, ніж канал на піку
+			// (MaxBitRate = 1,5 x mean, mft.c peak_bps) проковтне цей.
+			refiner.Sent(time.Now(), n, int(s.bitrateBps.Load())/2*3)
+			refines++
+		}
 		if err != nil {
 			log.Printf("oo-agent: encode.Encode: %v", err)
 			// A-12: «MFT event wait timeout» — енкодер завис; перебудова через
@@ -2043,13 +2096,15 @@ loop:
 		for _, au := range aus {
 			sendAsync(au)
 		}
-		if still && len(aus) == 1 && !aus[0].Keyframe {
+		// Refine-AU не кешуємо як keepalive: його залишок поверх іншого
+		// референсу зіпсував би картинку.
+		if still && refineQP == 0 && len(aus) == 1 && !aus[0].Keyframe {
 			cp := aus[0]
 			lastStillAU, lastStillEnc, lastStillSentAt = &cp, s.encoder(), time.Now()
 		}
 
 		if time.Since(lastLog) >= 5*time.Second {
-			log.Printf("oo-agent: sent=%d dropped=%d keepalives=%d throttled=%d", sent.Load(), dropped.Load(), keepalives, throttled)
+			log.Printf("oo-agent: sent=%d dropped=%d keepalives=%d refines=%d throttled=%d", sent.Load(), dropped.Load(), keepalives, refines, throttled)
 			dropped.Store(0)
 			lastLog = time.Now()
 		}

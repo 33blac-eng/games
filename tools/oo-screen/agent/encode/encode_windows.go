@@ -425,6 +425,24 @@ func (e *Encoder) SetBitrate(bps int) error {
 	return nil
 }
 
+// SetRefineQP switches the following Encode calls to static-screen refine
+// (ТЗ P4): qp>0 asks the MFT for that per-frame QP and caps MaxQP at it; 0
+// restores normal rate control. The per-sample QP is set even when the MFT
+// refuses MaxQP — that refusal is still returned, so the caller can log it.
+func (e *Encoder) SetRefineQP(qp int) error {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.closed {
+		return ErrClosed
+	}
+	buf := (*C.char)(C.calloc(256, 1))
+	defer C.free(unsafe.Pointer(buf))
+	if C.oos_enc_set_refine_qp(e.e, C.int32_t(qp), buf, 256) != C.OOS_ENC_OK {
+		return fmt.Errorf("encode: set refine qp %d: %s", qp, C.GoString(buf))
+	}
+	return nil
+}
+
 // Flush is the reset path of plan §5.5: drain what the MFT holds, discard the
 // reference state (MFT_MESSAGE_COMMAND_FLUSH), restart streaming and force an
 // IDR. Everything still buffered is dropped — the video epoch is over, so no
