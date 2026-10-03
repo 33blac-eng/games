@@ -1699,13 +1699,16 @@ func primeViewerLocked(ns *nodeSession, vl *viewerLeg) bool {
 	if len(pkts) == 0 {
 		return false
 	}
+	// Все-або-нічого: частково вкладений кеш при primeSlack=0 дав би
+	// неперервний лише до розриву потік — живі пакети різались би як
+	// відставання. Під ns.mu черга лише спорожнюється (читач — writer-горутина),
+	// тож вільне місце, виміряне тут, не зменшиться до кінця циклу.
+	if cap(vl.out)-len(vl.out) < len(pkts) {
+		log.Printf("gop prime [node=%s]: черга глядача не вмістить кеш (%d пакетів) — лишаємо keyframe_request", ns.nodeID, len(pkts))
+		return false
+	}
 	for _, p := range pkts {
-		select {
-		case vl.out <- p:
-		default:
-			log.Printf("gop prime [node=%s]: черга глядача не вмістила кеш — лишаємо keyframe_request", ns.nodeID)
-			return false
-		}
+		vl.out <- p
 	}
 	vl.primeSlack = len(pkts)
 	log.Printf("gop prime [node=%s]: віддано %d кешованих пакетів від останнього IDR", ns.nodeID, len(pkts))
