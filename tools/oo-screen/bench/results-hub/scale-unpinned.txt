@@ -1,0 +1,10 @@
+=== 10 x 8
+RESULT {"Nodes":10,"ViewersPerNode":8,"ViewersOK":80,"Failed":0,"Silent":4,"CorpusMbps":7.979840403191935,"HubCPU":85.61299620445264,"HubRSSMB":389.0859375,"HubRSSMaxMB":389.0859375,"HubThreads":11,"Goroutines":1724,"ClientCPU":81.87149871521676,"RecvMbpsPerViewer":7.163783623666528,"RecvMbpsMin":0,"LossPct":0.11003427705862812,"LatP50":0,"LatP95":0,"LatP99":0,"LatMax":0,"LatSamples":0,"PLIs":1,"SysIdlePct":0.7883869353022149,"RcvbufErrors":0}
+=== 10 x 16
+RESULT {"Nodes":10,"ViewersPerNode":16,"ViewersOK":160,"Failed":0,"Silent":64,"CorpusMbps":7.979840403191935,"HubCPU":91.67972300729551,"HubRSSMB":440.125,"HubRSSMaxMB":534.375,"HubThreads":12,"Goroutines":1826,"ClientCPU":84.26882999541921,"RecvMbpsPerViewer":3.9746589841473665,"RecvMbpsMin":0,"LossPct":1.6346595827239352,"LatP50":0,"LatP95":0,"LatP99":0,"LatMax":0,"LatSamples":0,"PLIs":11,"SysIdlePct":0.6743256743256743,"RcvbufErrors":0}
+=== 50 x 1
+RESULT {"Nodes":50,"ViewersPerNode":1,"ViewersOK":50,"Failed":0,"Silent":19,"CorpusMbps":7.979840403191935,"HubCPU":81.94354249774231,"HubRSSMB":412.34765625,"HubRSSMaxMB":517.3046875,"HubThreads":11,"Goroutines":1586,"ClientCPU":79.64685206590008,"RecvMbpsPerViewer":4.617508077443884,"RecvMbpsMin":0,"LossPct":1.9636718249785756,"LatP50":0,"LatP95":0,"LatP99":0,"LatMax":0,"LatSamples":0,"PLIs":0,"SysIdlePct":1.3187641296156745,"RcvbufErrors":333}
+=== 50 x 4
+RESULT {"Nodes":50,"ViewersPerNode":4,"ViewersOK":200,"Failed":0,"Silent":143,"CorpusMbps":7.979840403191935,"HubCPU":88.61494675789896,"HubRSSMB":492.23828125,"HubRSSMaxMB":633.79296875,"HubThreads":11,"Goroutines":1768,"ClientCPU":86.87092289050837,"RecvMbpsPerViewer":1.4880405767996703,"RecvMbpsMin":0,"LossPct":5.874531771186896,"LatP50":0,"LatP95":0,"LatP99":0,"LatMax":0,"LatSamples":0,"PLIs":20,"SysIdlePct":0.44943820224719105,"RcvbufErrors":10289}
+=== 100 x 1
+DONE

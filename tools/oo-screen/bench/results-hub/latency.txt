@@ -1,0 +1,13 @@
+=== 1 x 1
+RESULT {"Nodes":1,"ViewersPerNode":1,"ViewersOK":1,"Failed":0,"Silent":0,"CorpusMbps":7.979840403191935,"HubCPU":5.795323667272321,"HubRSSMB":28.5234375,"HubRSSMaxMB":28.921875,"HubThreads":8,"Goroutines":50,"ClientCPU":7.244315293062298,"RecvMbpsPerViewer":7.53398151843315,"RecvMbpsMin":7.53398151843315,"LossPct":0,"LatP50":0.695071,"LatP95":2.290342,"LatP99":4.985334,"LatMax":14.779382,"LatSamples":19476,"PLIs":0,"SysIdlePct":2.5821891925935256,"RcvbufErrors":0}
+=== 1 x 4
+RESULT {"Nodes":1,"ViewersPerNode":4,"ViewersOK":4,"Failed":0,"Silent":0,"CorpusMbps":7.979840403191935,"HubCPU":8.887961638143485,"HubRSSMB":42.38671875,"HubRSSMaxMB":42.38671875,"HubThreads":8,"Goroutines":110,"ClientCPU":11.085856855608938,"RecvMbpsPerViewer":7.549759775024399,"RecvMbpsMin":7.549759775024399,"LossPct":0,"LatP50":0.91948,"LatP95":4.645191,"LatP99":8.391812,"LatMax":18.933668,"LatSamples":78112,"PLIs":0,"SysIdlePct":14.74391480730223,"RcvbufErrors":0}
+=== 1 x 16
+RESULT {"Nodes":1,"ViewersPerNode":16,"ViewersOK":16,"Failed":0,"Silent":0,"CorpusMbps":7.979840403191935,"HubCPU":21.867803188175454,"HubRSSMB":86.4296875,"HubRSSMaxMB":86.4296875,"HubThreads":8,"Goroutines":350,"ClientCPU":24.214674622908166,"RecvMbpsPerViewer":7.5440243413856365,"RecvMbpsMin":7.543028108178293,"LossPct":0,"LatP50":1.771579,"LatP95":13.107523,"LatP99":42.92567,"LatMax":67.45653,"LatSamples":312216,"PLIs":0,"SysIdlePct":33.06379155435759,"RcvbufErrors":0}
+=== 10 x 1
+RESULT {"Nodes":10,"ViewersPerNode":1,"ViewersOK":10,"Failed":0,"Silent":0,"CorpusMbps":7.979840403191935,"HubCPU":34.12528194239241,"HubRSSMB":117.91015625,"HubRSSMaxMB":117.91015625,"HubThreads":9,"Goroutines":401,"ClientCPU":37.67498239134531,"RecvMbpsPerViewer":7.533300823874332,"RecvMbpsMin":7.521512322671237,"LossPct":0,"LatP50":0.561998,"LatP95":3.08815,"LatP99":8.846512,"LatMax":66.712929,"LatSamples":194722,"PLIs":0,"SysIdlePct":25.24069737184491,"RcvbufErrors":0}
+=== 10 x 4
+RESULT {"Nodes":10,"ViewersPerNode":4,"ViewersOK":40,"Failed":0,"Silent":0,"CorpusMbps":7.979840403191935,"HubCPU":66.05498793819332,"HubRSSMB":239.86328125,"HubRSSMaxMB":239.86328125,"HubThreads":9,"Goroutines":1001,"ClientCPU":56.36181475496179,"RecvMbpsPerViewer":7.5567793696524435,"RecvMbpsMin":7.533203824811407,"LossPct":0,"LatP50":1.115096,"LatP95":7.858797,"LatP99":18.126391,"LatMax":85.509961,"LatSamples":781299,"PLIs":0,"SysIdlePct":39.16435277006479,"RcvbufErrors":0}
+DONE
+BASELINE samples=19494 p50=0.137 p95=0.764 p99=2.518 max=5.060 ms
+ALLDONE
