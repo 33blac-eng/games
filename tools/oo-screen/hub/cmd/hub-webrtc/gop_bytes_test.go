@@ -104,15 +104,15 @@ func TestGopHugePacketsHitByteCap(t *testing.T) {
 	}
 }
 
-// TestGopLongSpan — довгий GOP агента: з типовою стелею 3 с GOP 8 с не
-// кешується, з OO_SCREEN_GOP_SPAN=10s — віддається цілком. Межі прапорця
-// обрізаються.
+// TestGopLongSpan — довгий GOP агента: зі стелею 3 с GOP 8 с не кешується,
+// з OO_SCREEN_GOP_SPAN=10s і з типовою (12 с) — віддається цілком. Межі
+// прапорця обрізаються.
 func TestGopLongSpan(t *testing.T) {
 	quietNDJSON(t, nil)
 	old := gopMaxSpan
 	t.Cleanup(func() { gopMaxSpan = old })
 
-	gopMaxSpan = gopDefaultSpan
+	gopMaxSpan = clampGopSpan(3 * time.Second)
 	var g gopCache
 	g.setBitrate(4_000_000)
 	gopStream(&g, 4_000_000, 8*time.Second, 1200)
@@ -128,8 +128,16 @@ func TestGopLongSpan(t *testing.T) {
 		t.Fatalf("GOP 8 с при стелі 10 с: віддано %d, want %d (overflow=%v)", got, n, g.overflow)
 	}
 
-	if d := clampGopSpan(time.Second); d != gopDefaultSpan {
-		t.Fatalf("clamp(1s)=%s, want %s", d, gopDefaultSpan)
+	gopMaxSpan = gopDefaultSpan
+	g = gopCache{}
+	g.setBitrate(4_000_000)
+	n = gopStream(&g, 4_000_000, 10*time.Second, 1200)
+	if got := len(g.replay()); got != n {
+		t.Fatalf("GOP 10 с при типовій стелі: віддано %d, want %d (overflow=%v)", got, n, g.overflow)
+	}
+
+	if d := clampGopSpan(time.Second); d != gopMinSpan {
+		t.Fatalf("clamp(1s)=%s, want %s", d, gopMinSpan)
 	}
 	if d := clampGopSpan(time.Hour); d != gopSpanLimit {
 		t.Fatalf("clamp(1h)=%s, want %s", d, gopSpanLimit)

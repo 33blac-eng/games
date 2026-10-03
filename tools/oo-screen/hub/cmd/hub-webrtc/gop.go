@@ -24,8 +24,11 @@ import (
 const (
 	// gopMaxPackets — запобіжна стеля кешу в ПАКЕТАХ. Основна межа тепер у
 	// байтах (gopByteBudget), а ця лише гарантує, що навіть потік із крихітних
-	// пакетів не роздує зріз вказівників. 8192 ≈ 10 с на 8 Мбіт/с (~830 пак/с).
-	gopMaxPackets = 8192
+	// пакетів не роздує зріз вказівників. 16384 ≈ 20 с на 8 Мбіт/с (~830
+	// пак/с): з GOP агента 10 с (-gop-seconds) кеш упирається в байти
+	// (gopMaxBytes), а не в цей запобіжник — 8192 різав хвіст GOP 10 с на
+	// 8 Мбіт/с (RESULTS-hub.md S5).
+	gopMaxPackets = 16384
 	// gopMaxBytes — жорстка стеля кешу в БАЙТАХ на одну ноду, незалежно від
 	// бітрейту й прапорця: що б не прислав агент, більше за це хаб не тримає.
 	gopMaxBytes = 12 << 20
@@ -40,9 +43,15 @@ const (
 	// (заголовок RTP + сама структура). Без цього потік із порожніх payload-ів
 	// не впирався б у байтову стелю зовсім.
 	gopPacketOverhead = 64
-	// gopDefaultSpan — типова стеля кешу в часі RTP. GOP агента — 2 с; довший
-	// «GOP» означає, що IDR ми пропустили, і хвіст уже не самодостатній.
-	gopDefaultSpan = 3 * time.Second
+	// gopDefaultSpan — типова стеля кешу в часі RTP. GOP агента — 10 с
+	// (-gop-seconds), стеля трохи більша: довший «GOP» означає, що IDR ми
+	// пропустили, і хвіст уже не самодостатній. Памʼять однаково тримає
+	// gopMaxBytes; на переповненні (високий бітрейт) нога не primed і хаб
+	// просить keyframe — агент відповідає IDR.
+	gopDefaultSpan = 12 * time.Second
+	// gopMinSpan — найменша стеля, яку дозволяє OO_SCREEN_GOP_SPAN (агент із
+	// -gop-seconds 2 може жити з 3 с і меншим хвостом на приєднанні).
+	gopMinSpan = 3 * time.Second
 	// gopSpanLimit — найбільший проміжок, який дозволяє OO_SCREEN_GOP_SPAN.
 	// Кеш на хвилину — це вже не «миттєвий старт», а відео хвилинної давнини;
 	// пам'ять при цьому однаково тримає gopMaxBytes.
@@ -52,17 +61,16 @@ const (
 )
 
 // gopMaxSpan — стеля кешу в часі RTP. Налаштовується OO_SCREEN_GOP_SPAN
-// (формат time.ParseDuration), коли агент кодує з довшим GOP: ставити її треба
-// трохи БІЛЬШОЮ за GOP агента (GOP 2 с -> 3 с, GOP 8 с -> 10 с). Без змінної —
-// сьогоднішні 3 с. Змінна, а не os.Getenv на місці: тести перемикають напряму.
+// (формат time.ParseDuration), коли агент кодує з іншим GOP: ставити її треба
+// трохи БІЛЬШОЮ за GOP агента (GOP 2 с -> 3 с, GOP 10 с -> 12 с). Без змінної —
+// 12 с під типовий GOP агента 10 с. Змінна, а не os.Getenv на місці: тести перемикають напряму.
 var gopMaxSpan = clampGopSpan(envDuration("OO_SCREEN_GOP_SPAN", gopDefaultSpan))
 
-// clampGopSpan обрізає проміжок до [gopDefaultSpan, gopSpanLimit]: коротша за
-// типову стеля лише ламала б кеш на штатному GOP 2 с, довша за ліміт — див.
-// gopSpanLimit.
+// clampGopSpan обрізає проміжок до [gopMinSpan, gopSpanLimit]: коротша
+// стеля ламала б кеш навіть на GOP 2 с, довша за ліміт — див. gopSpanLimit.
 func clampGopSpan(d time.Duration) time.Duration {
-	if d < gopDefaultSpan {
-		return gopDefaultSpan
+	if d < gopMinSpan {
+		return gopMinSpan
 	}
 	if d > gopSpanLimit {
 		return gopSpanLimit
