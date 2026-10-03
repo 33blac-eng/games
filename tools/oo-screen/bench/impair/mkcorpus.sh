@@ -8,7 +8,8 @@ set -eu
 OUT="${1:?тека}"; SECS="${2:-10}"
 SRC="$(dirname "$0")/../corpus/code-dark-1080p.png"
 mkdir -p "$OUT"
-for b in 8000000 4000000 2000000 1000000 500000; do
+# LADDER_BPS — свій набір щаблів (run_network_p0.sh: 16 щаблів ~x1.2).
+for b in ${LADDER_BPS:-8000000 4000000 2000000 1000000 500000}; do
   f="$OUT/ladder-$b.h264"
   [ -s "$f" ] && continue
   k=$((b/1000))

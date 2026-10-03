@@ -144,6 +144,11 @@ func main() {
 			log.Fatalf("ladder: %v", err)
 		}
 		offerBitrate = lad.levels[len(lad.levels)-1].bps
+		if os.Getenv("OO_CORPUS_LADDER_ALIGNED") == "1" {
+			if err := lad.setAligned(); err != nil {
+				log.Fatalf("ladder: %v", err)
+			}
+		}
 	}
 	var aus []h264.AU
 	if lad == nil {
