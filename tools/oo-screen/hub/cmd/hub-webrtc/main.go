@@ -149,6 +149,13 @@ var (
 	// OO_SCREEN_ICE_TCP_PORT — порт ICE-TCP. 0 (дефолт) = TCP не слухаємо
 	// зовсім і NetworkTypes лишаються суто UDP.
 	iceTCPPort = envPort("OO_SCREEN_ICE_TCP_PORT", 0)
+	// N5: OO_SCREEN_ICE_TCP_ADVERTISE_PORT — порт, який хаб ОГОЛОШУЄ в
+	// TCP-кандидатах, якщо він відрізняється від порту, який слухає. Типовий
+	// прод: nginx `stream` тримає 443 і за ssl_preread віддає не-TLS потоки
+	// (ICE-TCP, RFC 4571) на 127.0.0.1:OO_SCREEN_ICE_TCP_PORT, а TLS — на
+	// HTTPS. Тоді глядач мусить стукати в 443, а не в внутрішній порт.
+	// 0 (дефолт) = оголошувати той, що слухаємо (поведінка як до N5).
+	iceTCPAdvertisePort = envPort("OO_SCREEN_ICE_TCP_ADVERTISE_PORT", 0)
 	// OO_SCREEN_STUN_URLS — список через кому ("stun:host:3478,stun:...").
 	stunURLs = envOr("OO_SCREEN_STUN_URLS", "")
 	// TURN — усі три змінні мають сенс лише разом; будь-яка порожня вимикає.
@@ -629,6 +636,7 @@ var iceTCPMux struct {
 	once  sync.Once
 	apply func(*webrtc.SettingEngine)
 	err   error
+	ln    net.Listener // для тестів: закрити слухача між прогонами
 }
 
 // iceTCPReadBuffer — скільки пакетів тримати в буфері одного TCP-стріму до
@@ -650,6 +658,7 @@ func applyICETCPMux(se *webrtc.SettingEngine) error {
 			iceTCPMux.err = fmt.Errorf("ICE TCP mux :%d: %w", iceTCPPort, err)
 			return
 		}
+		iceTCPMux.ln = ln
 		mux := webrtc.NewICETCPMux(nil, ln, iceTCPReadBuffer)
 		iceTCPMux.apply = func(se *webrtc.SettingEngine) { se.SetICETCPMux(mux) }
 		log.Printf("ICE TCP mux слухає :%d (запасний шлях для глядача за firewall-ом)", iceTCPPort)
@@ -659,6 +668,36 @@ func applyICETCPMux(se *webrtc.SettingEngine) error {
 	}
 	iceTCPMux.apply(se)
 	return nil
+}
+
+// advertiseICETCPPort (N5) переписує порт у TCP-кандидатах answer-а з того,
+// який хаб слухає (OO_SCREEN_ICE_TCP_PORT), на той, у який має стукати глядач
+// (OO_SCREEN_ICE_TCP_ADVERTISE_PORT, напр. 443 за nginx stream). pion не вміє
+// «NAT 1:1 для порту», тому правимо SDP: кандидати в answer-і повні (ми чекаємо
+// GatheringComplete), trickle немає. UDP-кандидати не чіпаються.
+//
+// Формат рядка (RFC 8839): a=candidate:<f> <comp> <transport> <prio> <addr>
+// <port> typ <type> [...]. Міняємо поле port, лише якщо transport=tcp і
+// port == порт слухача — так активні (port 9) і чужі кандидати лишаються.
+func advertiseICETCPPort(sdp string) string {
+	if iceTCPPort == 0 || iceTCPAdvertisePort == 0 || iceTCPAdvertisePort == iceTCPPort {
+		return sdp
+	}
+	from := strconv.Itoa(int(iceTCPPort))
+	to := strconv.Itoa(int(iceTCPAdvertisePort))
+	lines := strings.Split(sdp, "\n")
+	for i, ln := range lines {
+		if !strings.HasPrefix(ln, "a=candidate:") {
+			continue
+		}
+		f := strings.Split(ln, " ")
+		if len(f) < 6 || !strings.EqualFold(f[2], "tcp") || strings.TrimRight(f[5], "\r") != from {
+			continue
+		}
+		f[5] = strings.Replace(f[5], from, to, 1)
+		lines[i] = strings.Join(f, " ")
+	}
+	return strings.Join(lines, "\n")
 }
 
 // newAPI будує API для ОДНІЄЇ ноги. profile — profile-level-id, який ця нога
@@ -1068,7 +1107,7 @@ func handleOffer(leg string) http.HandlerFunc {
 		}
 
 		answered = true
-		writeJSON(w, answerResp{SDP: pc.LocalDescription().SDP, SessionID: sessionID})
+		writeJSON(w, answerResp{SDP: advertiseICETCPPort(pc.LocalDescription().SDP), SessionID: sessionID})
 	}
 }
 
@@ -1677,7 +1716,7 @@ func renegotiateViewer(w http.ResponseWriter, req offerReq) {
 		return
 	}
 	log.Printf("renegotiate [node=%s]: viewer leg ICE restarted", ns.nodeID)
-	writeJSON(w, answerResp{SDP: pc.LocalDescription().SDP, SessionID: req.SessionID})
+	writeJSON(w, answerResp{SDP: advertiseICETCPPort(pc.LocalDescription().SDP), SessionID: req.SessionID})
 }
 
 func drainRTCP(read func([]byte) (int, interceptor.Attributes, error), tag string) {

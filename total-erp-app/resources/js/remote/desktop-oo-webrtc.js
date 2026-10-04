@@ -315,6 +315,77 @@ export function labelFor(mode) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// N5: ICE-конфіг для суворих офісних firewall-ів (лише TCP 443)
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// Хаб сам є медіа-кінцем, тож головний запасний шлях — ICE-TCP на 443 хаба
+// (OO_SCREEN_ICE_TCP_ADVERTISE_PORT): для нього браузеру НЕ потрібен жоден
+// iceServer, кандидат приходить в answer-і. iceServers із config/ERP
+// потрібні для другого рубежу — TURN-TLS (turns:host:443?transport=tcp) там,
+// де DPI пропускає на 443 лише справжній TLS.
+//
+// UDP завжди має перевагу без жодної логіки з нашого боку: ICE дає host/UDP
+// найвищий пріоритет, TCP-host нижчий, relay — найнижчий, і пари
+// перевіряються паралельно. Тому iceTransportPolicy лишається 'all' —
+// 'relay' вимкнув би UDP і в офісі, де він є. Тут лише чистимо вхід:
+// невалідний запис (TURN без облікових даних, чужа схема) з ERP не має
+// ламати конструктор RTCPeerConnection — той кидає на ВСЬОМУ списку.
+
+const ICE_URL_RE = /^(stun|stuns|turn|turns):[^\s]+$/i;
+
+// iceUrlRank — порядок у списку: UDP-варіанти першими, turns (TLS) останнім.
+// На пріоритет кандидатів це не впливає (його рахує ICE), але Chrome опитує
+// сервери по черзі, і так дешеві запити йдуть раніше.
+function iceUrlRank(u) {
+    const s = u.toLowerCase();
+    if (s.startsWith('stun')) return 0;
+    if (s.startsWith('turns:')) return 3;
+    if (s.includes('transport=tcp')) return 2;
+    return 1;
+}
+
+/**
+ * normalizeIceServers — RTCIceServer[] з config/ERP, придатний для
+ * RTCPeerConnection: лише stun/stuns/turn/turns-URL, TURN — лише з
+ * username+credential, сортування UDP → TCP → TLS. Не масив → [].
+ */
+export function normalizeIceServers(list) {
+    if (!Array.isArray(list)) return [];
+    const out = [];
+    for (const s of list) {
+        if (!s || typeof s !== 'object') continue;
+        const urls = (Array.isArray(s.urls) ? s.urls : [s.urls])
+            .filter((u) => typeof u === 'string' && ICE_URL_RE.test(u.trim()))
+            .map((u) => u.trim());
+        const turn = urls.filter((u) => /^turns?:/i.test(u));
+        const stun = urls.filter((u) => /^stuns?:/i.test(u));
+        const hasCreds = typeof s.username === 'string' && s.username !== ''
+            && typeof s.credential === 'string' && s.credential !== '';
+        const keep = hasCreds ? stun.concat(turn) : stun;
+        if (!keep.length) continue;
+        keep.sort((a, b) => iceUrlRank(a) - iceUrlRank(b));
+        const e = { urls: keep };
+        if (hasCreds && turn.length) { e.username = s.username; e.credential = s.credential; }
+        out.push(e);
+    }
+    out.sort((a, b) => iceUrlRank(a.urls[0]) - iceUrlRank(b.urls[0]));
+    return out;
+}
+
+/**
+ * buildRtcConfig — RTCConfiguration глядача. config.iceTransportPolicy
+ * 'relay' — лише для діагностики («чи живий TURN»); будь-що інше = 'all'.
+ */
+export function buildRtcConfig(config) {
+    const c = config || {};
+    return {
+        iceServers: normalizeIceServers(c.iceServers),
+        iceTransportPolicy: c.iceTransportPolicy === 'relay' ? 'relay' : 'all',
+        bundlePolicy: 'max-bundle',
+    };
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // DOM-шар: overlay <video> + RTCPeerConnection recvonly
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -325,6 +396,7 @@ export function labelFor(mode) {
  * @param {object}   o.meshDesktop
  * @param {object}   o.config  { requestTicket, firstFrameMs?, frameAgeMs?,
  *                               geometryTimeoutMs?, offerTimeoutMs?, iceServers?,
+ *                               iceTransportPolicy?,
  *                               disconnectGraceMs? }
  *   requestTicket() → Promise<{ticket, signalUrl}> — §6.4 свіжий одноразовий
  *   ticket на цю ноду; offer їде з ticket, НЕ з довгоживучим токеном (BLOCKER-1/3).
@@ -840,7 +912,7 @@ export function createOoWebrtcLayer(o) {
     }
 
     async function connect(gen) {
-        const peer = new RTCPeerConnection({ iceServers: config.iceServers || [] });
+        const peer = new RTCPeerConnection(buildRtcConfig(config));
         pc = peer;
         peer.addTransceiver('video', { direction: 'recvonly' });
         // Звук — під тим самим прапорцем, що й на хабі (OO_SCREEN_AUDIO), лише з

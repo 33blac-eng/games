@@ -174,6 +174,7 @@ sudo sh -c 'umask 077; grep ^OO_SCREEN_AGENT_SECRET= /etc/oo-screen/hub.env | cu
 | `OO_SCREEN_ICE_PORT` | = `OO_SCREEN_UDP_PORT_MIN` або `4544` | єдиний UDP-порт ICE-mux |
 | `OO_SCREEN_UDP_PORT_MIN` | `4544` | легасі, дефолт для ICE_PORT |
 | `OO_SCREEN_ICE_TCP_PORT` | `0` (вимк.) | порт ICE-TCP |
+| `OO_SCREEN_ICE_TCP_ADVERTISE_PORT` **нова** | `0` (= ICE_TCP_PORT) | порт у TCP-кандидатах answer-а, коли 443 тримає nginx `stream` (§9) |
 | `OO_SCREEN_PUBLIC_IP` | авто | публічний IP для host-кандидатів (NAT 1:1) |
 | `OO_SCREEN_STUN_URLS` | порожньо | STUN через кому |
 | `OO_SCREEN_TURN_URL` / `_USER` / `_PASS` | порожньо | TURN; лише всі три разом |
@@ -209,3 +210,201 @@ sudo sh -c 'umask 077; grep ^OO_SCREEN_AGENT_SECRET= /etc/oo-screen/hub.env | cu
 | `OO_SCREEN_INPUT` | вимк. | `1` = `-input` |
 
 Стендові: `OO_SCREEN_HUB_URL` (corpus-player), `OO_SCREEN_T1_TOKEN` у `hub-wt`/`loadgen`.
+
+## 9. N5: глядач за суворим firewall-ом (назовні лише TCP 443)
+
+Офісний firewall ріже весь UDP і всі порти, крім TCP 443. Шляхи, які глядач
+пробує сам (ICE перевіряє пари паралельно, пріоритет рахує браузер — вручну
+нічого вибирати не треба):
+
+1. **UDP host** `хаб:4544/udp` — як і досі, найкращий, якщо UDP є.
+2. **ICE-TCP passive на 443** — хаб сам слухає ICE-TCP (RFC 6544, кадри
+   RFC 4571), браузер підключається активно. Жодного relay і жодного
+   iceServer у браузера: кандидат приходить в answer-і хаба. **Основний
+   запасний шлях** (реалізовано; тест `TestN5TCPOnlyViewerPlays`).
+3. **TURN-TLS на 443** (coturn) — лише для firewall-ів із DPI, що на 443
+   пропускають тільки справжній TLS (ICE-TCP — не TLS). Зайвий hop і TLS
+   поверх TCP; вмикається через iceServers з ERP.
+4. WebSocket-транспорт медіа — **не робимо**: TURN-TLS закриває той самий
+   випадок стандартно, а свій транспорт означав би свій jitter-буфер і NACK
+   у плеєрі.
+
+pion/turn усередині хаба теж не вбудовуємо: хаб і так кінцева точка медіа,
+тож TURN на тому самому хості не дає нічого понад ICE-TCP, крім TLS-обгортки,
+— а її дає coturn без нового коду в хабі.
+
+### 9.1 Хаб (`/etc/oo-screen/hub.env`)
+
+```ini
+OO_SCREEN_PUBLIC_IP=203.0.113.10        # публічна IP (host-кандидати, NAT 1:1)
+OO_SCREEN_ICE_PORT=4544                 # UDP, як і було
+OO_SCREEN_ICE_TCP_PORT=4443             # внутрішній ICE-TCP (назовні ЗАКРИТИЙ)
+OO_SCREEN_ICE_TCP_ADVERTISE_PORT=443    # що оголошувати глядачу: порт nginx stream
+```
+
+Якщо 443 на сервері більше нікому не потрібен — простіше
+`OO_SCREEN_ICE_TCP_PORT=443` без `_ADVERTISE_PORT` і без nginx (юніту тоді
+потрібен `AmbientCapabilities=CAP_NET_BIND_SERVICE`).
+
+### 9.2 nginx: 443 спільний для HTTPS і ICE-TCP (`stream` + `ssl_preread`)
+
+TLS-клієнт першим шле ClientHello, ICE-TCP — STUN Binding (2 байти довжини +
+STUN). Для не-TLS потоку `$ssl_preread_protocol` порожній — за цим і ділимо.
+TLS ділиться ще й за SNI: `turn.example.com` -> coturn (TURN-TLS), решта ->
+HTTPS.
+
+```nginx
+# /etc/nginx/nginx.conf — на верхньому рівні, ПОРУЧ із http {}
+stream {
+    map $ssl_preread_protocol $oo_443_kind {
+        ""      ice;      # не TLS -> ICE-TCP (RFC 4571)
+        default tls;
+    }
+    map "$oo_443_kind:$ssl_preread_server_name" $oo_443_upstream {
+        ~^ice:                  oo_ice;
+        "tls:turn.example.com"  oo_turns;
+        default                 oo_https;
+    }
+
+    # ВАЖЛИВО: IP інтерфейсу хаба, НЕ 127.0.0.1. pion шукає ICE-сесію за
+    # (ufrag, ЛОКАЛЬНА IP з'єднання), а кандидат оголошено з IP інтерфейсу;
+    # з'єднання на loopback сесії не знаходить ("Failed to ping without
+    # candidate pairs", ICE вічно checking). Відтворено тестом: через
+    # 127.0.0.1 ICE не встає, через IP інтерфейсу — встає.
+    upstream oo_ice   { server 10.0.0.5:4443; }    # приватна IP eth0 хаба
+    upstream oo_turns { server 127.0.0.1:5349; }   # coturn tls-listening-port
+    upstream oo_https { server 127.0.0.1:8443; }   # http{} server нижче
+
+    server {
+        listen 443;
+        listen [::]:443;
+        ssl_preread on;
+        preread_timeout 5s;
+        proxy_connect_timeout 5s;
+        proxy_timeout 10m;     # ICE consent кожні ~5 с, тиші не буває
+        proxy_pass $oo_443_upstream;
+        # proxy_protocol тут НЕ вмикати: ні pion, ні coturn його не чекають.
+    }
+}
+
+http {
+    server {
+        listen 127.0.0.1:8443 ssl;   # колишній listen 443 ssl
+        http2 on;
+        server_name erp.example.com;
+        # ... ssl_certificate ..., location /oo-hub/ { proxy_pass http://127.0.0.1:4470; }
+    }
+}
+```
+
+Наслідок переїзду HTTPS за `stream`: http-сервер бачить клієнта як 127.0.0.1.
+Якщо потрібна справжня IP (rate-limit `/offer/*`, логи) — окремий
+`stream server` для HTTPS із `proxy_protocol on;` і в http
+`listen 127.0.0.1:8443 ssl proxy_protocol; set_real_ip_from 127.0.0.1;
+real_ip_header proxy_protocol;`; `OO_SCREEN_TRUSTED_PROXIES` лишити на
+127.0.0.1. Для `oo_ice` proxy_protocol ламає STUN.
+
+### 9.3 Firewall сервера
+
+```bash
+ufw allow 443/tcp            # nginx stream: HTTPS + ICE-TCP + TURN-TLS
+ufw allow 4544/udp           # ICE UDP (основний шлях)
+ufw allow 3478/udp           # coturn STUN/TURN-UDP (якщо coturn є)
+ufw allow 49160:49200/udp    # coturn relay-порти (min-port/max-port нижче)
+ufw deny  4443/tcp           # ICE-TCP хаба — лише через nginx
+ufw deny  5349/tcp           # coturn TLS — лише через nginx
+```
+
+Офісному firewall-у клієнта нічого відкривати не треба: потрібен лише
+вихідний TCP 443.
+
+### 9.4 coturn (TURN-TLS для DPI-firewall-ів)
+
+```ini
+# /etc/turnserver.conf
+listening-ip=10.0.0.5
+listening-port=3478
+tls-listening-port=5349          # TLS приходить від nginx stream (SNI turn.example.com)
+external-ip=203.0.113.10/10.0.0.5
+relay-ip=10.0.0.5
+min-port=49160
+max-port=49200
+fingerprint
+use-auth-secret
+static-auth-secret=<секрет, той самий у ERP>   # REST-креди з TTL, не статичний пароль
+realm=turn.example.com
+cert=/etc/letsencrypt/live/turn.example.com/fullchain.pem
+pkey=/etc/letsencrypt/live/turn.example.com/privkey.pem
+no-tlsv1
+no-tlsv1_1
+no-cli
+no-multicast-peers
+denied-peer-ip=0.0.0.0-255.255.255.255
+allowed-peer-ip=10.0.0.5          # relay ЛИШЕ до хаба
+allowed-peer-ip=203.0.113.10
+```
+
+`allowed-peer-ip` обмежує relay самим хабом — інакше відкритий TURN стає
+проксі в чужу мережу. `turn.example.com` має резолвитись у ту саму публічну
+IP (nginx ділить за SNI). Якщо coturn слухає TLS на 127.0.0.1, додайте
+`listening-ip=127.0.0.1` і `upstream oo_turns` на 127.0.0.1:5349 (як вище).
+
+### 9.5 ERP / плеєр
+
+Плеєр (`total-erp-app/resources/js/remote/desktop-oo-webrtc.js`) бере
+`config.iceServers` через `buildRtcConfig`/`normalizeIceServers`: лише
+stun/turn/turns, TURN — тільки з обліковими даними (інакше конструктор
+RTCPeerConnection відкинув би весь список), порядок UDP -> TCP -> TLS,
+`iceTransportPolicy: 'all'` — тож UDP завжди виграє, де він є, а TCP/TLS
+підхоплюються автоматично. Для ICE-TCP хаба iceServers **не потрібні**.
+Для TURN-TLS ERP віддає короткоживучі REST-креди coturn
+(`username = "<unix_expiry>:<user>"`, `credential = base64(HMAC-SHA1(secret,
+username))`):
+
+```js
+iceServers: [
+  { urls: 'stun:turn.example.com:3478' },
+  { urls: ['turn:turn.example.com:3478', 'turns:turn.example.com:443?transport=tcp'],
+    username: '1791200000:viewer42', credential: '<hmac>' },
+]
+```
+
+`iceTransportPolicy: 'relay'` — лише для діагностики «чи живий TURN».
+
+### 9.6 Заміри (in-process, `hub/cmd/hub-webrtc/n5_tcp443_test.go`)
+
+Глядач — pion з `SetNetworkTypes(TCP4)` (жодного UDP-кандидата — як браузер
+за таким firewall-ом); між ним і хабом — TCP-фронт замість nginx stream; хаб
+оголошує порт фронту (`_ADVERTISE_PORT`), тест перевіряє, що внутрішній порт
+в answer не потрапляє і що медіа йде через фронт. Агент шле синтетичний
+H.264 60 к/с, ~4 Мбіт/с, IDR раз на 2 с (+ на keyframe_request/PLI); кадр
+«декодовний» = побайтно цілий і ланцюг від IDR не рвався. Лінк: однобічна
+затримка 40 мс хаб -> глядач. UDP-втрата — дроп пакета + NACK pion (вікно
+SRTP 1024, як у браузера). TCP-втрату ядро на loopback не відтворює, тому
+вона змодельована: втрачений сегмент зупиняє ВЕСЬ потік за ним на
+1×RTT+10 мс (fast retransmit) або на 200 мс (RTO — оцінка зверху, коли
+кожна втрата хвостова). 30 с на сценарій:
+`OO_SCREEN_N5_BENCH=1 OO_SCREEN_N5_DUR=30s go test -run N5TCPvsUDP -v ./hub/cmd/hub-webrtc/`.
+
+| сценарій | шлях | TTFF | декодовні | лат. p50 / p95 / p99 | макс. розрив |
+|---|---|---|---|---|---|
+| чисто | UDP | 242 мс | 1787/1787 (100 %) | 58 / 61 / 75 мс | 109 мс |
+| чисто | TCP 443 | 239 мс | 1793/1793 (100 %) | 58 / 62 / 75 мс | 55 мс |
+| 1 % втрат | UDP + NACK | 342 мс | 1792/1792 (100 %) | 59 / 143 / 175 мс | 152 мс |
+| 1 % втрат | TCP, fast-retx | 281 мс | 1803/1803 (100 %) | 58 / 94 / 141 мс | 151 мс |
+| 1 % втрат | TCP, RTO 200 мс | 425 мс | 1762/1762 (100 %) | 292 / 1028 / 1328 мс | 601 мс |
+
+(58 мс = 40 мс лінку + ~18 мс хаба/депакетизації; TTFF — від offer до першого
+декодовного IDR, включно з ICE+DTLS через 40 мс лінк.)
+
+Висновок: TCP 443 дає ту саму картинку, що UDP, поки втрат немає; при 1 %
+втрат ціна HOL — це хвіст затримки, а не биті кадри (TCP нічого не губить).
+З fast retransmit хвіст навіть коротший за UDP+NACK (NACK pion опитує раз
+на 100 мс); у гіршому випадку RTO затримка накопичується до ~1 с p95 — тому
+TCP лишається **запасним** шляхом, а UDP має пріоритет.
+
+**UNVERIFIED** (потрібні справжні nginx, coturn і браузер): розбір
+`ssl_preread` ICE-TCP від Chrome/Edge/Firefox, TURN-TLS через coturn за nginx
+SNI, корпоративні DPI і явні HTTP-проксі (через CONNECT ICE-TCP не пройде;
+TURN-TLS — лише якщо браузер сам піде через проксі), справжня динаміка TCP
+(cwnd, RTO) замість моделі.
