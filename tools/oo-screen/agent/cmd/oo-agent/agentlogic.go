@@ -140,6 +140,9 @@ type webrtcTransport struct {
 	// frameInterval — 1/fps: тривалість, яку віддаємо pion, поки різниці PTS
 	// сусідніх AU ще нема (перший AU сесії). Див. sampleDuration.
 	frameInterval time.Duration
+	// ctl — oosc-ctl (агент -> hub: content_mode, videomode.go); nil до
+	// створення каналу.
+	ctl *webrtc.DataChannel
 }
 
 func newWebRTCAPI() (*webrtc.API, error) {

@@ -1048,6 +1048,7 @@ func onReceiverReportSig(ns *nodeSession, lossFrac float64, jitterTicks uint32, 
 	ns.bitrate = next
 	ns.mu.Unlock()
 	if !send {
+		tryVideoBoost(ns, now)
 		return
 	}
 	sendBitrateTarget(ns, next.target, lossFrac*100, jitterTicks, rttExcess, false)

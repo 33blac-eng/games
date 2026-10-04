@@ -34,6 +34,7 @@ import (
 	"github.com/organicoils/oo-screen/agent/capture"
 	"github.com/organicoils/oo-screen/agent/encode"
 	"github.com/organicoils/oo-screen/internal/agentcred"
+	"github.com/organicoils/oo-screen/internal/contentmode"
 	"github.com/organicoils/oo-screen/internal/control"
 	"github.com/organicoils/oo-screen/internal/cursorproto"
 	"github.com/organicoils/oo-screen/internal/envelope"
@@ -291,6 +292,7 @@ func dialWebRTC(hubURL string, frameInterval time.Duration, onKeyframeRequest fu
 	// видимого глядача) відпускала затиснуті ним клавіші й кнопки миші.
 	inj := newInputInjector()
 	onGate = releaseOnPause(inj, onGate)
+	var ctlDC *webrtc.DataChannel
 	if onGate != nil || onBitrateTarget != nil || onSelectOutput != nil {
 		ctl, dcErr := pc.CreateDataChannel("oosc-ctl", nil)
 		if dcErr != nil {
@@ -306,6 +308,7 @@ func dialWebRTC(hubURL string, frameInterval time.Duration, onKeyframeRequest fu
 			noteHubMessage(&hubLive, time.Now(), msg.Data)
 			handleCtlMessage(msg.Data, onKeyframeRequest, onGate, onBitrateTarget, onSelectOutput)
 		})
+		ctlDC = ctl
 	}
 	// Канал вводу (input.go) — ДРУГИЙ DataChannel того самого зʼєднання, у тому
 	// ж стилі, що oosc-ctl: створює його агент (він тут offerer), хаб ловить
@@ -490,7 +493,7 @@ func dialWebRTC(hubURL string, frameInterval time.Duration, onKeyframeRequest fu
 		_ = pc.Close()
 		return nil, err
 	}
-	return &webrtcTransport{pc: pc, track: track, paced: paced, atrk: atrk, frameInterval: frameInterval}, nil
+	return &webrtcTransport{pc: pc, track: track, paced: paced, atrk: atrk, frameInterval: frameInterval, ctl: ctlDC}, nil
 }
 
 // waitConnected чекає на connected, який закриває обробник стану з dialWebRTC.
@@ -909,6 +912,8 @@ func main() {
 	refineFlag := flag.Bool("refine", true, "дошліфування нерухомого екрана (ТЗ P4): через 200 мс без нових кадрів 1–2 рази перекодувати останній кадр із нижчим QP; false — вимкнути")
 	textTilesFlag := flag.Bool("text-tiles", false, "текстові тайли (STAGE3-444 B): на нерухомому дошліфованому екрані один раз слати lossless PNG-тайли кольорового тексту каналом oosc-tiles (потрібен OO_SCREEN_TILES=1 на хабі і config.textTiles у плеєрі)")
 	textFPS := flag.Int("text-fps", 15, "стеля FPS у текстовому режимі (gap #2: набір/читання — дрібні dirty rects); 0 = не обмежувати. Вихід із режиму (рух) знімає стелю миттєво")
+	videoModeFlag := flag.Bool("video-mode", false, "режим «Відео» (internal/contentmode): тривалий рух великої площі (відео, прокрутка) -> до -video-fps на апаратному енкодері, що встигає, і прохання до hub підняти бітрейт у межах стелі; поза ним кадри вмісту не частіше -fps. UNVERIFIED на Windows")
+	videoFPS := flag.Int("video-fps", 60, "частота в режимі «Відео» (лише з -video-mode)")
 	gopSeconds := flag.Int("gop-seconds", 10, "інтервал періодичного IDR, с (ТЗ 1.4). Довгий GOP = менше важких IDR (див. bench/quality/RESULTS-workloads.md); новий глядач отримує кадр із GOP-кешу хаба (OO_SCREEN_GOP_SPAN, дефолт 12s ≥ GOP, макс 30s) або IDR на keyframe_request/PLI. >11 вимагає на хабі більшого OO_SCREEN_GOP_SPAN")
 	flag.Parse()
 
@@ -1227,6 +1232,10 @@ func main() {
 	// frameInterval рахуємо ДО dial: webrtcTransport бере його як тривалість
 	// першого AU (sampleDuration), і кожен реконект створює транспорт заново.
 	frameInterval := time.Second / time.Duration(effectiveFPS)
+	// tickFPS/tickInterval — годинник PTS (videomode.go): з -video-mode тікає
+	// 1/video-fps, щоб 60 к/с мали власні мітки; інакше = frameInterval.
+	tickFPS := videoTickFPS(*videoModeFlag, effectiveFPS, *videoFPS)
+	tickInterval := time.Second / time.Duration(tickFPS)
 
 	// pcDown — друга (і головна) причина реконекту поряд із txErrCh: стан
 	// PeerConnection. Буфер 1 + неблокуючий запис: причина потрібна одна, а
@@ -1268,7 +1277,13 @@ func main() {
 		// стеля FPS (-text-fps, textfps.go): у текстовому режимі кодуємо не
 		// частіше за textModeGap; затриманий кадр дошлемо, щойно щілина
 		// відкриється (textPending).
-		textDet         = textmode.New(textmode.Config{})
+		// Один автомат Text / Normal / Video (internal/contentmode); без
+		// -video-mode це рівно колишній textmode-детектор.
+		contentDet      = contentmode.New(contentmode.Config{NoVideo: !*videoModeFlag})
+		contentMode     contentmode.Mode
+		contentCtlAt    time.Time
+		contentCtlSeq   uint64
+		encSecEWMA      float64
 		textOn          bool
 		textPending     bool
 		textThrottled   int
@@ -1302,6 +1317,30 @@ func main() {
 		tpMu        sync.Mutex // guards tp across reconnects; the single ordered sender goroutine reads it under this lock
 		sendQueue   = make(chan sendJob, 8)
 	)
+
+	// onContentMode — новий стан автомата Text / Normal / Video. textOn —
+	// рівно «режим Text» (у Video текстова стеля не діє ніколи); з
+	// -video-mode зміна режиму (і повтор у Video) іде hub-у content_mode.
+	onContentMode := func(mode contentmode.Mode, flipped bool) {
+		contentMode = mode
+		textOn = mode == contentmode.Text
+		if flipped {
+			c, m := contentDet.TextDetector().Smoothed()
+			log.Printf("oo-agent: content mode=%v (changed≈%.3f moved≈%.3f, no-op skipped=%d, text-throttled=%d, enc≈%.1fms)",
+				mode, c, m, noChangeSkipped, textThrottled, encSecEWMA*1e3)
+		}
+		if !videoCtlDue(*videoModeFlag, flipped, mode, time.Since(contentCtlAt)) {
+			return
+		}
+		contentCtlAt = time.Now()
+		contentCtlSeq++
+		tpMu.Lock()
+		cur := tp
+		tpMu.Unlock()
+		if err := sendContentMode(cur, contentCtlSeq, mode); err != nil && flipped {
+			log.Printf("oo-agent: content_mode %v not sent: %v", mode, err)
+		}
+	}
 
 	// Один ordered sender: усі AU (у т.ч. кілька з одного enc.Encode виклику,
 	// напр. IDR+trailing delta AU з тієї самої кодованої картинки) ідуть через
@@ -1368,10 +1407,10 @@ func main() {
 			return
 		}
 		now := time.Now()
-		captureSeq += seqAdvance(now.Sub(lastSeqAt), frameInterval)
+		captureSeq += seqAdvance(now.Sub(lastSeqAt), tickInterval)
 		lastSeqAt = now
 		au := *lastStillAU
-		au.PTS = time.Duration(captureSeq) * time.Second / time.Duration(effectiveFPS)
+		au.PTS = time.Duration(captureSeq) * time.Second / time.Duration(tickFPS)
 		tilesStill()
 		sendAsync(au)
 		lastStillSentAt = now
@@ -1590,7 +1629,8 @@ loop:
 		}
 		waitFor := refiner.Wait(time.Now(), keepaliveAfter)
 		refineWait := waitFor < keepaliveAfter
-		textGap := textModeGap(*textFPS, s.fps, textOn)
+		vIn := contentmode.FPSInput{BaseFPS: s.fps, VideoFPS: *videoFPS, Hardware: !s.software, EncSec: encSecEWMA}
+		textGap := max(textModeGap(*textFPS, s.fps, textOn), videoModeGap(*videoModeFlag, contentMode, vIn))
 		waitFor, textWait := textFlushWait(textPending, textGap, time.Since(lastAdmitAt), waitFor)
 		if textWait {
 			refineWait = false // прокинулись заради дошлення, не заради refine
@@ -1617,6 +1657,9 @@ loop:
 				s.releaseCapture()
 				continue
 			}
+		}
+		if *videoModeFlag && (err != nil || frame.NoChange) {
+			onContentMode(contentDet.Tick(time.Now()))
 		}
 		still := false
 		refineQP := 0
@@ -1657,17 +1700,10 @@ loop:
 			// Текстові тайли: invalidate ДО кодування цього кадру (tiles.go).
 			tilesMotion()
 			textCF = capture.ChangedFraction(frame)
-			if textDet != nil {
-				text, flipped := textDet.Update(
-					textCF,
-					textmode.Fraction(frame.MoveArea, frame.Width, frame.Height))
-				textOn = text
-				if flipped {
-					c, m := textDet.Smoothed()
-					log.Printf("oo-agent: text mode=%v (changed≈%.3f moved≈%.3f, no-op skipped=%d, text-throttled=%d)",
-						text, c, m, noChangeSkipped, textThrottled)
-				}
-			}
+			mode, flipped := contentDet.Update(
+				textCF,
+				textmode.Fraction(frame.MoveArea, frame.Width, frame.Height), time.Now())
+			onContentMode(mode, flipped)
 		case ctx.Err() != nil:
 			break loop // зупиняють агента, а не просто екран стоїть
 		case refineWait && errors.Is(err, context.DeadlineExceeded):
@@ -1745,7 +1781,7 @@ loop:
 		// кадр справді чекали, на стільки й зсуваємо. Тут же, до admission —
 		// щоб і викинутий кадр не лишав RTP позаду стінного часу.
 		now := time.Now()
-		captureSeq += seqAdvance(now.Sub(lastSeqAt), frameInterval)
+		captureSeq += seqAdvance(now.Sub(lastSeqAt), tickInterval)
 		lastSeqAt = now
 
 		// A-08: рух миші без змін на столі (DXGI: LastPresentTime==0) — не
@@ -1790,7 +1826,10 @@ loop:
 		// пропустити, тож ефективна стеля = min. still (keepalive/refine) і
 		// дошлення затриманого не чіпаємо. Вихід із текстового режиму вже
 		// обнулив textGap на цьому ж кадрі (textOn оновлено вище).
-		if g := textModeGap(*textFPS, s.fps, textCapApplies(textOn, textCF)); g > 0 && !still && !textFlush && now.Sub(lastAdmitAt) < g {
+		// -video-mode: кадри вмісту не частіше contentmode.FPS(режим) — той
+		// самий механізм затримки/дошлення, що й текстова стеля.
+		vIn = contentmode.FPSInput{BaseFPS: s.fps, VideoFPS: *videoFPS, Hardware: !s.software, EncSec: encSecEWMA}
+		if g := max(textModeGap(*textFPS, s.fps, textCapApplies(textOn, textCF)), videoModeGap(*videoModeFlag, contentMode, vIn)); g > 0 && !still && !textFlush && now.Sub(lastAdmitAt) < g {
 			textPending = true
 			textThrottled++
 			continue
@@ -1810,7 +1849,7 @@ loop:
 		textPending = false
 
 		encFrame := encode.Frame{
-			PTS: time.Duration(captureSeq) * time.Second / time.Duration(effectiveFPS),
+			PTS: time.Duration(captureSeq) * time.Second / time.Duration(tickFPS),
 		}
 		if s.software {
 			encFrame.Y = frame.Y
@@ -1850,6 +1889,9 @@ loop:
 		}
 		encStart := time.Now()
 		aus, err := s.encoder().Encode(encFrame)
+		if err == nil && !still {
+			encSecEWMA = encEWMA(encSecEWMA, time.Since(encStart))
+		}
 		if swPol != nil && swPolEnc == s.encoder() && s.software && err == nil {
 			if d := swPol.Observe(time.Since(encStart), time.Now()); d.Changed {
 				// Роздільність софт-шлях не масштабує (submit_cpu ріже, а не

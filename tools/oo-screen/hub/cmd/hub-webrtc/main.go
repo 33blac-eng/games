@@ -293,8 +293,10 @@ type nodeSession struct {
 	// startBps — фактичний стартовий -bitrate агента з offer (стеля адаптації),
 	// 0 = агент поля не прислав -> фолбек startBitrateBps; lastKeyframeReq —
 	// дебаунс keyframe_request. Усі три під ns.mu.
-	bitrate         bitrateCtl
-	startBps        uint64
+	bitrate  bitrateCtl
+	startBps uint64
+	// videoMode — агент повідомив content_mode "video" (videoboost.go).
+	videoMode       bool
 	lastKeyframeReq time.Time
 	// kfTrailing — у дебаунс-вікні вже заплановано ОДИН відкладений
 	// keyframe-запит (requestKeyframe). Під ns.mu.
@@ -1214,6 +1216,10 @@ func setupAgentLeg(ns *nodeSession, pc *webrtc.PeerConnection) error {
 			ns.mu.Lock()
 			ns.agentCtrl, ns.agentChanPC = dc, pc
 			ns.mu.Unlock()
+			// Агент -> hub: content_mode (режим «Відео», videoboost.go).
+			dc.OnMessage(func(msg webrtc.DataChannelMessage) {
+				handleAgentCtl(ns, msg.Data, time.Now())
+			})
 			// Пульс заводиться разом із гейтом і живе рівно стільки, скільки
 			// цей канал (heartbeat.go). Без нього агент на паузі не має ЖОДНОЇ
 			// ознаки, що хаб іще живий.

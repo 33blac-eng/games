@@ -54,6 +54,10 @@ const (
 	TypeFallbackReason  = "fallback_reason"
 	TypeShutdown        = "shutdown"
 	TypeAck             = "ack"
+	// TypeContentMode — агент -> hub: режим вмісту (contentmode: "video",
+	// "text", "normal"). У "video" hub може підняти ціль бітрейту, але лише в
+	// межах власної стелі ноди і поки мережа чиста (hub/cmd/hub-webrtc).
+	TypeContentMode = "content_mode"
 )
 
 var knownTypes = map[string]bool{
@@ -67,6 +71,7 @@ var knownTypes = map[string]bool{
 	TypeFallbackReason:  true,
 	TypeShutdown:        true,
 	TypeAck:             true,
+	TypeContentMode:     true,
 }
 
 // IsKnownType повідомляє, чи цей пакет розпізнає даний тип повідомлення.
@@ -89,6 +94,8 @@ type Msg struct {
 	// свідомо, а не випадково — окремого «не задано» цьому типу не потрібно:
 	// сам type і є наміром, а індекс без значення = основний вихід.
 	Output int `json:"output,omitempty"`
+	// Mode — режим вмісту для content_mode ("video" | "text" | "normal").
+	Mode string `json:"mode,omitempty"`
 }
 
 // --- Конструктори по одному на тип повідомлення ---
@@ -132,6 +139,11 @@ func FallbackReason(seq uint64, reason string) Msg {
 
 func Shutdown(seq uint64, reason string) Msg {
 	return Msg{V: Version, Type: TypeShutdown, Seq: seq, Reason: reason}
+}
+
+// ContentMode — агент повідомляє hub про зміну режиму вмісту (-video-mode).
+func ContentMode(seq uint64, mode string) Msg {
+	return Msg{V: Version, Type: TypeContentMode, Seq: seq, Mode: mode}
 }
 
 func Ack(seq uint64) Msg {
