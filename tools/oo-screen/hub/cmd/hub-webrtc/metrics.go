@@ -450,6 +450,9 @@ func handleMetrics(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
 	_ = writeMetrics(w, reg.all(), time.Now())
+	if p2pBroker != nil {
+		_ = p2pBroker.Metrics().WriteProm(w)
+	}
 }
 
 // startMetricsServer — окремий слухач /metrics; порожня адреса = вимкнено.
