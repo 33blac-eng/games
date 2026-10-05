@@ -31,6 +31,9 @@
 #include <mfobjects.h>
 #include <mftransform.h>
 #include <mferror.h>
+/* ICodecAPI is declared in strmif.h; the CI runner's mingw-w64 does not pull it in
+ * transitively through mfidl.h/d3d11.h, so include it explicitly. */
+#include <strmif.h>
 #include <codecapi.h>
 #include <d3d11.h>
 #include <stdio.h>
