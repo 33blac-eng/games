@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"unicode/utf8"
 )
 
 func TestConsumeTicket_OK(t *testing.T) {
@@ -126,5 +127,42 @@ func TestConsumeTicket_Unreachable(t *testing.T) {
 	_, err := ConsumeTicket("http://127.0.0.1:1", "k", "j")
 	if err == nil {
 		t.Fatal("expected network error, got nil")
+	}
+}
+
+// truncBody ріже тіло до 256 байтів, але не посеред символу: 255 байтів ASCII
+// + кирилиця — межа 256 припадає на середину «ї».
+func TestTruncBodyKeepsUTF8(t *testing.T) {
+	body := []byte(strings.Repeat("a", 255) + strings.Repeat("ї", 10))
+	got := truncBody(body)
+	if !utf8.ValidString(got) {
+		t.Fatalf("обрізане тіло — невалідний UTF-8: %q", got[len(got)-8:])
+	}
+	if want := strings.Repeat("a", 255) + "…"; got != want {
+		t.Errorf("got %q…, want 255×a + …", got[250:])
+	}
+	if got := truncBody([]byte("коротко")); got != "коротко" {
+		t.Errorf("коротке тіло змінене: %q", got)
+	}
+}
+
+// TestConsumeTicket_BadBodyTruncatedInError — R6-G6: 2xx з кривим тілом (ERP
+// віддав сторінку помилки PHP зі статусом 200). Текст помилки йде в журнал
+// (authorizeViewer), тож тіло в ньому мусить бути обрізане truncBody, а не
+// до 1 МБ на кожен квиток. Постав string(respBody) назад — довжина вилізе.
+func TestConsumeTicket_BadBodyTruncatedInError(t *testing.T) {
+	page := strings.Repeat("<div>Whoops</div>", 4096) // ~68 КБ
+	for _, body := range []string{page, `{"x":1,"pad":"` + page + `"}`} {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			_, _ = w.Write([]byte(body))
+		}))
+		_, err := ConsumeTicket(srv.URL, "k", "j")
+		srv.Close()
+		if err == nil {
+			t.Fatal("expected error, got nil")
+		}
+		if n := len(err.Error()); n > 1024 {
+			t.Fatalf("помилка несе %d байт тіла ERP — у журнал поїде вся сторінка", n)
+		}
 	}
 }

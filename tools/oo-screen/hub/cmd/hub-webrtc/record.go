@@ -16,12 +16,16 @@
 // dropped; форвардинг цього навіть не помічає. Розбір RTP, мультиплексування і
 // сам write(2) робить окрема горутина.
 //
-// ЖИТТЄВИЙ ЦИКЛ = ЖИТТЯ READ LOOP АГЕНТСЬКОЇ НОГИ. Рекордер створюється в
-// OnTrack і закривається defer-ом ТІЄЇ Ж горутини, що читає RTP. Цим одним
-// defer-ом накриваються геть усі шляхи смерті: агент розірвав звʼязок (ReadRTP
-// віддає помилку), агента витіснив новий (generation розійшлась), ноду закрив
-// runtime-revoke (closeNode -> agentPC.Close() -> ReadRTP помилка). Окремого
-// «а якщо ще отак» не існує, бо іншого виходу з тієї горутини немає.
+// ЖИТТЄВИЙ ЦИКЛ — ФАЙЛ ЖИВЕ, ПОКИ Є ГЛЯДАЧІ (з 15.09.2026). Відкриває його
+// лише read loop агентської ноги (OnTrack у main.go): на першому пакеті, коли
+// рекордера нема, а глядач є. Закривають два шляхи:
+//   - таймер scheduleRecordClose (нижче): recordIdleClose після ОСТАННЬОГО
+//     глядача — сеанси різних днів не зливаються в один файл;
+//   - defer тієї ж горутини read loop: агент розірвав звʼязок (ReadRTP віддає
+//     помилку), агента витіснив новий (generation розійшлась), ноду закрив
+//     runtime-revoke (closeNode -> agentPC.Close() -> ReadRTP помилка).
+//
+// Відкриває одна горутина на ноду, тож двох писарів одночасно не буває.
 //
 // А ЯКЩО ПРОЦЕС УБИЛИ. Тоді defer не виконається — і саме тому коректність
 // файлу НЕ покладена на Close(): кластери пишуться цілими шматками (див.
@@ -59,6 +63,11 @@ var recordDir = envOr("OO_SCREEN_RECORD_DIR", "recordings")
 // 2048 ≈ 2.5 с запасу: звичайне «диск задумався» переживається без втрат.
 // ponytail: стеля — черга рахує ПАКЕТИ, як і viewerQueueDepth у fanout.go.
 const recordQueueDepth = 2048
+
+// audioResyncGap — на скільки прихід кадру звуку може випереджати його
+// накопичену мітку, перш ніж мітку переякорять (handleAudio). Більше за
+// звичайний джитер доставки пачками, менше за помітний на слух розсинхрон.
+const audioResyncGap = 200 * time.Millisecond
 
 // recItem — одиниця роботи писаря: або RTP-пакет відео, або готовий кадр μ-law.
 type recItem struct {
@@ -104,7 +113,7 @@ type recorder struct {
 	haveV bool
 
 	// Прив'язка звуку: PTS наступного кадру звуку (перший — від t0, далі
-	// накопиченням тривалостей).
+	// накопиченням тривалостей; після розриву — знову від t0, handleAudio).
 	aPTS  time.Duration
 	haveA bool
 
@@ -112,6 +121,9 @@ type recorder struct {
 	started  bool
 	vFrames  int
 	aFrames  int
+	// part — номер файлу сесії: SPS/PPS змінився (select_output на монітор
+	// іншої роздільності) -> новий файл, бо заголовок MKV уже бреше.
+	part int
 
 	// lastPTS — мітка останнього ЗАПИСАНОГО кадру. RTP не гарантує порядку, і
 	// пакет, що спізнився, дає мітку, меншу за попередню. Такий кадр ламає
@@ -121,24 +133,45 @@ type recorder struct {
 	lastPTS     time.Duration
 	haveLast    bool
 	droppedLate int
+
+	// fileBase — PTS першого кадру ПОТОЧНОГО файлу. Мітки у файлі йдуть від
+	// нього, тож кожен файл сесії (і -2.mkv після зміни SPS) стартує з нуля, а
+	// не з «часу від початку сесії». Самі PTS лишаються наскрізними — на них
+	// тримається перевірка монотонності.
+	fileBase time.Duration
+}
+
+// recordCfg — налаштування запису, зняті ОДИН раз, коли нода зʼявляється в
+// реєстрі (registry.getOrCreate). Фонові горутини ноди (pion-колбеки, таймер
+// scheduleRecordClose) читають лише цей знімок, а не глобали: глобали — це
+// те, що міняють тести, і горутина ноги ПОПЕРЕДНЬОГО тесту, яка ще доживає,
+// читала їх паралельно із записом (DATA RACE під -race, R3-G6 ⚪3).
+type recordCfg struct {
+	on   bool
+	dir  string
+	idle time.Duration
+}
+
+func currentRecordCfg() recordCfg {
+	return recordCfg{on: recordEnabled, dir: recordDir, idle: recordIdleClose}
 }
 
 // startRecording піднімає писаря сесії. nil (і жодного сліду на диску), поки
 // OO_SCREEN_RECORD не заданий — це і є «без прапорця нічого не змінилось».
-func startRecording(nodeID string) *recorder {
-	if !recordEnabled {
+func startRecording(nodeID string, c recordCfg) *recorder {
+	if !c.on {
 		return nil
 	}
 	// Запобіжник місця (recordprune.go). Прибирає застаріле й відмовляється
 	// починати, коли на диску тісно. Саме ТУТ, а не у фоновому таймері: у
 	// момент старту сесії ми ще можемо чесно сказати «не пишу», а посеред
 	// запису вибір уже між зіпсованим файлом і забитим диском.
-	if !recordingsFit(recordDir) {
+	if !recordingsFit(c.dir) {
 		return nil
 	}
 	r := &recorder{
 		nodeID: nodeID,
-		dir:    recordDir,
+		dir:    c.dir,
 		ch:     make(chan recItem, recordQueueDepth),
 		done:   make(chan struct{}),
 		fin:    make(chan struct{}),
@@ -259,8 +292,9 @@ func (r *recorder) handleVideo(it recItem) {
 	nals, err := r.dp.Unmarshal(pkt.Payload)
 	if err != nil {
 		// Втрачений/битий фрагмент: AU вийде неповним — рівно те саме, що
-		// побачить глядач. Запис не має права бути чистішим за потік. Але
-		// позначаємо його рваним, щоб файл не ПОЧАВСЯ з такого кадру.
+		// побачить глядач. Запис не має права бути чистішим за потік. Тут нічого
+		// не позначається: почати файл з кадру без ПЕРШОГО зрізу не дає
+		// startsFrame у flushAU, а втрату в середині кадру не видно й там.
 		return
 	}
 	r.curAU = append(r.curAU, nals...)
@@ -291,17 +325,14 @@ func (r *recorder) flushAU() {
 
 	key := false
 	startsFrame := false
+	var sps, pps []byte
 	var avcc bytes.Buffer
 	for _, n := range nals {
 		switch n[0] & 0x1F {
 		case h264.NALSPS:
-			if r.sps == nil {
-				r.sps = append([]byte(nil), n...)
-			}
+			sps = n
 		case h264.NALPPS:
-			if r.pps == nil {
-				r.pps = append([]byte(nil), n...)
-			}
+			pps = n
 		case h264.NALIDR:
 			key = true
 			// Чи цей зріз починає КАДР. first_mb_in_slice — перше поле
@@ -323,6 +354,24 @@ func (r *recorder) flushAU() {
 		avcc.Write(n)
 	}
 
+	// Розмір і avcC у заголовку MKV фіксуються першим IDR. Інші SPS/PPS
+	// (select_output на монітор іншої роздільності) = новий файл: дописувати
+	// в старий означало б хибні PixelWidth/Height і CodecPrivate.
+	if (sps != nil && r.sps != nil && !bytes.Equal(sps, r.sps)) ||
+		(pps != nil && r.pps != nil && !bytes.Equal(pps, r.pps)) {
+		if r.started {
+			r.closeFile()
+			r.started, r.f, r.mkv, r.vFrames, r.aFrames = false, nil, nil, 0, 0
+		}
+		r.sps, r.pps = nil, nil
+	}
+	if sps != nil && r.sps == nil {
+		r.sps = append([]byte(nil), sps...)
+	}
+	if pps != nil && r.pps == nil {
+		r.pps = append([]byte(nil), pps...)
+	}
+
 	if !r.started {
 		if !key || !startsFrame || len(r.sps) < 4 || len(r.pps) == 0 || !r.open() {
 			return
@@ -335,7 +384,7 @@ func (r *recorder) flushAU() {
 		r.droppedLate++
 		return
 	}
-	r.mkv.block(mkvVideoTrack, r.curPTS.Milliseconds(), key, avcc.Bytes())
+	r.mkv.block(mkvVideoTrack, (r.curPTS - r.fileBase).Milliseconds(), key, avcc.Bytes())
 	r.lastPTS, r.haveLast = r.curPTS, true
 	r.vFrames++
 }
@@ -346,10 +395,17 @@ func (r *recorder) handleAudio(it recItem) {
 	if !r.started || !r.mkv.hasAudio {
 		return
 	}
-	if !r.haveA {
-		r.aPTS, r.haveA = it.at.Sub(r.t0), true
+	// Далі мітка йде накопиченням тривалостей — без джитера доставки. Але відео
+	// йде за RTP-часом агента, а той — стінний годинник: після паузи (глядач
+	// сховав вкладку без звуку -> агент на паузі) чи викинутих кадрів звуку
+	// відео стрибає вперед, а накопичена мітка — ні. Відстали від приходу
+	// більше ніж на audioResyncGap — переякорюємось на час приходу.
+	if at := it.at.Sub(r.t0); !r.haveA || at-r.aPTS > audioResyncGap {
+		r.aPTS, r.haveA = at, true
 	}
-	r.mkv.block(mkvAudioTrack, r.aPTS.Milliseconds(), true, pcmBlock(it.aud))
+	// Звук, що прийшов трохи раніше за перший кадр файлу, — на нуль: мітка
+	// кластера від'ємною бути не може.
+	r.mkv.block(mkvAudioTrack, max(r.aPTS-r.fileBase, 0).Milliseconds(), true, pcmBlock(it.aud))
 	r.aPTS += it.dur
 	r.aFrames++
 }
@@ -370,7 +426,12 @@ func (r *recorder) open() bool {
 		r.mkv = newMKVWriter(discardWriter{})
 		return false
 	}
+	r.part++
 	name := fmt.Sprintf("%s-%s.mkv", safeNodeID(r.nodeID), time.Now().UTC().Format("20060102-150405"))
+	if r.part > 1 {
+		// Та сама секунда, що й попередній файл сесії, — os.Create його затер би.
+		name = fmt.Sprintf("%s-%s-%d.mkv", safeNodeID(r.nodeID), time.Now().UTC().Format("20060102-150405"), r.part)
+	}
 	f, err := os.Create(filepath.Join(r.dir, name))
 	if err != nil {
 		log.Printf("record: файл %s не створився: %v", name, err)
@@ -380,6 +441,7 @@ func (r *recorder) open() bool {
 	}
 	r.f, r.path = f, f.Name()
 	r.mkv = newMKVWriter(f)
+	r.fileBase = r.curPTS // open кличе flushAU на першому IDR файлу
 	if err := r.mkv.writeHeader(sps.Width, sps.Height, avcC(r.sps, r.pps), audioEnabled); err != nil {
 		log.Printf("record: заголовок %s не записався: %v", r.path, err)
 	}
@@ -391,6 +453,12 @@ func (r *recorder) open() bool {
 
 func (r *recorder) finish() {
 	r.flushAU()
+	r.closeFile()
+}
+
+// closeFile дописує й закриває поточний файл сесії (або лише логує, що файлу
+// не було).
+func (r *recorder) closeFile() {
 	if r.f == nil {
 		if d := r.dropped.Load(); d > 0 {
 			log.Printf("record: сесія [node=%s] не записана (викинуто %d пакетів)", r.nodeID, d)
@@ -450,16 +518,16 @@ func safeNodeID(id string) string {
 // в тому самому файлі, а сеанс наступного дня — вже в новому.
 var recordIdleClose = 30 * time.Second
 
-// scheduleRecordClose закриває поточний файл ноди, якщо за recordIdleClose так і
+// scheduleRecordClose закриває поточний файл ноди, якщо за recCfg.idle так і
 // не зʼявився жоден глядач. Close() чекає на писаря, тому поза таймерною горутиною.
 // ponytail: між перевіркою лічильника і Swap новий глядач може встигнути відкрити
 // файл — тоді він закриється, і наступний пакет відкриє ще один. Короткий зайвий
 // файл, не втрата запису.
 func scheduleRecordClose(ns *nodeSession) {
-	if !recordEnabled {
+	if !ns.recCfg.on {
 		return
 	}
-	time.AfterFunc(recordIdleClose, func() {
+	time.AfterFunc(ns.recCfg.idle, func() {
 		if ns.viewerCount.Load() != 0 {
 			return
 		}

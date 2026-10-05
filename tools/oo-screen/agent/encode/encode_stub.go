@@ -13,6 +13,7 @@ import (
 var (
 	ErrNoHardware = errors.New("encode: hardware H.264 MFT requires Windows")
 	ErrClosed     = errors.New("encode: closed")
+	ErrWedged     = errors.New("encode: encoder wedged, rebuild required")
 )
 
 type Config struct {

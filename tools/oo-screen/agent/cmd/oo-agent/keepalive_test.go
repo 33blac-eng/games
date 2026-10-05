@@ -9,6 +9,8 @@ import (
 	"io"
 	"testing"
 	"time"
+
+	"github.com/organicoils/oo-screen/agent/encode"
 )
 
 // На нерухомому екрані DXGI не віддає кадрів узагалі, а сторож у браузері рве
@@ -252,5 +254,25 @@ func TestAdmissionFloorLeavesRoomForDelivery(t *testing.T) {
 	if admissionFloor < keepaliveAfter {
 		t.Fatalf("admissionFloor=%v < keepaliveAfter=%v: межа спрацьовує раніше за keepalive, admission вимкнено",
 			admissionFloor, keepaliveAfter)
+	}
+}
+
+// keepalive-AU, яке повторюється на локу, мусить бути справді «нічого не
+// змінилось»: кадр, уже закодований раніше. Кадр, викинутий max_fps/admission
+// до кодування, дає P-кадр з реальною дельтою — повтор наклав би її вдруге.
+// Прибери sameFrameEncodedBefore з keepStillAU — впаде перший випадок.
+func TestKeepStillAUOnlyForRepeatedFrame(t *testing.T) {
+	p := []encode.AU{{Data: []byte{0, 0, 0, 1, 0x41}}}
+	if keepStillAU(true, false, p) {
+		t.Fatal("keepalive кадру, який ще не кодувався (дропнутий), збережено як «нічого не змінилось»")
+	}
+	if !keepStillAU(true, true, p) {
+		t.Fatal("повтор уже закодованого кадру не збережено — на локу не буде чим тримати сесію")
+	}
+	if keepStillAU(false, true, p) {
+		t.Fatal("звичайний кадр збережено як keepalive")
+	}
+	if keepStillAU(true, true, []encode.AU{{Keyframe: true}}) {
+		t.Fatal("IDR збережено як keepalive-P-кадр")
 	}
 }

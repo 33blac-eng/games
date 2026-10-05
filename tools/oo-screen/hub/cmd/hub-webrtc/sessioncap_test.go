@@ -28,9 +28,9 @@ func TestSessionCapDropsForgottenViewer(t *testing.T) {
 	vl := &viewerLeg{pc: pc, out: make(chan *rtp.Packet, 1), done: make(chan struct{})}
 	ns.viewers = map[*webrtc.PeerConnection]*viewerLeg{pc: vl}
 
-	go watchSessionCap(ns, vl)
+	go watchSessionCap(ns, vl, sessionCap)
 
-	deadline := time.After(3 * time.Second)
+	deadline := time.After(eventGuard)
 	for {
 		ns.mu.Lock()
 		n := len(ns.viewers)
@@ -69,13 +69,13 @@ func TestSessionCapSilentWhenViewerLeavesEarly(t *testing.T) {
 	ns.viewers = map[*webrtc.PeerConnection]*viewerLeg{pc: vl}
 
 	returned := make(chan struct{})
-	go func() { watchSessionCap(ns, vl); close(returned) }()
+	go func() { watchSessionCap(ns, vl, sessionCap); close(returned) }()
 
 	close(vl.done) // глядач пішов сам, задовго до стелі
 
 	select {
 	case <-returned:
-	case <-time.After(time.Second):
+	case <-time.After(eventGuard):
 		t.Fatal("сторож не вийшов після зняття ноги — лишилась горутина до самої стелі")
 	}
 	ns.mu.Lock()
@@ -97,10 +97,10 @@ func TestSessionCapZeroDisables(t *testing.T) {
 	ns := &nodeSession{nodeID: "node-off"}
 	vl := &viewerLeg{done: make(chan struct{})}
 	returned := make(chan struct{})
-	go func() { watchSessionCap(ns, vl); close(returned) }()
+	go func() { watchSessionCap(ns, vl, sessionCap); close(returned) }()
 	select {
 	case <-returned:
-	case <-time.After(time.Second):
+	case <-time.After(eventGuard):
 		t.Fatal("з вимкненою стелею сторож не вийшов — лишилась горутина")
 	}
 }
@@ -142,7 +142,7 @@ func TestAddViewerArmsSessionCap(t *testing.T) {
 	ns := &nodeSession{nodeID: "node-armed"}
 	addViewer(ns, pc, trk, "user-1")
 
-	deadline := time.After(3 * time.Second)
+	deadline := time.After(eventGuard)
 	for {
 		ns.mu.Lock()
 		n := len(ns.viewers)

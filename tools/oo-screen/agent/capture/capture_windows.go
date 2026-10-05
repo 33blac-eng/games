@@ -85,13 +85,10 @@ var (
 
 // NV12Frame is one captured desktop frame, already converted on the GPU.
 //
-// Y and UV are copies owned by the caller — the underlying staging map is
-// released before NextFrame returns.
-//
-// TODO(zero-copy): this CPU readback exists only because Ф0 has no encoder yet.
-// The real path hands the NV12 ID3D11Texture2D straight to the hardware MFT
-// (MF_SA_D3D11_AWARE + IMFDXGIDeviceManager + MFCreateDXGISurfaceBuffer), and
-// then Y/UV here become nil and a texture handle takes their place.
+// On the CPU readback path Y and UV alias the capturer's scratch buffers (see
+// copyOut): the staging map is already released, but the bytes stay valid only
+// until the next NextFrame/GDIFrame. On the zero-copy path Y/UV are nil and
+// Texture carries the NV12 ID3D11Texture2D for the hardware MFT instead.
 type NV12Frame struct {
 	Width  int
 	Height int

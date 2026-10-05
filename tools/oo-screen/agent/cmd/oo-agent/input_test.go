@@ -2,14 +2,24 @@ package main
 
 import (
 	"errors"
+	"sync/atomic"
 	"testing"
+	"time"
+
+	"github.com/pion/webrtc/v4"
 
 	"github.com/organicoils/oo-screen/agent/input"
 )
 
 type recordingInjector struct {
-	got []input.Event
-	err error
+	got      []input.Event
+	err      error
+	released atomic.Int32
+}
+
+func (r *recordingInjector) ReleaseAll() error {
+	r.released.Add(1)
+	return nil
 }
 
 func (r *recordingInjector) Inject(ev input.Event) error {
@@ -88,5 +98,57 @@ func TestHandleInputMessageRejectsInvalid(t *testing.T) {
 				t.Fatalf("до SendInput не сміло дійти нічого, дійшло %d", len(inj.got))
 			}
 		})
+	}
+}
+
+// Знахідка G6-6: канал вводу закрився (реконект, розрив, хаб зняв ногу) —
+// агент мусить відпустити все, що тримає: key-up цим каналом уже не прийде.
+// Прибери OnClose з attachInputChannel — впаде.
+func TestInputChannelCloseReleasesAll(t *testing.T) {
+	agent, err := webrtc.NewPeerConnection(webrtc.Configuration{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	hub, err := webrtc.NewPeerConnection(webrtc.Configuration{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = hub.Close() })
+
+	dc, err := agent.CreateDataChannel(inputChannelLabel, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	inj := &recordingInjector{}
+	attachInputChannel(dc, inj)
+	opened := make(chan struct{})
+	dc.OnOpen(func() { close(opened) })
+
+	offer, err := agent.CreateOffer(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	g := webrtc.GatheringCompletePromise(agent)
+	_ = agent.SetLocalDescription(offer)
+	<-g
+	_ = hub.SetRemoteDescription(*agent.LocalDescription())
+	ans, _ := hub.CreateAnswer(nil)
+	g2 := webrtc.GatheringCompletePromise(hub)
+	_ = hub.SetLocalDescription(ans)
+	<-g2
+	_ = agent.SetRemoteDescription(*hub.LocalDescription())
+
+	select {
+	case <-opened:
+	case <-time.After(15 * time.Second):
+		t.Fatal("канал вводу не відкрився")
+	}
+	_ = agent.Close() // tp.close() на реконекті робить рівно це
+	deadline := time.Now().Add(5 * time.Second)
+	for inj.released.Load() == 0 && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if inj.released.Load() == 0 {
+		t.Fatal("канал вводу закрито, а ReleaseAll не викликано — клавіша лишиться затиснутою")
 	}
 }

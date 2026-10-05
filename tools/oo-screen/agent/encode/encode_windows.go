@@ -29,10 +29,18 @@ import (
 
 // Typed errors. Callers switch on these, never on strings.
 var (
-	// ErrNoHardware means MFTEnumEx found no hardware H.264 encoder. Per plan
-	// §5.1 this is the signal to fall back to NVENC directly, not to a software
-	// MFT: we deliberately do not ship two encoders "just in case".
+	// ErrNoHardware means there is no usable H.264 MFT for this capture on the
+	// path New was asked for. mft.c already drops to the software Microsoft
+	// H.264 MFT by itself when no hardware MFT exists or all of them sit on
+	// another GPU (A-18); it returns this when even that enumeration is empty,
+	// or when the hardware MFT it picked is not D3D11-aware (A-19). The agent
+	// answers the latter by retrying with Config.ForceSoftware.
 	ErrNoHardware = errors.New("encode: no hardware H.264 MFT on this machine")
+
+	// ErrWedged means the MFT stopped raising events mid-submit (A-12: driver
+	// reset, device removed, NVENC session lost). Nothing but a rebuild of the
+	// encoder recovers it; it is a status code from mft.c, not a message match.
+	ErrWedged = errors.New("encode: encoder wedged, rebuild required")
 
 	// ErrClosed is returned after Close.
 	ErrClosed = errors.New("encode: closed")
@@ -97,9 +105,10 @@ type AU struct {
 	PTS      time.Duration
 }
 
-// Encoder wraps one hardware MFT. It is safe for concurrent use only in the
-// sense that the mutex serialises callers; the MFT itself is driven from
-// whichever goroutine calls in.
+// Encoder wraps one H.264 MFT — hardware on the capture's adapter when there is
+// one, the software Microsoft MFT otherwise (see ErrNoHardware). It is safe
+// for concurrent use only in the sense that the mutex serialises callers; the
+// MFT itself is driven from whichever goroutine calls in.
 //
 // Threading model. mft.c keeps a dedicated anchor thread that holds
 // CoInitializeEx(COINIT_MULTITHREADED) + MFStartup for as long as any Encoder
@@ -149,7 +158,9 @@ func (e *Encoder) LastSubmitTiming() (wait, process time.Duration) {
 	return e.lastWait, e.lastProcess
 }
 
-// New opens the first hardware H.264 MFT and configures it for low-latency CBR.
+// New opens an H.264 MFT — the hardware one on the capture's adapter, else the
+// software one (always with Config.ForceSoftware) — and configures it for
+// low-latency CBR.
 func New(cfg Config) (*Encoder, error) {
 	if cfg.Width <= 0 || cfg.Height <= 0 {
 		return nil, fmt.Errorf("encode: bad frame size %dx%d", cfg.Width, cfg.Height)
@@ -241,8 +252,13 @@ func (e *Encoder) Level() int { return e.level }
 // stream no viewer will negotiate.
 func (e *Encoder) Profile() int { return e.profile }
 
-// Headers is the cached SPS/PPS in Annex-B form, or nil.
-func (e *Encoder) Headers() []byte { return e.headers }
+// Headers is the cached SPS/PPS in Annex-B form, or nil. Under e.mu: the
+// drain loop replaces e.headers when the MFT renegotiates mid-stream.
+func (e *Encoder) Headers() []byte {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.headers
+}
 
 // HeaderStats reports how many keyframes were produced and how many of them
 // needed the cached SPS/PPS prefixed manually because the MFT did not repeat
@@ -276,7 +292,7 @@ func (e *Encoder) Encode(f Frame) ([]AU, error) {
 		st = C.oos_enc_submit_texture(e.e, C.uintptr_t(f.Texture),
 			C.uint64_t(f.TextureGen), pts, buf, 256)
 	case len(f.Y) > 0 && len(f.UV) > 0:
-		if err := e.checkPlanes(f); err != nil {
+		if err := checkPlanes(f, e.cfg.Width, e.cfg.Height); err != nil {
 			return nil, err
 		}
 		st = C.oos_enc_submit_cpu(e.e,
@@ -291,7 +307,7 @@ func (e *Encoder) Encode(f Frame) ([]AU, error) {
 		// AGAIN means MF_E_NOTACCEPTING: the frame was not taken, but whatever
 		// output was pending is still worth draining below.
 	default:
-		return nil, fmt.Errorf("encode: submit: %s", C.GoString(buf))
+		return nil, submitErr(int(st), C.GoString(buf))
 	}
 
 	var waitUS, procUS C.int64_t
@@ -302,31 +318,16 @@ func (e *Encoder) Encode(f Frame) ([]AU, error) {
 	return e.drainLocked(buf, 0)
 }
 
-// checkPlanes validates the CPU NV12 planes against the configured frame size.
-// oos_enc_submit_cpu does memcpy(dst, y + r*YStride, Width) for every row with
-// no bounds knowledge of its own, so a short slice or a stride smaller than the
-// width is an out-of-bounds read inside C — silent corruption at best. Every
-// such frame is rejected here instead.
-func (e *Encoder) checkPlanes(f Frame) error {
-	w, h := e.cfg.Width, e.cfg.Height
-	// mft.c: chroma_rows = ((h+1) & ~1) / 2
-	chromaRows := ((h + 1) &^ 1) / 2
+// statusWedged is OOS_ENC_WEDGED as a Go constant: _test.go files cannot use cgo.
+const statusWedged = int(C.OOS_ENC_WEDGED)
 
-	if f.YStride < w {
-		return fmt.Errorf("encode: Y stride %d < width %d", f.YStride, w)
+// submitErr turns a failed submit status into an error. OOS_ENC_WEDGED becomes
+// ErrWedged so callers can errors.Is it; the C message is kept for the log only.
+func submitErr(st int, msg string) error {
+	if st == statusWedged {
+		return fmt.Errorf("encode: submit: %w: %s", ErrWedged, msg)
 	}
-	if f.UVStride < w {
-		return fmt.Errorf("encode: UV stride %d < width %d", f.UVStride, w)
-	}
-	if need := f.YStride * h; len(f.Y) < need {
-		return fmt.Errorf("encode: Y plane too small: %d bytes, need %d (stride %d x %d rows)",
-			len(f.Y), need, f.YStride, h)
-	}
-	if need := f.UVStride * chromaRows; len(f.UV) < need {
-		return fmt.Errorf("encode: UV plane too small: %d bytes, need %d (stride %d x %d rows)",
-			len(f.UV), need, f.UVStride, chromaRows)
-	}
-	return nil
+	return fmt.Errorf("encode: submit: %s", msg)
 }
 
 // drainLocked pops everything the MFT has ready. timeoutMS>0 waits that long
@@ -361,11 +362,8 @@ func (e *Encoder) drainLocked(buf *C.char, timeoutMS int) ([]AU, error) {
 			if hl > 0 {
 				e.headers = C.GoBytes(unsafe.Pointer(hp), C.int(hl))
 			}
-			if !hasSPS(data) && len(e.headers) > 0 {
-				merged := make([]byte, 0, len(e.headers)+len(data))
-				merged = append(merged, e.headers...)
-				merged = append(merged, data...)
-				data = merged
+			var injected bool
+			if data, injected = withHeaders(data, e.headers); injected {
 				e.headersInjected++
 			}
 		}
@@ -445,28 +443,4 @@ func (e *Encoder) Close() error {
 	}
 	runtime.SetFinalizer(e, nil)
 	return nil
-}
-
-// hasSPS reports whether the Annex-B stream carries an SPS NAL (type 7).
-// Deliberately local rather than importing internal/h264: the encoder must not
-// depend on the parser it is validated against.
-func hasSPS(b []byte) bool {
-	for i := 0; i+3 < len(b); i++ {
-		if b[i] != 0 || b[i+1] != 0 {
-			continue
-		}
-		var nal byte
-		switch {
-		case b[i+2] == 1:
-			nal = b[i+3]
-		case b[i+2] == 0 && i+4 < len(b) && b[i+3] == 1:
-			nal = b[i+4]
-		default:
-			continue
-		}
-		if nal&0x1F == 7 {
-			return true
-		}
-	}
-	return false
 }

@@ -89,14 +89,6 @@ func Decode(b byte) int16 {
 // означало б заповнити його тріском на повну гучність.
 const Silence = 0xFF
 
-// AppendSilence дописує n семплів тиші.
-func AppendSilence(dst []byte, n int) []byte {
-	for i := 0; i < n; i++ {
-		dst = append(dst, Silence)
-	}
-	return dst
-}
-
 // Duration — скільки звучить payload із n байтів. Один байт = один семпл 8 кГц,
 // тож це і є та тривалість, яку чекає media.Sample: саме з неї pion крутить
 // RTP-годинник доріжки (Duration.Seconds()*ClockRate).

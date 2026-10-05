@@ -35,6 +35,7 @@ import (
 	"encoding/json"
 	"log"
 	"os"
+	"sync/atomic"
 	"time"
 
 	"github.com/pion/webrtc/v4"
@@ -44,6 +45,15 @@ import (
 // inputChannelLabel — мітка каналу вводу на ОБОХ ногах: глядач відкриває його
 // до хаба, агент — до хаба. Одна мітка, бо це один і той самий потік подій.
 const inputChannelLabel = "oosc-input"
+
+// inputMoveChannelLabel — ДРУГИЙ канал вводу глядача (контракт C2), ненадійний
+// і невпорядкований ({ordered:false, maxRetransmits:0} на боці браузера): рух
+// миші, який загубився, не вартий того, щоб за ним у черзі стояв наступний, —
+// саме ретрансмісія старих рухів і тягла курсор. Лише viewer-нога; далі до
+// агента рух іде тим самим шляхом, що й з "oosc-input". Засувки ті самі, плюс
+// одна: у цьому каналі живе ЛИШЕ mouse_move — кнопка чи клавіша, що
+// загубилась без ретрансмісії, лишилась би затиснутою на чужому ПК.
+const inputMoveChannelLabel = "oosc-input-move"
 
 // grantControl — єдине значення grant, яке відчиняє канал вводу. Рядок, а не
 // bool: у квитку вже є поле довільного дозволу, і чесніше звірятися з ним, ніж
@@ -133,6 +143,22 @@ func judgeInput(data []byte, ticket, grant string, lim *rate.Limiter, now time.T
 	return inputAccept, m.Event, ""
 }
 
+// judgeViewerInput — judgeInput плюс правило каналу. Спершу всі три засувки
+// (чужий тікет у move-каналі рве сесію так само), потім — тип події.
+func judgeViewerInput(label string, data []byte, ticket, grant string, lim *rate.Limiter, now time.Time) (inputVerdict, json.RawMessage, string) {
+	v, ev, why := judgeInput(data, ticket, grant, lim, now)
+	if v != inputAccept || label != inputMoveChannelLabel {
+		return v, ev, why
+	}
+	var e struct {
+		Type string `json:"type"`
+	}
+	if json.Unmarshal(ev, &e) != nil || e.Type != "mouse_move" {
+		return inputDrop, nil, "у " + inputMoveChannelLabel + " дозволено лише mouse_move"
+	}
+	return v, ev, why
+}
+
 // attachViewerInput вішає канал вводу на viewer-ногу. Кличеться ЛИШЕ під
 // прапорцем і ЛИШЕ для ноги з тікетом (див. setupViewerLeg).
 func attachViewerInput(ns *nodeSession, vl *viewerLeg, pc *webrtc.PeerConnection, ticket, grant string) {
@@ -147,20 +173,40 @@ func attachViewerInput(ns *nodeSession, vl *viewerLeg, pc *webrtc.PeerConnection
 	// щоб причина знайшлась із першого `journalctl | grep input`.
 	noChanLim := rate.NewLimiter(rate.Every(30*time.Second), 1)
 
+	// Глядач, що зник посеред drag-у чи з затиснутим Ctrl (обрив, стеля сесії,
+	// inputKill, закрита вкладка), key-up не пришле НІКОЛИ — і клавіша лишилась
+	// би затиснутою на чужому ПК, доки людина за ним не натисне її сама. Тому
+	// на зникненні ноги, яка хоч раз керувала, агентові йде release_all: він
+	// відпускає все, що тримає (agent/input.Injector.ReleaseAll).
+	// ponytail: інʼєктор агента один на ногу агента, тож release_all відпускає
+	// й клавіші ІНШОГО глядача з керуванням, якщо такий є одночасно. Двоє
+	// керуючих одночасно — не сценарій ЕРП; окремий облік на глядача — коли стане.
+	var controlled atomic.Bool
+	go func() {
+		<-vl.done
+		if controlled.Load() {
+			sendInputToAgent(ns, releaseAllEvent)
+		}
+	}()
+
 	pc.OnDataChannel(func(dc *webrtc.DataChannel) {
-		if dc.Label() != inputChannelLabel {
+		label := dc.Label()
+		if label != inputChannelLabel && label != inputMoveChannelLabel {
 			return
 		}
-		log.Printf("input: viewer channel open [node=%s]", ns.nodeID)
+		log.Printf("input: viewer channel %s open [node=%s]", label, ns.nodeID)
+		// lim — один на обидва канали: стеля подій на КЛІЄНТА, а не на канал,
+		// інакше другий канал подвоював би її.
 		dc.OnMessage(func(msg webrtc.DataChannelMessage) {
 			now := time.Now()
-			verdict, ev, why := judgeInput(msg.Data, ticket, grant, lim, now)
+			verdict, ev, why := judgeViewerInput(label, msg.Data, ticket, grant, lim, now)
 			switch verdict {
 			case inputAccept:
 				// F-39: людина клацає — отже, дивиться. Знімаємо прихованість,
 				// навіть якщо її POST /viewer/visibility загубився або прийшов
 				// не в тому порядку. Це страховка в бік «слати», а не «різати».
 				unhideViewer(ns, vl)
+				controlled.Store(true)
 				if !sendInputToAgent(ns, ev) && noChanLim.AllowN(now, 1) {
 					log.Printf("input: агент цієї ноди НЕ має каналу вводу [node=%s] — "+
 						"події глядача летять у нікуди (ПК розкочено без -input?)", ns.nodeID)
@@ -176,6 +222,10 @@ func attachViewerInput(ns *nodeSession, vl *viewerLeg, pc *webrtc.PeerConnection
 		})
 	})
 }
+
+// releaseAllEvent — подія протоколу вводу агента (agent/input.KindReleaseAll).
+// Старий агент її відкине як невідомий тип — рівно як і до неї.
+var releaseAllEvent = []byte(`{"v":1,"type":"release_all"}`)
 
 // sendInputToAgent пише подію в канал вводу агента ЦІЄЇ ноди. Немає каналу
 // (старий агент, прапорець у нього вимкнений, агент саме перепідключається) —

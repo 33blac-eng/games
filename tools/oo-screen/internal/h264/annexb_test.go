@@ -3,6 +3,7 @@ package h264
 import (
 	"os"
 	"testing"
+	"time"
 )
 
 // Гейт на РЕАЛЬНОМУ корпусі: 600 AU (10с × 60fps), 5 IDR (кожні 2с),
@@ -52,4 +53,62 @@ func TestCorpusSplitAndSPS(t *testing.T) {
 		t.Fatal("empty codec string")
 	}
 	t.Logf("codec=%s aus=%d idr=%d", sps.CodecString(), len(aus), idr)
+}
+
+// bitW — мінімальний писар бітів для синтетичних SPS.
+type bitW struct {
+	b []byte
+	n int
+}
+
+func (w *bitW) bit(v int) {
+	if w.n%8 == 0 {
+		w.b = append(w.b, 0)
+	}
+	if v != 0 {
+		w.b[len(w.b)-1] |= 0x80 >> uint(w.n%8)
+	}
+	w.n++
+}
+
+func (w *bitW) ue(v uint32) {
+	x := uint64(v) + 1
+	l := 0
+	for t := x; t > 1; t >>= 1 {
+		l++
+	}
+	for i := 0; i < l; i++ {
+		w.bit(0)
+	}
+	for i := l; i >= 0; i-- {
+		w.bit(int(x>>uint(i)) & 1)
+	}
+}
+
+// TestParseSPSHugePocCycleFailsFast — битий SPS з poc_type=1 і
+// num_ref_frames_in_pic_order_cnt_cycle ~2^31 має відмовити одразу. Прибери
+// перевірку n > 255 — цикл крутитиметься секунди.
+func TestParseSPSHugePocCycleFailsFast(t *testing.T) {
+	w := &bitW{}
+	for _, v := range []byte{66, 0, 30} { // baseline, constraint, level
+		for i := 7; i >= 0; i-- {
+			w.bit(int(v>>uint(i)) & 1)
+		}
+	}
+	w.ue(0)       // seq_parameter_set_id
+	w.ue(0)       // log2_max_frame_num_minus4
+	w.ue(1)       // pic_order_cnt_type
+	w.bit(0)      // delta_pic_order_always_zero_flag
+	w.ue(0)       // offset_for_non_ref_pic (se 0)
+	w.ue(0)       // offset_for_top_to_bottom_field (se 0)
+	w.ue(1 << 31) // num_ref_frames_in_pic_order_cnt_cycle — битий
+	nal := append([]byte{0x67}, w.b...)
+
+	start := time.Now()
+	if _, err := ParseSPS(nal); err == nil {
+		t.Fatal("битий SPS розібрано без помилки")
+	}
+	if d := time.Since(start); d > 200*time.Millisecond {
+		t.Fatalf("ParseSPS на битому SPS зайняв %v — цикл до 2^31", d)
+	}
 }

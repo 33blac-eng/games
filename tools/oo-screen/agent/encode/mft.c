@@ -688,7 +688,8 @@ static HRESULT drain_one_output(oos_enc *e, int *got)
 /* Handles one MFT event. wait!=0 blocks in GetEvent. Returns:
  *   1  an event was handled
  *   0  no event pending (non-blocking only)
- *  -1  failure (err filled) */
+ *  -1  failure (err filled)
+ *  -2  wait timed out: the transform is wedged (err filled; blocking only) */
 /* A-12: an upper bound on how long a blocking pump may wait for the MFT.
  * A wedged transform (driver reset, device removed mid-encode, NVENC session
  * lost) never raises another event; GetEvent(0) then parked the frame loop
@@ -715,7 +716,7 @@ static int pump_event(oos_enc *e, int wait, char *err, int32_t err_len)
             if (hr != MF_E_NO_EVENTS_AVAILABLE) break;
             if (now_us(e) - t0 > OOS_EVENT_WAIT_US) {
                 set_msg(err, err_len, "MFT event wait timeout: encoder wedged, rebuild required");
-                return -1;
+                return -2; /* the caller reports OOS_ENC_WEDGED, not a plain error */
             }
             SwitchToThread();
         }
@@ -803,6 +804,7 @@ static int submit_sample(oos_enc *e, IMFSample *sample, char *err, int32_t err_l
          * produce output, which lands in the queue. */
         while (e->need_input == 0) {
             int r = pump_event(e, 1, err, err_len);
+            if (r == -2) return OOS_ENC_WEDGED;
             if (r < 0) return OOS_ENC_ERROR;
         }
         e->need_input--;

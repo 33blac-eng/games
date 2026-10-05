@@ -2,3 +2,4 @@ results/
 build/
 bench/soak-*.ndjson
 bench/soak_viewer_state.json
+.claude/

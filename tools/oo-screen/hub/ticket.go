@@ -12,11 +12,12 @@ import (
 	"net/http"
 	"strings"
 	"time"
+	"unicode/utf8"
 )
 
 // TicketClaims — те, що повертає ERP при успішному consume single-use тікета.
-// Grant — довільний рядок-опис дозволу (наприклад "view"/"control"), hub його
-// не інтерпретує зараз, лише передає для майбутнього логування.
+// Grant — дозвіл ("view"/"control"). Hub його інтерпретує: це засувка вводу —
+// подія від глядача з grant != "control" рве сесію (cmd/hub-webrtc/input.go).
 type TicketClaims struct {
 	UserID string `json:"user_id"`
 	OrgID  string `json:"org_id"`
@@ -80,17 +81,35 @@ func ConsumeTicket(erpBase, hubKey, jti string) (*TicketClaims, error) {
 	respBody, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return nil, &TicketError{StatusCode: resp.StatusCode, Body: string(respBody)}
+		// Тіло — у лог (Error()), а ERP на збої віддає цілу сторінку помилки
+		// PHP: без обрізання кожен невдалий квиток лив би до 1 МБ у journald.
+		return nil, &TicketError{StatusCode: resp.StatusCode, Body: truncBody(respBody)}
 	}
 
 	var claims TicketClaims
 	if err := json.Unmarshal(respBody, &claims); err != nil {
-		return nil, fmt.Errorf("consume ticket: bad json from erp: %w (body=%q)", err, string(respBody))
+		return nil, fmt.Errorf("consume ticket: bad json from erp: %w (body=%q)", err, truncBody(respBody))
 	}
 	if strings.TrimSpace(claims.UserID) == "" && strings.TrimSpace(claims.OrgID) == "" {
 		// ERP відповів 2xx, але без розпізнаваних claims — трактуємо як
 		// невалідну відповідь, а не як «порожній, але легітимний» тікет.
-		return nil, fmt.Errorf("consume ticket: erp response has no claims (body=%q)", string(respBody))
+		return nil, fmt.Errorf("consume ticket: erp response has no claims (body=%q)", truncBody(respBody))
 	}
 	return &claims, nil
+}
+
+// truncBody — початок тіла відповіді для логу; причина збою ERP вміщається в
+// перші байти, решта — HTML-обгортка.
+func truncBody(b []byte) string {
+	const max = 256
+	if len(b) <= max {
+		return string(b)
+	}
+	// Ріжемо на межі символу: кирилиця в тілі ERP — 2 байти на літеру, і
+	// розрізана навпіл дала б у журналі «�».
+	n := max
+	for n > 0 && !utf8.RuneStart(b[n]) {
+		n--
+	}
+	return string(b[:n]) + "…"
 }

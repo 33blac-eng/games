@@ -37,12 +37,38 @@ type controlReq struct {
 	// (наповнення перемикача при відкритті консолі), інакше 0 не відрізнити від
 	// «перемкни на основний».
 	Output *int `json:"output"`
+	// MaxBitrateBps / MaxFps — «Якість» і «Швидкість» тулбара (контракт C1).
+	// RawMessage, а не *int: тут ТРИ стани, і всі різні. Поля немає — не чіпати
+	// (вибір монітора не має скидати якість); null — зняти стелю; число — стеля.
+	MaxBitrateBps json.RawMessage `json:"max_bitrate_bps,omitempty"`
+	MaxFps        json.RawMessage `json:"max_fps,omitempty"`
 }
 
-// controlResp — стан моніторів ноди, як його зараз знає hub.
+// controlResp — стан моніторів ноди, як його зараз знає hub, і застосовані
+// стелі якості. nil = стелі немає (серіалізується як null, а не зникає: консоль
+// має відрізняти «стелі немає» від «старий хаб про стелю не знає»).
 type controlResp struct {
-	Outputs []outputInfo `json:"outputs"`
-	Active  int          `json:"active"`
+	Outputs       []outputInfo `json:"outputs"`
+	Active        int          `json:"active"`
+	MaxBitrateBps *uint64      `json:"max_bitrate_bps"`
+	MaxFps        *int         `json:"max_fps"`
+}
+
+// maxFpsCeil — верх стелі кадрів/с (C1). Ним же знімається стеля в агента:
+// агент бере min(свій -fps, стеля), тож 60 = «як без стелі».
+const maxFpsCeil = 60
+
+// optInt розбирає поле з трьома станами: set=false — поля немає; set=true і
+// null=true — явний null; інакше v.
+func optInt(raw json.RawMessage) (v int64, set, null bool, err error) {
+	if len(raw) == 0 {
+		return 0, false, false, nil
+	}
+	if string(raw) == "null" {
+		return 0, true, true, nil
+	}
+	err = json.Unmarshal(raw, &v)
+	return v, true, false, err
 }
 
 // setOutputs запамʼятовує монітори ноди з offer-а агента.
@@ -61,7 +87,16 @@ func outputsSnapshot(ns *nodeSession) controlResp {
 	defer ns.mu.Unlock()
 	out := make([]outputInfo, len(ns.outputs))
 	copy(out, ns.outputs)
-	return controlResp{Outputs: out, Active: ns.activeOutput}
+	resp := controlResp{Outputs: out, Active: ns.activeOutput}
+	if ns.capBps > 0 {
+		v := ns.ceilingBps()
+		resp.MaxBitrateBps = &v
+	}
+	if ns.maxFps > 0 {
+		v := ns.maxFps
+		resp.MaxFps = &v
+	}
+	return resp
 }
 
 // sendSelectOutput шле агентові ЦІЄЇ ноди «перемкни на idx» тим самим
@@ -69,19 +104,29 @@ func outputsSnapshot(ns *nodeSession) controlResp {
 // false, поки канал не відкритий: старий агент без DataChannel перемикати нічим,
 // і мовчазний «успіх» тут був би брехнею консолі.
 func sendSelectOutput(ns *nodeSession, idx int) bool {
+	return sendAgentCtl(ns, func(seq uint64) control.Msg { return control.SelectOutput(seq, idx) })
+}
+
+// sendMaxFps — стеля кадрів/с агентові ЦІЄЇ ноди (C1), тим самим шляхом.
+func sendMaxFps(ns *nodeSession, fps int) bool {
+	return sendAgentCtl(ns, func(seq uint64) control.Msg { return control.MaxFps(seq, fps) })
+}
+
+func sendAgentCtl(ns *nodeSession, build func(seq uint64) control.Msg) bool {
 	dc := ctlChan(ns)
 	if dc == nil {
 		return false
 	}
-	seq := atomic.AddUint64(&ns.ctlSeq, 1)
-	if err := control.Write(dcWriter{dc}, control.SelectOutput(seq, idx)); err != nil {
-		log.Printf("sendSelectOutput [node=%s]: %v", ns.nodeID, err)
+	m := build(atomic.AddUint64(&ns.ctlSeq, 1))
+	if err := control.Write(dcWriter{dc}, m); err != nil {
+		log.Printf("ctl %s [node=%s]: %v", m.Type, ns.nodeID, err)
 		return false
 	}
 	return true
 }
 
-// handleControl — POST /control: {ticket|token, output?} -> {outputs, active}.
+// handleControl — POST /control: {ticket|token, output?, max_bitrate_bps?,
+// max_fps?} -> {outputs, active, max_bitrate_bps, max_fps}.
 //
 // Без "output" — чисте читання (перемикачу в консолі є чим наповнитись). З
 // "output" — команда агентові. Відповідь однакова в обох випадках, тож консоль
@@ -109,12 +154,26 @@ func handleControl(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Спершу розбираємо ВСІ поля, потім застосовуємо: інакше {"output":1,
+	// "max_fps":0} перемикав монітор і відповідав 400, а консоль вважала, що
+	// нічого не застосовано.
+	if req.Output != nil && *req.Output < 0 {
+		http.Error(w, "output must be >= 0", http.StatusBadRequest)
+		return
+	}
+	bps, bpsSet, bpsNull, err := optInt(req.MaxBitrateBps)
+	if err != nil || (bpsSet && !bpsNull && bps <= 0) {
+		http.Error(w, "max_bitrate_bps must be a positive integer or null", http.StatusBadRequest)
+		return
+	}
+	fps, fpsSet, fpsNull, err := optInt(req.MaxFps)
+	if err != nil || (fpsSet && !fpsNull && fps <= 0) {
+		http.Error(w, "max_fps must be a positive integer or null", http.StatusBadRequest)
+		return
+	}
+
 	if req.Output != nil {
 		idx := *req.Output
-		if idx < 0 {
-			http.Error(w, "output must be >= 0", http.StatusBadRequest)
-			return
-		}
 		if !sendSelectOutput(ns, idx) {
 			http.Error(w, "agent control channel not open", http.StatusConflict)
 			return
@@ -131,6 +190,55 @@ func handleControl(w http.ResponseWriter, r *http.Request) {
 		ns.activeOutput = idx
 		ns.mu.Unlock()
 		log.Printf("select_output [node=%s]: -> %d", ns.nodeID, idx)
+	}
+
+	ns.mu.Lock()
+	curCap, hadFps := ns.capBps, ns.maxFps > 0
+	ns.mu.Unlock()
+
+	// C1: «Якість» — стеля бітрейту ноди. Лише стан хаба (агентові їде звичайний
+	// bitrate_target), тож 409 тут не буває. Та сама стеля, що вже діє, — нічого
+	// не робити, як і для fps нижче: тулбар повторює поточну «Якість» (число або
+	// null) з кожною зміною «Швидкості» і на повторі після реконекту, а
+	// setBitrateCap скинув би вивчену ціль контролера на стелю (H-26).
+	if bpsSet && clampBitrateCap(uint64(bps)) != curCap {
+		setBitrateCap(ns, uint64(bps)) // null -> bps 0 -> стелю знято
+	}
+
+	// C1: «Швидкість» — стеля кадрів/с, її виконує агент.
+	// null при знятій стелі — нічого не робити: агента смикати нема чим, і 409
+	// без каналу тут був би брехнею («не застосовано» те, що й так діє).
+	if fpsSet && !(fpsNull && !hadFps) {
+		f := int(min(fps, maxFpsCeil))
+		if fpsNull {
+			f = 0
+		}
+		send := f
+		if send == 0 {
+			send = maxFpsCeil
+		}
+		if !sendMaxFps(ns, send) {
+			http.Error(w, "agent control channel not open", http.StatusConflict)
+			return
+		}
+		ns.mu.Lock()
+		ns.maxFps = f
+		ns.mu.Unlock()
+		log.Printf("max_fps [node=%s]: -> %d", ns.nodeID, send)
+	}
+
+	// Стелі тулбара належать глядачам (clearViewerCapsLocked). Глядачів зараз
+	// нема — останній пішов, поки ми застосовували, або їх не було від початку:
+	// стеля нічия і не має дістатись наступному, тож знімаємо тим самим шляхом.
+	ns.mu.Lock()
+	orphaned := len(ns.viewers) == 0 && (ns.capBps > 0 || ns.maxFps > 0)
+	lateFps := false
+	if orphaned {
+		lateFps = clearViewerCapsLocked(ns)
+	}
+	ns.mu.Unlock()
+	if lateFps {
+		sendMaxFps(ns, maxFpsCeil)
 	}
 
 	writeJSON(w, outputsSnapshot(ns))

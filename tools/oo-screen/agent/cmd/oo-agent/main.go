@@ -1,8 +1,8 @@
 //go:build windows
 
 // oo-agent — Т2: живий агент. DXGI-захоплення (agent/capture) → апаратний
-// MFT-енкодер (agent/encode) → один із двох транспортів (обидва кандидати в
-// одному бінарі, вибір прапорцем -transport). Не дублює agent/capture чи
+// MFT-енкодер (agent/encode) → транспорт WebRTC (легасі-бенч WT — лише в
+// збірці з -tags wt, transport_wt.go; прапорець -transport). Не дублює agent/capture чи
 // agent/encode — тільки склеює їх і §5.5 admission-політику.
 package main
 
@@ -10,7 +10,6 @@ import (
 	"bufio"
 	"bytes"
 	"context"
-	"crypto/tls"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -32,13 +31,11 @@ import (
 	"github.com/pion/rtcp"
 	"github.com/pion/webrtc/v4"
 	"github.com/pion/webrtc/v4/pkg/media"
-	"github.com/quic-go/quic-go"
 
 	"github.com/organicoils/oo-screen/agent/capture"
 	"github.com/organicoils/oo-screen/agent/encode"
-	"github.com/organicoils/oo-screen/internal/h264"
 	"github.com/organicoils/oo-screen/internal/control"
-	"github.com/organicoils/oo-screen/internal/envelope"
+	"github.com/organicoils/oo-screen/internal/h264"
 )
 
 const (
@@ -47,36 +44,6 @@ const (
 	// кашею з макроблоків.
 	minBitrateBps = 300_000
 
-	// keepaliveAfter — скільки чекати новий кадр, перш ніж переслати останній.
-	// На нерухомому екрані DXGI не віддає кадрів узагалі (dxgi.c: WAIT_TIMEOUT
-	// -> OOS_TIMEOUT, capture.NextFrame крутиться далі), а сторож у браузері рве
-	// сесію безповоротно, якщо кадру не було 3000 мс (web/desktop-oo.js:
-	// fallback() ставить finished=true). Тобто без keepalive людина, яка на три
-	// секунди прибрала руку з миші, гарантовано втрачає сесію.
-	//
-	// 1000 мс дає потрійний запас: два поспіль загублені keepalive ще не валять
-	// сесію. Ціна виміряна, а не на око: повторно закодований ІДЕНТИЧНИЙ кадр на
-	// NVIDIA H.264 MFT (1920x1080, CBR 8 Мбіт/с) важить 75–374 байти, у
-	// середньому 184 — це ≈1,5 кбіт/с, тобто ~0,02% від цільового бітрейту.
-	keepaliveAfter = 1000 * time.Millisecond
-
-	// admissionFloor — найдовша пауза, яку має право створити admission-дроп
-	// (§5.5). Дроп рахує лише queued і тому викидає й keepalive-кадр — тобто
-	// рівно те, що годує сторож у браузері. На насиченому транспорті захист від
-	// нерухомого екрана зникав саме тоді, коли він найпотрібніший, і платив за
-	// це не якістю, а сесією.
-	//
-	// Дроп коштує ЦІЛОГО keepaliveAfter, а не одного кадру: після continue
-	// NextFrame вичікує дедлайн наново. Тож двох дропів поспіль уже досить, щоб
-	// дійти до 3000 мс сторожа.
-	//
-	// Два keepaliveAfter — та сама межа, з якої виходить
-	// TestKeepaliveAfterLeavesRoomForWatchdog: два пропущені keepalive ще в
-	// запасі, третій мусить пройти. Окремої константи не заводимо навмисно:
-	// поріг зобовʼязаний рухатись разом із keepaliveAfter.
-	admissionFloor = 2 * keepaliveAfter
-
-	agentALPN = "oo-screen-agent"
 	// h264FmtpLine — фолбек, коли рівень енкодера ще невідомий (dial до
 	// відкриття MFT) або MFT його не назвав. Живий рядок дає h264Fmtp().
 	// Main 3.1 (4d001f) — рівно те, що Chrome оголошує в
@@ -85,25 +52,17 @@ const (
 	h264FmtpLine = "level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=4d001f"
 	dialTimeout  = 10 * time.Second // dial/HTTP таймаут: реконект/shutdown не мають зависати назавжди
 
-	// wtWriteTimeout — стеля на ОДИН запис кадру в QUIC-стрім (A-33).
-	//
-	// Не «скільки не шкода чекати», а «з якої миті чекати вже нема сенсу»:
-	// admissionFloor — найдовша пауза, яку ми взагалі дозволяємо потоку (два
-	// keepaliveAfter, далі сторож у браузері рве сесію). Запис, що не вклався в
-	// неї, вже нічого не рятує — картинка на тому боці однаково прострочена,
-	// тож дешевше визнати транспорт мертвим і перепідключитись.
-	wtWriteTimeout = admissionFloor
 )
 
 var httpClient = &http.Client{Timeout: dialTimeout}
 
-// encPLID — profile-level-id (6 hex-цифр), прочитаний із SPS ЖИВОГО енкодера.
-// Пишеться при кожному відкритті енкодера, читається на dial. Порожньо =
-// енкодера ще нема (dial до відкриття MFT) або SPS не розібрався.
 // encProfileMain — profile_idc профілю Main (eAVEncH264VProfile_Main у mft.c).
 // Значення в MF_MT_MPEG2_PROFILE збігається з profile_idc у SPS.
 const encProfileMain = 77
 
+// encPLID — profile-level-id (6 hex-цифр), прочитаний із SPS ЖИВОГО енкодера.
+// Пишеться при кожному відкритті енкодера, читається на dial. Порожньо =
+// енкодера ще нема (dial до відкриття MFT) або SPS не розібрався.
 var encPLID atomic.Value // string
 
 // h264Fmtp — SDP fmtp для нашої доріжки (A-26).
@@ -184,132 +143,6 @@ type transport interface {
 	close()
 }
 
-// ---- WebTransport (кандидат B): envelope-кадри по QUIC-стріму -------------
-
-type wtTransport struct {
-	conn     *quic.Conn
-	videoStr *quic.Stream
-}
-
-func dialWT(hubAddr string, onKeyframeRequest func(), onBitrateTarget func(uint64), onSelectOutput func(int)) (*wtTransport, error) {
-	tlsConf := &tls.Config{
-		InsecureSkipVerify: true, // T1/T2: самопідписаний сертифікат hub-wt
-		NextProtos:         []string{agentALPN},
-	}
-	dialCtx, cancel := context.WithTimeout(context.Background(), dialTimeout)
-	defer cancel()
-	conn, err := quic.DialAddr(dialCtx, hubAddr, tlsConf, &quic.Config{})
-	if err != nil {
-		return nil, fmt.Errorf("dial hub-wt %s: %w", hubAddr, err)
-	}
-
-	ctrlStr, err := conn.OpenStreamSync(dialCtx)
-	if err != nil {
-		conn.CloseWithError(0, "")
-		return nil, fmt.Errorf("open control stream: %w", err)
-	}
-	if err := control.Write(ctrlStr, control.Hello(authToken(), 1)); err != nil {
-		conn.CloseWithError(0, "")
-		return nil, fmt.Errorf("send hello: %w", err)
-	}
-	// heartbeat раз/5с, поки конект живий (control-протокол §5.4)
-	go func() {
-		t := time.NewTicker(5 * time.Second)
-		defer t.Stop()
-		var seq uint64 = 1
-		for range t.C {
-			seq++
-			if err := control.Write(ctrlStr, control.Heartbeat(seq)); err != nil {
-				return
-			}
-		}
-	}()
-
-	// Control-стрім двонаправлений: hub шле keyframe_request сюди ж, поки
-	// агент лише пише (heartbeat) і ніколи не читає — запити зависають у
-	// буфері й ForceIDR ніколи не викликається. Читаємо персистентно й на
-	// keyframe_request віддаємо колбек у main() (§5.4/§5.5).
-	go func() {
-		br := bufio.NewReader(ctrlStr)
-		for {
-			m, err := control.ReadKnown(br, nil)
-			if err != nil {
-				return // конект/стрім мертвий — reconnect-логіка в main() це побачить через send-помилки
-			}
-			if m.Type == control.TypeKeyframeRequest && onKeyframeRequest != nil {
-				onKeyframeRequest()
-			}
-			if m.Type == control.TypeBitrateTarget && onBitrateTarget != nil {
-				onBitrateTarget(m.BitrateBps)
-			}
-			// Дзеркало WebRTC-гілки (handleCtlMessage): вибір монітора мусить
-			// працювати обома ногами, інакше «перемкни екран» тихо не діяло б
-			// саме на тому транспорті, яким знімають бенчі.
-			if m.Type == control.TypeSelectOutput && onSelectOutput != nil {
-				onSelectOutput(m.Output)
-			}
-		}
-	}()
-
-	videoStr, err := conn.OpenStreamSync(dialCtx)
-	if err != nil {
-		conn.CloseWithError(0, "")
-		return nil, fmt.Errorf("open video stream: %w", err)
-	}
-
-	return &wtTransport{conn: conn, videoStr: videoStr}, nil
-}
-
-func (t *wtTransport) send(au encode.AU, seq uint64) error {
-	flags := uint8(0)
-	if au.Keyframe {
-		flags |= envelope.FlagKeyframe
-		// Енкодер (agent/encode) вставляє SPS/PPS у кожен IDR — контракт §5.2.
-		flags |= envelope.FlagConfigured
-	}
-	f := &envelope.Frame{
-		Flags: flags,
-		// Епоха БІЛЬШЕ НЕ КОНСТАНТА: SwitchOutput зсуває її, бо інший монітор —
-		// інша геометрія, тобто інший SPS. Глядач мусить побачити зсув, інакше
-		// нова геометрія прийде посеред старого потоку (див. output.go).
-		ConfigEpoch: currentEpoch(),
-		FrameSeq:    seq,
-		PTS:         uint64(au.PTS.Microseconds()),
-		Payload:     bytes.Clone(au.Data),
-	}
-	buf, err := f.Marshal()
-	if err != nil {
-		return fmt.Errorf("marshal frame seq=%d: %w", seq, err)
-	}
-	// 🚨 A-33. Без дедлайну Write на QUIC-стрімі блокується НАЗАВЖДИ, щойно
-	// вікно flow control закрилось: хаб перестав вичитувати (завис, а не впав),
-	// вікно не рухається — і єдиний ordered sender стоїть у цьому виклику. А
-	// поки він стоїть, у txErrCh нічого не приходить, тобто реконект, який мав
-	// би це полагодити, не запускається взагалі. Дедлайн перетворює зависання
-	// на звичайну помилку відправки, а її кадровий цикл уже вміє лікувати.
-	if err := t.videoStr.SetWriteDeadline(time.Now().Add(wtWriteTimeout)); err != nil {
-		return fmt.Errorf("set write deadline seq=%d: %w", seq, err)
-	}
-	if _, err := t.videoStr.Write(buf); err != nil {
-		return fmt.Errorf("write frame seq=%d: %w", seq, err)
-	}
-	return nil
-}
-
-// sendAudio: нога WT — бенчова, доріжок у ній немає взагалі (envelope возить
-// самі AU відео). Звук туди не їде і ніколи не їхав; runAudio для цього
-// транспорту й не стартує (main: гілка лише для webrtc).
-func (t *wtTransport) sendAudio([]byte, time.Duration) error { return nil }
-
-func (t *wtTransport) close() {
-	if t.videoStr != nil {
-		_ = t.videoStr.Close()
-	}
-	if t.conn != nil {
-		_ = t.conn.CloseWithError(0, "")
-	}
-}
-
 // ---- WebRTC (кандидат A): TrackLocalStaticSample, Pion пакетизує в RTP ----
 
 type webrtcTransport struct {
@@ -323,15 +156,42 @@ type webrtcTransport struct {
 	// frameInterval — 1/fps: тривалість, яку віддаємо pion, поки різниці PTS
 	// сусідніх AU ще нема (перший AU сесії). Див. sampleDuration.
 	frameInterval time.Duration
+	// ctl — той самий "oosc-ctl"; агент у нього пише лише fallback_reason
+	// (reportAvailability). nil = канал не створювався.
+	ctl *webrtc.DataChannel
+	// fmtp — рядок, з яким піднято ЦЮ ногу (offer). Див. fmtpStale.
+	fmtp string
 }
 
-func newWebRTCAPI() (*webrtc.API, error) {
+// fmtpStale — енкодер відкрився ПІСЛЯ dial з іншим profile-level-id, ніж той,
+// що ця нога оголосила. Типовий шлях: старт на заблокованому ПК (енкодера ще
+// нема -> фолбек 4d001f), перший глядач -> MFT на 2560x1440 з рівнем 5.1.
+// Хаб і глядач домовились про одне, кодується інше — рівно той режим, з якого
+// почався A-26. Лікується лише новим offer-ом, тобто реконектом.
+func (t *webrtcTransport) fmtpStale() bool {
+	return t.fmtp != h264Fmtp()
+}
+
+// sendFallbackReason — сказати хабу, чому картинки зараз не буде ("" = знову
+// буде). false = канал ще не відкритий, повторити пізніше.
+func (t *webrtcTransport) sendFallbackReason(seq uint64, reason string) bool {
+	if t.ctl == nil || t.ctl.ReadyState() != webrtc.DataChannelStateOpen {
+		return false
+	}
+	var b bytes.Buffer
+	if err := control.Write(&b, control.FallbackReason(seq, reason)); err != nil {
+		return false
+	}
+	return t.ctl.SendText(b.String()) == nil
+}
+
+func newWebRTCAPI(fmtp string) (*webrtc.API, error) {
 	m := &webrtc.MediaEngine{}
 	if err := m.RegisterCodec(webrtc.RTPCodecParameters{
 		RTPCodecCapability: webrtc.RTPCodecCapability{
 			MimeType:    webrtc.MimeTypeH264,
 			ClockRate:   90000,
-			SDPFmtpLine: h264Fmtp(),
+			SDPFmtpLine: fmtp,
 			RTCPFeedback: []webrtc.RTCPFeedback{
 				{Type: "nack"},
 				{Type: "nack", Parameter: "pli"},
@@ -396,6 +256,15 @@ type outputList struct {
 
 var outputs atomic.Pointer[outputList]
 
+// maxFpsWanted — остання стеля кадрів/с від хаба (control max_fps, C1); 0 = без
+// стелі. Глобальна, а не ще один колбек крізь dial*: її пише DataChannel-
+// горутина, читає лише кадровий цикл (maxFpsGap), і стан цей — рівно одне число.
+// Скидається на початку кожного dialWebRTC: стеля належить сесії хаба, а хаб
+// повторює її на oosc-ctl OnOpen лише тоді, коли вона в нього є. Після рестарту
+// хаба (кожна заливка) її в нього нема — і старе число інакше тримало б fps
+// для всіх наступних глядачів.
+var maxFpsWanted atomic.Int32
+
 // publishOutputs перечитує список виходів і запам'ятовує активний. Помилка
 // енумерації не фатальна: без списку агент стрімить як стрімив, просто консоль
 // не побачить, з чого вибирати.
@@ -413,7 +282,11 @@ func dialWebRTC(hubURL string, frameInterval time.Duration, onKeyframeRequest fu
 	// Сторож живості починає нову сесію роззброєним: тримати озброєним із
 	// останнім ударом ПОПЕРЕДНЬОЇ означало б вирішити рвати щойно підняте.
 	hubLive.disarm()
-	api, err := newWebRTCAPI()
+	setMaxFps(0) // нова сесія хаба — стеля, якщо є, приїде з його OnOpen
+	// Один знімок на всю ногу: MediaEngine і трек мусять оголосити ОДНЕ й те
+	// саме, навіть якщо енкодер відкриється посеред dial.
+	fmtp := h264Fmtp()
+	api, err := newWebRTCAPI(fmtp)
 	if err != nil {
 		return nil, fmt.Errorf("new api: %w", err)
 	}
@@ -425,8 +298,10 @@ func dialWebRTC(hubURL string, frameInterval time.Duration, onKeyframeRequest fu
 	// bitrate_target, keyframe_request) і, для зворотної сумісності, старі
 	// текстові "resume"/"pause" за присутністю глядача. Створюємо ДО offer-а,
 	// щоб канал потрапив у SDP; hub (answerer) ловить його через OnDataChannel.
+	var ctlChan *webrtc.DataChannel
 	if onGate != nil || onBitrateTarget != nil || onSelectOutput != nil {
 		ctl, dcErr := pc.CreateDataChannel("oosc-ctl", nil)
+		ctlChan = ctl
 		if dcErr != nil {
 			_ = pc.Close()
 			return nil, fmt.Errorf("create control datachannel: %w", dcErr)
@@ -454,11 +329,7 @@ func dialWebRTC(hubURL string, frameInterval time.Duration, onKeyframeRequest fu
 			_ = pc.Close()
 			return nil, fmt.Errorf("create input datachannel: %w", dcErr)
 		}
-		in.OnMessage(func(msg webrtc.DataChannelMessage) {
-			if err := handleInputMessage(msg.Data, inj); err != nil {
-				logInputProblem(time.Now(), err)
-			}
-		})
+		attachInputChannel(in, inj)
 		// Поверхня вводу лишається ВСІМ віртуальним робочим столом (дефолт
 		// input.Injector), і це точно лише поки монітор один: DXGI-виходи не
 		// віддають свій Left/Top через capture.OutputInfo, тож звузити її нема з
@@ -473,7 +344,7 @@ func dialWebRTC(hubURL string, frameInterval time.Duration, onKeyframeRequest fu
 	track, err := webrtc.NewTrackLocalStaticSample(webrtc.RTPCodecCapability{
 		MimeType:    webrtc.MimeTypeH264,
 		ClockRate:   90000,
-		SDPFmtpLine: h264Fmtp(),
+		SDPFmtpLine: fmtp,
 	}, "video", "oo-screen-agent")
 	if err != nil {
 		_ = pc.Close()
@@ -594,7 +465,7 @@ func dialWebRTC(hubURL string, frameInterval time.Duration, onKeyframeRequest fu
 		_ = pc.Close()
 		return nil, err
 	}
-	return &webrtcTransport{pc: pc, track: track, atrk: atrk, frameInterval: frameInterval}, nil
+	return &webrtcTransport{pc: pc, track: track, atrk: atrk, frameInterval: frameInterval, ctl: ctlChan, fmtp: fmtp}, nil
 }
 
 // waitConnected чекає на connected, який закриває обробник стану з dialWebRTC.
@@ -734,6 +605,8 @@ func handleCtlMessage(data []byte, onKeyframeRequest func(), onGate func(bool), 
 			if onSelectOutput != nil {
 				onSelectOutput(m.Output)
 			}
+		case control.TypeMaxFps:
+			setMaxFps(m.Fps)
 		case control.TypeKeyframeRequest:
 			// Досі WebRTC-нога реагувала лише на RTCP PLI, тож запит хаба
 			// control-каналом нікуди не доходив.
@@ -754,6 +627,17 @@ func handleCtlMessage(data []byte, onKeyframeRequest func(), onGate func(bool), 
 		if bps, ok := parseBitrateLine(s); ok && onBitrateTarget != nil {
 			onBitrateTarget(bps)
 		}
+	}
+}
+
+// setMaxFps — стеля з хаба (1..60); усе поза межами = «без стелі», а не
+// «0 кадрів/с»: зависла картинка гірша за зайвий CPU.
+func setMaxFps(fps int) {
+	if fps < 1 || fps > 60 {
+		fps = 0
+	}
+	if int(maxFpsWanted.Swap(int32(fps))) != fps {
+		log.Printf("oo-agent: max_fps -> %d (0 = без стелі)", fps)
 	}
 }
 
@@ -786,6 +670,16 @@ func shouldKeepalive(waitErr error, paused, haveLast bool) bool {
 		return false // глядача нема: keepalive зʼїв би економію, заради якої робився гейтинг
 	}
 	return haveLast // без жодного захопленого кадру повторювати нема чого
+}
+
+// keepStillAU — чи годиться щойно закодований keepalive-AU на повтор під час
+// локу/UAC (sendStillKeepalive). Лише коли той самий кадр УЖЕ був закодований
+// перед цим: тоді P-кадр справді «нічого не змінилось». Кадр, який
+// max_fps/admission/mouse-only викинули ДО кодування, потрапляє в keepalive
+// першим — і його P-кадр несе реальну дельту. Повтор такої дельти поверх
+// референсу, де вона вже є, накладає її вдруге.
+func keepStillAU(still, sameFrameEncodedBefore bool, aus []encode.AU) bool {
+	return still && sameFrameEncodedBefore && len(aus) == 1 && !aus[0].Keyframe
 }
 
 // shouldAdmit вирішує, чи пускати щойно захоплений кадр далі — на кодування й
@@ -1251,7 +1145,7 @@ func (s *stream) SwitchOutput(idx int) error {
 // ручку керування його екраном повз усю авторизацію ЕРП.
 
 func main() {
-	transportKind := flag.String("transport", "webrtc", "транспорт: webrtc|wt (wt — легасі T1-стенд)")
+	transportKind := flag.String("transport", "webrtc", "транспорт: webrtc|wt (wt — легасі T1-стенд, лише збірка -tags wt)")
 	hubAddr := flag.String("hub", "", "адреса hub-а (wt: host:port QUIC; webrtc: http://host:port/offer/agent)")
 	fps := flag.Int("fps", 30, "цільовий FPS енкодера/GOP (60 — лише для стенда: подвійний CPU без видимої різниці на робочому столі)")
 	bitrate := flag.Int("bitrate", 0, "бітрейт, біт/с (CBR); 0 = порахувати за пікселями кадру (defaultBitrate)")
@@ -1318,14 +1212,10 @@ func main() {
 		}
 	}
 
-	// A-04: під -H windowsgui os.Stderr не існує — уся капчер-діагностика
-	// (recreate failed, access lost) губилась навіть із -log. Один сток.
-	logger := slog.New(slog.NewTextHandler(log.Writer(), nil))
-
 	// encode.New нормалізує FPS<=0 до 30 усередині (encode_windows.go:120),
-	// але це приватне — зовнішній код (PTS-ділення нижче) про цю нормалізацію
-	// не знає. Нормалізуємо прапорець тут, ОДИН раз, і використовуємо
-	// effectiveFPS всюди далі (encode.Config і розрахунок PTS), щоб
+	// але це приватне — зовнішній код (PTS-ділення в кадровому циклі) про цю
+	// нормалізацію не знає. Нормалізуємо прапорець тут, ОДИН раз, і
+	// використовуємо s.fps всюди далі (encode.Config і розрахунок PTS), щоб
 	// -fps=0 не привів до ділення на нуль у циклі захоплення.
 	effectiveFPS := *fps
 	if effectiveFPS <= 0 {
@@ -1352,24 +1242,72 @@ func main() {
 	// читає кадровий цикл. nil = вікно не піднялось, поведінка як до A-39.
 	session := watchSession(stop)
 
+	s := openStream(ctx, &stream{
+		reqW: *width, reqH: *height, fps: effectiveFPS,
+		forceSoftware: *forceSoftware,
+		// A-04: під -H windowsgui os.Stderr не існує — уся капчер-діагностика
+		// (recreate failed, access lost) губилась навіть із -log. Один сток.
+		logger: slog.New(slog.NewTextHandler(log.Writer(), nil)),
+		output: outIdx,
+	}, *bitrate)
+	if s == nil {
+		return
+	}
+	defer s.close()
+
+	// Список моніторів іде в offer (див. offerReq.Outputs) — консолі більше
+	// нізвідки його взяти. Оновлюється тут і на кожному перемиканні.
+	publishOutputs(outIdx)
+	if l := outputs.Load(); l != nil {
+		log.Printf("oo-agent: outputs=%d active=%d %+v", len(l.Outputs), l.Active, l.Outputs)
+	}
+
+	a := newAgent(s, session, *transportKind, *hubAddr)
+	tp, err := retryUntil(ctx, "initial dial "+*hubAddr, a.dial)
+	if err != nil {
+		return
+	}
+	a.tp = tp
+	log.Printf("oo-agent: connected via %s to %s", *transportKind, *hubAddr)
+
+	go a.runSender()
+	// Звук — ОКРЕМА горутина, бо джерело в нього своє (WASAPI, ~10мс пакети) і
+	// зупиняти через нього кадровий цикл нема за що. Транспорт береться тим
+	// самим a.transport(), що й у відео-sender-а: після реконекту звук піде в
+	// НОВУ доріжку без жодного власного механізму перепідключення.
+	// Гейт — той самий gatePaused, що керує відео (див. runAudio).
+	if audioEnabled && *transportKind == "webrtc" {
+		go runAudio(ctx, &a.gatePaused, func(data []byte, dur time.Duration) error {
+			return a.transport().sendAudio(data, dur)
+		})
+	}
+	go a.watchAvailability(ctx)
+
+	a.run(ctx)
+}
+
+// openStream піднімає капчер і енкодер стартового монітора (s.output) і
+// рахує стартовий бітрейт. nil — агента зупинили під час бек-офу; тоді все,
+// що встигло відкритись, уже закрито.
+func openStream(ctx context.Context, s *stream, bitrateFlag int) *stream {
 	// A-27: замість Fatalf — чекаємо з бек-офом (див. retryUntil). Але
 	// заблокований/захищений робочий стіл (E_ACCESSDENIED на DuplicateOutput)
 	// — не привід не йти на хаб: без агента на хабі ПК «зникає з пульта»
 	// на весь час локу (Maria, 05.09). Тоді стартуємо БЕЗ капчера: кадровий
 	// цикл підніме його через reacquireCapture, щойно зʼявиться глядач.
-	var cap_ *capture.Capturer
-	if c, cerr := capture.NewWithOptions(outIdx, capture.Options{Logger: logger}); cerr == nil {
-		cap_ = c
+	open := func() (*capture.Capturer, error) {
+		return capture.NewWithOptions(s.output, capture.Options{Logger: s.logger})
+	}
+	if c, cerr := open(); cerr == nil {
+		s.cap = c
 	} else if errors.Is(cerr, capture.ErrNotAvailable) || errors.Is(cerr, capture.ErrAccessLost) {
 		log.Printf("oo-agent: capture.New: %v — стартую без захоплення, підніму при появі глядача", cerr)
 	} else {
-		var rerr error
-		cap_, rerr = retryUntil(ctx, "capture.New", func() (*capture.Capturer, error) {
-			return capture.NewWithOptions(outIdx, capture.Options{Logger: logger})
-		})
+		c, rerr := retryUntil(ctx, "capture.New", open)
 		if rerr != nil {
-			return
+			return nil
 		}
+		s.cap = c
 	}
 	// Не чіпаємо readback ДО того, як дізнаємось тип енкодера. Раніше тут стояв
 	// SetCPUReadback(false), а після encode.New — умовний SetCPUReadback(true)
@@ -1379,21 +1317,21 @@ func main() {
 	// коли вже відомо hw vs sw. Капчер за замовчуванням у readback-режимі
 	// (NewWithOptions readback=true), тож для софт-шляху це взагалі no-op.
 
-	srcW, srcH := nativeSize(cap_, outIdx)
+	srcW, srcH := nativeSize(s.cap, s.output)
 	// Геометрію беремо ВІД ВИВОДУ, а не з зашитих 1920x1080: на моніторі
 	// 2560x1440 енкодер масштабував униз, і текст у таблицях виходив мильнішим,
 	// ніж у транспорті, який ми замінюємо. Прапорці лишаються шляхом для
 	// слабкого каналу — requestedSize віддає їм пріоритет.
 	//
-	// У stream кладемо СИРІ прапорці, а не цей результат: після select_output
+	// У stream лежать СИРІ прапорці, а не цей результат: після select_output
 	// монітор інший, і його рідний розмір має порахуватись заново (openEncoder).
-	reqW, reqH := requestedSize(*width, *height, srcW, srcH)
+	reqW, reqH := requestedSize(s.reqW, s.reqH, srcW, srcH)
 	// Бітрейт мусить іти за пікселями: рідна роздільність при старих 8 Мбіт/с —
 	// та сама мильна картинка, лише з іншого боку (на 1440p пікселів у 1.78
 	// раза більше при тому самому потоці).
-	bitrateBps := defaultBitrate(*bitrate, reqW, reqH)
+	bitrateBps := defaultBitrate(bitrateFlag, reqW, reqH)
 	log.Printf("oo-agent: capture opened, output %d, native %dx%d -> want %dx%d, bitrate %d bps",
-		outIdx, srcW, srcH, reqW, reqH, bitrateBps)
+		s.output, srcW, srcH, reqW, reqH, bitrateBps)
 
 	// Стеля для bitrate_target: hub бере її з поля bitrate в offer (ceilingBps).
 	// Ставимо ДО dial — offerReq читає цю змінну.
@@ -1404,648 +1342,37 @@ func main() {
 	// приймає ненадійно (див. bitrateTarget), і перерахунок лише тут розійшовся
 	// б зі стелею, яку ми оголосили хабу. Зайві біти зріже регулятор хаба.
 	startBitrateBps = bitrateBps
-
-	s := &stream{
-		reqW: *width, reqH: *height, fps: effectiveFPS,
-		forceSoftware: *forceSoftware, logger: logger,
-		cap: cap_, output: outIdx,
-	}
 	s.bitrateBps.Store(int64(bitrateBps))
-	// nil-guard: на паузі капчер звільнено (releaseCapture), тож на виході з
-	// агента, що стався у простої, s.cap уже nil — Close на nil впав би.
-	defer func() {
-		if s.cap != nil {
-			s.cap.Close()
-		}
-	}() // closure: закриває ПОТОЧНИЙ капчер (SwitchOutput/releaseCapture його міняють)
 
-	if cap_ != nil {
+	if s.cap != nil {
 		type encOpen struct {
 			enc  *encode.Encoder
 			w, h int
 			sw   bool
 		}
+		cap_ := s.cap
 		eo, err := retryUntil(ctx, "encode.New", func() (encOpen, error) {
 			e, w, h, sw, err := s.openEncoder(cap_.Device(), cap_.Generation(), srcW, srcH)
 			return encOpen{e, w, h, sw}, err
 		})
 		if err != nil {
-			return
+			s.close()
+			return nil
 		}
 		s.enc.Store(eo.enc)
 		s.encW, s.encH, s.software = eo.w, eo.h, eo.sw
-	}
-	defer func() {
-		if e := s.encoder(); e != nil {
-			e.Close()
-		}
-	}() // closure: закриває ПОТОЧНИЙ енкодер (nil на паузі)
-	if s.cap != nil {
 		s.applyReadback()
 	}
+	return s
+}
 
-	// Список моніторів іде в offer (див. offerReq.Outputs) — консолі більше
-	// нізвідки його взяти. Оновлюється тут і на кожному перемиканні.
-	publishOutputs(outIdx)
-	if l := outputs.Load(); l != nil {
-		log.Printf("oo-agent: outputs=%d active=%d %+v", len(l.Outputs), l.Active, l.Outputs)
+// close закриває ПОТОЧНІ енкодер і капчер (SwitchOutput/releaseCapture їх
+// міняють; на паузі капчер звільнено й s.cap == nil — Close на nil впав би).
+func (s *stream) close() {
+	if e := s.encoder(); e != nil {
+		e.Close()
 	}
-	// logFirstSoftFrame: одноразове діагностичне логування геометрії CPU-кадру.
-	// Краш на Computer (Intel, native 1920x1200, encode 1920x1080) не
-	// відтворюється на NVIDIA-боксі, тож коли агент піде на той ПК — ці цифри
-	// (розміри, страйди, чи Y/UV не nil) покажуть, ЩО саме приходить у submit,
-	// замість голого access violation. Друкуємо рівно раз, щоб не спамити лог.
-	var logFirstSoftFrame sync.Once
-
-	// onKeyframeRequest — спільний колбек для обох транспортів: WT читає
-	// keyframe_request з control-стріму hub-а, WebRTC отримує RTCP PLI.
-	// В обох випадках реакція та сама — примусовий IDR (§5.5).
-	// A-13/A-31: колбеки pion не беруть мʼютекс енкодера (Encode тримає його до
-	// 500 мс) і не форсують IDR самі — лише піднімають прапорець, який кадровий
-	// цикл застосовує з дебаунсом. Шторм PLI від глядачів = один IDR на 300 мс,
-	// а не IDR на кожен кадр.
-	onKeyframeRequest := func() {
-		s.wantIDR.Store(true)
+	if s.cap != nil {
+		s.cap.Close()
 	}
-
-	// on-demand гейтинг: дефолт — НЕ пауза (безпечний фолбек = стара always-on
-	// поведінка, якщо hub не шле сигналів). Hub шле "pause" щойно відкриється
-	// control-канал і глядача нема, тож без глядача агент іде в паузу за ~мс.
-	var gatePaused atomic.Bool
-	// gateSeen — «хаб цієї сесії вже сказав своє слово про гейт». Потрібен
-	// РІВНО одному місцю: A-28-паузі на час реконекту, яка мусить відрізнити
-	// «прапорець стоїть, бо його поставили ми» від «прапорець стоїть, бо так
-	// вирішив новий хаб». Без цього відновлення після дозвону затирало б
-	// свіжий pause, що прийшов по щойно відкритому контрол-каналу.
-	var gateSeen atomic.Bool
-	onGate := func(resume bool) {
-		gateSeen.Store(true)
-		// Лише перемикаємо прапорець — саме звільнення/підняття капчера робить
-		// кадровий цикл (releaseCapture/reacquireCapture), бо капчер не
-		// thread-safe і його не можна чіпати з цього колбека (інша горутина).
-		if resume {
-			if gatePaused.CompareAndSwap(true, false) {
-				s.wantIDR.Store(true) // новий глядач має отримати IDR негайно
-				log.Printf("oo-agent: viewer present — resuming (capture reacquired in frame loop)")
-			}
-		} else {
-			if gatePaused.CompareAndSwap(false, true) {
-				log.Printf("oo-agent: no viewer — pausing (capture released in frame loop)")
-			}
-		}
-	}
-
-	// applyBitrate — ЄДИНЕ місце, де ціль реально лягає в енкодер. Після
-	// успішної зміни одразу IDR (тим самим шляхом, що й keyframe_request):
-	// без нього поточний GOP догравається старим квантуванням і нова ціль
-	// проявиться аж через ~2с, тобто саме тоді, коли вона вже не потрібна.
-	applyBitrate := func(bps int) {
-		e := s.encoder()
-		if e == nil {
-			return // капчер звільнено на паузі — ціль застосується на reacquire
-		}
-		if err := e.SetBitrate(bps); err != nil {
-			log.Printf("oo-agent: SetBitrate(%d): %v", bps, err)
-			return
-		}
-		// Запамʼятовуємо ЖИВУ ціль: SwitchOutput відкриває новий енкодер саме з
-		// нею, інакше перемикання монітора мовчки скасовувало б притискання хаба.
-		s.bitrateBps.Store(int64(bps))
-		log.Printf("oo-agent: bitrate -> %d bps", bps)
-		if err := e.ForceIDR(); err != nil {
-			log.Printf("oo-agent: ForceIDR (bitrate change): %v", err)
-		}
-	}
-
-	// onBitrateTarget — hub просить іншу CBR-ціль. Крутимо ручку на живому
-	// енкодері: переоткриття MFT коштувало б зміни епохи (§5.5).
-	var bitrateWanted bitrateTarget
-	onBitrateTarget := func(want uint64) {
-		bps, ok := clampBitrate(want, bitrateBps)
-		if !ok {
-			return // без валідного bitrate_bps повідомлення ігноруємо
-		}
-		// «Не готово» = і пауза, і вікно resume, поки капчер ще піднімається
-		// (encoder==nil). Хаб шле resume, а ОДРАЗУ за ним resetBitrate, тож ціль
-		// регулярно прилітає саме в це вікно: без перевірки на nil-encoder
-		// applyBitrate тихо викидав би її на нульовому енкодері, і потік стартував
-		// би з дефолтним бітрейтом замість замовленого (знайшов Codex-рев'ю).
-		// Відкладена ціль застосується в кадровому циклі одразу після reacquire.
-		// A-13: завжди через кадровий цикл (take() перед Encode), ніколи з
-		// колбека — SetBitrate бере той самий мʼютекс, що й Encode.
-		bitrateWanted.set(bps, true)
-		log.Printf("oo-agent: bitrate -> %d bps (застосує кадровий цикл)", bps)
-	}
-
-	// onSelectOutput — hub попросив інший монітор (control §select_output; сам
-	// запит приходить із консолі ЕРП). Тут лише КЛАДЕМО намір: перемикання
-	// капчера робить кадровий цикл, бо capture.Capturer «NOT safe for concurrent
-	// use», а ми в горутині DataChannel/QUIC-стріму. Неіснуючий індекс відсіє
-	// SwitchOutput проти живої енумерації — залишимось на поточному моніторі.
-	onSelectOutput := func(idx int) {
-		log.Printf("oo-agent: select_output -> %d (застосує кадровий цикл)", idx)
-		s.requestOutput(idx)
-	}
-
-	// frameInterval рахуємо ДО dial: webrtcTransport бере його як тривалість
-	// першого AU (sampleDuration), і кожен реконект створює транспорт заново.
-	frameInterval := time.Second / time.Duration(effectiveFPS)
-
-	// pcDown — друга (і головна) причина реконекту поряд із txErrCh: стан
-	// PeerConnection. Буфер 1 + неблокуючий запис: причина потрібна одна, а
-	// обробник стану pion блокувати не можна.
-	pcDown := make(chan string, 1)
-	onDown := func(reason string) {
-		select {
-		case pcDown <- reason:
-		default:
-		}
-	}
-
-	tp, err := retryUntil(ctx, "initial dial "+*hubAddr, func() (transport, error) {
-		return dial(*transportKind, *hubAddr, frameInterval, onKeyframeRequest, onGate, onBitrateTarget, onSelectOutput, onDown)
-	})
-	if err != nil {
-		return
-	}
-	log.Printf("oo-agent: connected via %s to %s", *transportKind, *hubAddr)
-
-	type sendJob struct {
-		au  encode.AU
-		seq uint64
-	}
-
-	var (
-		seq        uint64       // envelope/output frame sequence (wt only; monotonic per AU sent)
-		captureSeq uint64       // input frame counter, drives encoder PTS independent of drops/output seq
-		queued     atomic.Int64 // # AUs enqueued but not yet sent — admission signal (replaces old per-AU inFlight bool)
-		dropped    atomic.Int64
-		sent       atomic.Int64
-		lastLog    = time.Now()
-		keepalives int // скільки разів переслали останній кадр (нерухомий екран)
-		throttled  int // скільки кадрів викинув бюджет CPU софт-енкодера
-		// s.lastFrame — останній захоплений кадр, джерело keepalive. Тримаємо
-		// саме вказівник капчера, без копії: у zero-copy режимі це його
-		// персистентна Blt-текстура, у CPU-режимі — його ж scratch-буфери
-		// (capture_windows.go: "overwritten by the next NextFrame" / "the
-		// returned frame aliases them"). Поки нового кадру нема, там лежить
-		// рівно останній — тобто те, що нам і треба переслати. Живе в stream, а
-		// не тут, бо перемикання монітора ЗОБОВʼЯЗАНЕ його скинути разом із
-		// капчером, чиї буфери він аліасить.
-		// lastSeqAt — стінний час кадру, від якого рахуємо зсув PTS. Не час
-		// виклику NextFrame: між кадрами ще є кодування й відправка. Ставимо
-		// перед самим циклом — рукостискання транспорту до потоку не належить.
-		lastSeqAt time.Time
-		// lastAdmitAt — стінний час ОСТАННЬОГО кадру, який admission пропустив
-		// далі. Окремо від lastSeqAt: той рухається і на дропнутих кадрах (PTS
-		// іде за стінним годинником), а межу паузи треба міряти саме по тому,
-		// що дійсно поїхало в транспорт.
-		lastAdmitAt time.Time
-		txErrCh     = make(chan error, 1)
-		tpMu        sync.Mutex // guards tp across reconnects; the single ordered sender goroutine reads it under this lock
-		sendQueue   = make(chan sendJob, 8)
-	)
-
-	// Один ordered sender: усі AU (у т.ч. кілька з одного enc.Encode виклику,
-	// напр. IDR+trailing delta AU з тієї самої кодованої картинки) ідуть через
-	// ЦЕЙ канал і відправляються СТРОГО послідовно однією горутиною. Раніше
-	// кожен AU спамив власну goroutine.send — конкурентні send() на той самий
-	// стрім могли інтерлівитись/переставлятись місцями, і кожна goroutine
-	// незалежно скидала спільний inFlight, ламаючи admission-контроль.
-	go func() {
-		for job := range sendQueue {
-			tpMu.Lock()
-			cur := tp
-			tpMu.Unlock()
-			if err := cur.send(job.au, job.seq); err != nil {
-				select {
-				case txErrCh <- err:
-				default:
-				}
-			} else {
-				sent.Add(1)
-			}
-			queued.Add(-1)
-		}
-	}()
-
-	// Звук — ОКРЕМА горутина, бо джерело в нього своє (WASAPI, ~10мс пакети) і
-	// зупиняти через нього кадровий цикл нема за що. Транспорт бере ту саму
-	// змінну під tpMu, що й відео-sender вище: після реконекту звук піде в
-	// НОВУ доріжку без жодного власного механізму перепідключення.
-	// Гейт — той самий gatePaused, що керує відео (див. runAudio).
-	if audioEnabled && *transportKind == "webrtc" {
-		go runAudio(ctx, &gatePaused, func(data []byte, dur time.Duration) error {
-			tpMu.Lock()
-			cur := tp
-			tpMu.Unlock()
-			return cur.sendAudio(data, dur)
-		})
-	}
-
-	sendAsync := func(au encode.AU) {
-		mySeq := seq
-		seq++
-		queued.Add(1)
-		sendQueue <- sendJob{au: au, seq: mySeq}
-	}
-
-	// A-03: поки екрана нема (лок-скрін, UAC, капчер відновлює дублікацію),
-	// шлемо повтор останнього keepalive-AU — «нічого не змінилось» P-кадру.
-	// Декодер глядача копіює референс, сторож у браузері бачить свіжий кадр і
-	// не рве сесію на кожному UAC. AU дійсний лише для ТОГО енкодера, що його
-	// видав (інша геометрія/SPS = сміття), тому памʼятаємо й енкодер.
-	var (
-		lastStillAU     *encode.AU
-		lastStillEnc    *encode.Encoder
-		lastStillSentAt time.Time
-		reacqBackoff    = reacquireBackoffMin
-		suspended       bool      // A-17: дублікацію віддано на паузі
-		lastIDRAt       time.Time // A-31: дебаунс IDR за запитом
-	)
-	sendStillKeepalive := func() {
-		if lastStillAU == nil || gatePaused.Load() || time.Since(lastStillSentAt) < keepaliveAfter {
-			return
-		}
-		if e := s.encoder(); e != nil && e != lastStillEnc {
-			return
-		}
-		now := time.Now()
-		captureSeq += seqAdvance(now.Sub(lastSeqAt), frameInterval)
-		lastSeqAt = now
-		au := *lastStillAU
-		au.PTS = time.Duration(captureSeq) * time.Second / time.Duration(effectiveFPS)
-		sendAsync(au)
-		lastStillSentAt = now
-		keepalives++
-	}
-
-	reconnect := func() {
-		// 🚨 A-28. Реконект — це НЕ мить: хаб може лежати хвилинами, і всі ці
-		// хвилини dial крутиться з бек-офом. До цієї зміни агент увесь той час
-		// тримав DXGI-дублікацію відкритою (кадровий цикл стоїть тут, але
-		// капчер живий), а звукова горутина — своя, вона не стоїть — кодувала
-		// й слала пакети в мертвий транспорт. Дублікація в простої це та сама
-		// регресія 01.09, від якої рятує гейт: MeshCentral на цьому ж ПК не
-		// може захопити екран і рве свою desktop-сесію.
-		//
-		// Тому на час дозвону ставимо ТОЙ САМИЙ gatePaused, що й гейт хаба
-		// (його читає і звук), і віддаємо дублікацію через Suspend (A-17) —
-		// девайс і MFT лишаються, resume коштує один DuplicateOutput.
-		//
-		// Знімається прапорець лише якщо його поставили МИ і новий хаб за час
-		// дозвону нічого про гейт не сказав — див. reconnectGate.restore.
-		rg := beginReconnectGate(&gatePaused, &gateSeen)
-		defer rg.restore()
-		if s.cap != nil && !suspended {
-			s.cap.Suspend()
-			suspended = true
-			log.Printf("oo-agent: reconnect — desktop duplication released (екран вільний для Mesh)")
-		}
-		backoff := reconnectBackoffMin
-		for {
-			if ctx.Err() != nil {
-				return
-			}
-			tpMu.Lock()
-			tp.close()
-			tpMu.Unlock()
-
-			newTp, err := dial(*transportKind, *hubAddr, frameInterval, onKeyframeRequest, onGate, onBitrateTarget, onSelectOutput, onDown)
-			if err != nil {
-				wait := jitterBackoff(backoff)
-				log.Printf("oo-agent: reconnect failed, retry in %s: %v", wait.Round(time.Millisecond), err)
-				select {
-				case <-time.After(wait):
-				case <-ctx.Done():
-					return
-				}
-				backoff = nextBackoff(backoff)
-				continue
-			}
-			tpMu.Lock()
-			tp = newTp
-			tpMu.Unlock()
-			// Власне close() старого PeerConnection теж дає "closed", а невдала
-			// спроба dial — свій. Ці сигнали вже неактуальні: гасимо, інакше
-			// наступний прохід циклу переподключався б поверх щойно піднятої сесії.
-			select {
-			case <-pcDown:
-			default:
-			}
-			// A-32: у sendQueue лежать P-кадри старої сесії; новий хаб без
-			// референсу їх не декодує, а декодер глядача — тим паче.
-			for drained := false; !drained; {
-				select {
-				case <-sendQueue:
-					queued.Add(-1)
-				default:
-					drained = true
-				}
-			}
-			// Reference frames on the other side are gone: force a fresh IDR
-			// so the new session decodes from scratch (§5.5). Капчер може бути
-			// звільнений (реконект стався на паузі) — тоді IDR дасть reacquire.
-			if e := s.encoder(); e != nil {
-				if err := e.ForceIDR(); err != nil {
-					log.Printf("oo-agent: ForceIDR after reconnect: %v", err)
-				}
-			}
-			log.Printf("oo-agent: reconnected via %s to %s", *transportKind, *hubAddr)
-			return
-		}
-	}
-
-	log.Printf("oo-agent: streaming %s -> %s (fps=%d bitrate=%d)", *transportKind, *hubAddr, effectiveFPS, bitrateBps)
-	lastSeqAt = time.Now()
-	lastAdmitAt = lastSeqAt
-
-loop:
-	for {
-		select {
-		case <-ctx.Done():
-			break loop
-		case err := <-txErrCh:
-			log.Printf("oo-agent: transport error, reconnecting: %v", err)
-			reconnect()
-			continue
-		case reason := <-pcDown:
-			// 🚨 Саме цієї гілки бракувало 30.08 01:11. txErrCh нижче нічого не
-			// ловить, поки агент на паузі: без глядача він не шле — отже й не
-			// помиляється. Стан PeerConnection видно й на паузі.
-			log.Printf("oo-agent: %s, reconnecting", reason)
-			reconnect()
-			continue
-		default:
-		}
-
-		// 🚨 Друга (і єдина, що працює на паузі) причина реконекту: хаб
-		// замовк. Гілка pcDown вище тут безсила за побудовою — стан
-		// PeerConnection замерзає на "connected", бо агент, який нічого не шле,
-		// не заводить consent-таймер (див. hubLiveness). Перевірка стоїть саме
-		// тут, ДО гейта: на паузі цикл обертається кожні 50 мс, тобто сторож
-		// живий рівно тоді, коли він потрібен.
-		if hubLive.silent(time.Now()) {
-			log.Printf("oo-agent: хаб мовчить довше за %s — рвемо і перепідключаємось", control.HeartbeatTimeout)
-			reconnect()
-			continue
-		}
-
-		// on-demand: без глядача не захоплюємо й не кодуємо — і ЗВІЛЬНЯЄМО
-		// капчер, щоб не тримати DXGI-дублікацію виводу (інакше MeshCentral на
-		// цьому ж ПК не може захопити екран і рве свою desktop-сесію — регресія
-		// 01.09). PeerConnection і RTCP/DataChannel-читачі лишаються живими, тож
-		// щойно hub пришле "resume", наступний прохід підніме капчер заново.
-		if gatePaused.Load() {
-			// A-17: віддаємо лише DXGI-дублікацію (саме вона заважає Mesh), а
-			// девайс і MFT живуть далі: resume = один DuplicateOutput, а не
-			// повний MFShutdown/MFStartup + новий D3D-девайс на кожен вхід глядача.
-			if s.cap != nil && !suspended {
-				s.cap.Suspend()
-				suspended = true
-				log.Printf("oo-agent: no viewer — suspended desktop duplication (екран вільний для Mesh)")
-			}
-			select {
-			case <-ctx.Done():
-				break loop
-			case <-time.After(50 * time.Millisecond):
-			}
-			continue
-		}
-		// Глядач зʼявився, а капчер було звільнено на паузі — піднімаємо заново
-		// (той самий вивід, свіжий енкодер+IDR). Невдача — коротка пауза й
-		// повтор, потік не рветься назавжди.
-		// A-39: на лок-скріні DuplicateOutput приречений (E_ACCESSDENIED), і
-		// кожна спроба — це ще й новий D3D-девайс на порожньому місці. Поки
-		// сесія заблокована, не пробуємо взагалі: сесію тримає keepalive, а
-		// unlock зніме паузу негайно (нижче).
-		if session.Locked() && s.encoder() == nil {
-			sendStillKeepalive()
-			select {
-			case <-ctx.Done():
-				break loop
-			case <-time.After(250 * time.Millisecond):
-			}
-			continue
-		}
-		// Розблокували — пробуємо ЗАРАЗ, а не через залишок бек-офу, який міг
-		// дорости до keepaliveAfter поки екран був замкнений.
-		if session.takeUnlocked() {
-			reacqBackoff = reacquireBackoffMin
-		}
-		if s.encoder() == nil {
-			if err := s.reacquireCapture(); err != nil {
-				wait := jitterBackoff(reacqBackoff)
-				log.Printf("oo-agent: reacquire capture failed: %v (retry in %s)", err, wait.Round(time.Millisecond))
-				sendStillKeepalive()
-				select {
-				case <-ctx.Done():
-					break loop
-				case <-time.After(wait):
-				}
-				// Стеля = keepaliveAfter: довша пауза лишила б сторож без кадру.
-				if reacqBackoff *= 2; reacqBackoff > keepaliveAfter {
-					reacqBackoff = keepaliveAfter
-				}
-				continue
-			}
-			reacqBackoff = reacquireBackoffMin
-			log.Printf("oo-agent: viewer present — reacquired screen capture")
-		}
-
-		suspended = false
-
-		// Ціль, що прийшла на паузі, застосовується тут — на першому кадрі
-		// після відновлення, поки в MFT знову йдуть кадри.
-		if bps := bitrateWanted.take(); bps != 0 {
-			applyBitrate(bps)
-		}
-		// A-31: IDR за запитом — лише звідси, з дебаунсом.
-		if s.wantIDR.Swap(false) && time.Since(lastIDRAt) >= idrDebounce {
-			if err := s.encoder().ForceIDR(); err != nil {
-				log.Printf("oo-agent: ForceIDR (request): %v", err)
-			}
-			lastIDRAt = time.Now()
-		}
-
-		// Перемикання монітора — РІВНО ТУТ, у кадровому циклі, і ніде більше:
-		// капчер не є thread-safe, а між NextFrame і Encode його міняти не
-		// можна взагалі (кадр аліасить його буфери). Запит прийшов із іншої
-		// горутини через requestOutput; помилка (неіснуючий індекс, зайнятий
-		// вихід) лишає нас на поточному моніторі — потік не рветься.
-		if idx, ok := s.pending.take(); ok {
-			if err := s.SwitchOutput(idx); err != nil {
-				log.Printf("oo-agent: switch output -> %d: %v", idx, err)
-			}
-		}
-
-		// capture.NextFrame сама крутиться на DXGI-таймаутах і на нерухомому
-		// екрані не повернеться НІКОЛИ (її ж коментар: "Give it a deadline if
-		// you need 'no news' reported back"). Дедлайн — єдиний спосіб дізнатись,
-		// що екран стоїть, а не що ми ще чекаємо.
-		waitCtx, cancelWait := context.WithTimeout(ctx, keepaliveAfter)
-		frame, err := s.cap.NextFrame(waitCtx)
-		cancelWait()
-		// A-01: капчер міг пережити ACCESS_LOST і жити вже на іншому девайсі.
-		if dev, gen := s.cap.Device(), s.cap.Generation(); encoderStale(dev, gen, s.encDev, s.encGen) {
-			s.lastFrame = nil // аліасив буфери/текстуру старого девайса
-			if dev == 0 {
-				// Дублікацію втрачено, капчер ще відновлює її (лок/UAC):
-				// кадру нема, сесію тримає повтор keepalive (A-03).
-				sendStillKeepalive()
-				continue
-			}
-			if serr := s.syncEncoderToCapture(); serr != nil {
-				log.Printf("oo-agent: encoder rebuild after device change failed: %v — releasing capture", serr)
-				s.releaseCapture()
-				continue
-			}
-		}
-		still := false
-		switch {
-		case err == nil:
-			s.lastFrame = frame
-		case ctx.Err() != nil:
-			break loop // зупиняють агента, а не просто екран стоїть
-		case shouldKeepalive(err, gatePaused.Load(), s.lastFrame != nil):
-			// Екран нерухомий: пересилаємо ОСТАННІЙ кадр. Декодер отримує
-			// крихітний P-кадр «нічого не змінилось», сторож у браузері бачить
-			// свіжий кадр і не рве сесію.
-			frame = s.lastFrame
-			keepalives++
-			still = true
-		case shouldRearm(err, gatePaused.Load(), s.lastFrame != nil):
-			// Стартували на вже нерухомому екрані (або щойно перемкнули монітор
-			// на нерухомий — SwitchOutput скидає lastFrame саме в цей стан):
-			// беремо поточний робочий стіл через GDI, бо DXGI на такому екрані
-			// не віддасть нічого.
-			gdi, gerr := s.cap.GDIFrame()
-			if gerr != nil {
-				log.Printf("oo-agent: capture.GDIFrame: %v (retrying)", gerr)
-				time.Sleep(100 * time.Millisecond)
-				continue
-			}
-			log.Printf("oo-agent: перший кадр знято через GDI (екран нерухомий)")
-			frame, s.lastFrame = gdi, gdi
-		case errors.Is(err, context.DeadlineExceeded):
-			// Дедлайн був, але слати не можна: глядача нема (пауза). Порожній
-			// кадр тут не вигадуємо — декодеру нема з чого будувати картинку,
-			// а сторожа ми б обдурили.
-			continue
-		case errors.Is(err, capture.ErrClosed), errors.Is(err, capture.ErrAccessLost), errors.Is(err, capture.ErrNotAvailable):
-			// A-02: капчер закрив себе на OOS_ERROR або здався відновлювати
-			// дублікацію (лок-скрін/RDP). Раніше цикл крутив ErrClosed 10/с
-			// навічно. Звільняємо; reacquire вище підніме заново з бек-офом, а
-			// до того сесію тримає keepalive (A-03).
-			log.Printf("oo-agent: capture unavailable: %v — releasing, will reacquire", err)
-			s.releaseCapture()
-			sendStillKeepalive()
-			continue
-		default:
-			log.Printf("oo-agent: capture.NextFrame: %v (retrying)", err)
-			time.Sleep(100 * time.Millisecond)
-			continue
-		}
-
-		// PTS іде за СТІННИМ годинником, а не за лічильником кадрів: скільки
-		// кадр справді чекали, на стільки й зсуваємо. Тут же, до admission —
-		// щоб і викинутий кадр не лишав RTP позаду стінного часу.
-		now := time.Now()
-		captureSeq += seqAdvance(now.Sub(lastSeqAt), frameInterval)
-		lastSeqAt = now
-
-		// A-08: рух миші без змін на столі (DXGI: LastPresentTime==0) — не
-		// привід кодувати 60 повних кадрів/с. Курсор скомпоновано в кадр, тож
-		// зовсім пропускати не можна — тримаємо ≤15 к/с.
-		if frame.MouseOnly && !still && now.Sub(lastAdmitAt) < mouseOnlyGap {
-			continue
-		}
-
-		// Admission (§5.5): якщо відправка ПОПЕРЕДНЬОГО кадру ще блокує
-		// транспорт — дропаємо ЩОЙНО ЗАХОПЛЕНИЙ кадр ДО кодування. Референсні
-		// кадри енкодера лишаються цілі (ми нічого йому не подавали), тому
-		// IDR після дропу не потрібен. Верхню межу паузи, яку ці дропи мають
-		// право створити, тримає admissionFloor — інакше дроп зʼїдав і
-		// keepalive-кадр, і сесія гинула на сторожі браузера.
-		// Бюджет CPU софтверного енкодера: зайві кадри викидаємо ДО кодування,
-		// у тому самому місці й з тією ж логікою, що admission нижче — саме
-		// тут кадр іще нічого не коштував. -force-software не чіпаємо: це
-		// свідомий вибір оператора, а не машина, яка не тягне.
-		if s.software && !s.forceSoftware {
-			if gap := softwareFrameGap(runtime.NumCPU(), s.encW*s.encH, s.fps); gap > 0 && now.Sub(lastAdmitAt) < gap {
-				throttled++
-				continue
-			}
-		}
-
-		if !shouldAdmit(queued.Load(), now.Sub(lastAdmitAt)) {
-			dropped.Add(1)
-			if time.Since(lastLog) >= 5*time.Second {
-				log.Printf("oo-agent: dropped %d frames in last %s (transport busy), sent=%d",
-					dropped.Load(), time.Since(lastLog).Round(time.Millisecond), sent.Load())
-				dropped.Store(0)
-				lastLog = time.Now()
-			}
-			continue
-		}
-		lastAdmitAt = now
-
-		encFrame := encode.Frame{
-			PTS: time.Duration(captureSeq) * time.Second / time.Duration(effectiveFPS),
-		}
-		if s.software {
-			encFrame.Y = frame.Y
-			encFrame.UV = frame.UV
-			encFrame.YStride = frame.YStride
-			encFrame.UVStride = frame.UVStride
-			logFirstSoftFrame.Do(func() {
-				log.Printf("oo-agent: first software frame: cap %dx%d enc %dx%d | Y!=nil=%v len(Y)=%d YStride=%d | UV!=nil=%v len(UV)=%d UVStride=%d | cursor(vis=%v comp=%v shape=%v)",
-					frame.Width, frame.Height, s.encW, s.encH,
-					frame.Y != nil, len(frame.Y), frame.YStride,
-					frame.UV != nil, len(frame.UV), frame.UVStride,
-					frame.CursorVisible, frame.CursorComposited, frame.CursorShape)
-			})
-			// Захист: якщо капчер віддав кадр без CPU-площин (напр. режим
-			// readback раптом злетів), НЕ передаємо nil у C — там memcpy(nil)
-			// = access violation. Логуємо і пропускаємо кадр замість краху.
-			if frame.Y == nil || frame.UV == nil {
-				log.Printf("oo-agent: software frame with nil planes (Y!=nil=%v UV!=nil=%v) — skipping (no CPU readback?)",
-					frame.Y != nil, frame.UV != nil)
-				continue
-			}
-		} else {
-			encFrame.Texture = frame.Texture
-			// A-06: без покоління енкодер лишив би закешовану input-view на
-			// СТАРІЙ текстурі, якщо перебудований капчер отримав ту саму адресу.
-			encFrame.TextureGen = frame.TextureGen
-		}
-		aus, err := s.encoder().Encode(encFrame)
-		if err != nil {
-			log.Printf("oo-agent: encode.Encode: %v", err)
-			// A-12: «MFT event wait timeout» — енкодер завис; перебудова через
-			// той самий шлях, що й для ACCESS_LOST.
-			if strings.Contains(err.Error(), "wedged") {
-				s.releaseCapture()
-			}
-			continue
-		}
-		for _, au := range aus {
-			sendAsync(au)
-		}
-		if still && len(aus) == 1 && !aus[0].Keyframe {
-			cp := aus[0]
-			lastStillAU, lastStillEnc, lastStillSentAt = &cp, s.encoder(), time.Now()
-		}
-
-		if time.Since(lastLog) >= 5*time.Second {
-			log.Printf("oo-agent: sent=%d dropped=%d keepalives=%d throttled=%d", sent.Load(), dropped.Load(), keepalives, throttled)
-			dropped.Store(0)
-			lastLog = time.Now()
-		}
-	}
-
-	log.Printf("oo-agent: shutting down (sent=%d dropped=%d keepalives=%d throttled=%d)", sent.Load(), dropped.Load(), keepalives, throttled)
-	tpMu.Lock()
-	tp.close()
-	tpMu.Unlock()
 }

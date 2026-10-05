@@ -30,7 +30,7 @@ func withAudioFlag(t *testing.T, on bool) {
 func agentOffer(t *testing.T) (string, *webrtc.TrackLocalStaticSample) {
 	t.Helper()
 
-	api, err := newWebRTCAPI()
+	api, err := newWebRTCAPI(h264Fmtp())
 	if err != nil {
 		t.Fatalf("newWebRTCAPI: %v", err)
 	}

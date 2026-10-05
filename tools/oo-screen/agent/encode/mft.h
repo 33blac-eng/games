@@ -29,7 +29,9 @@ enum {
     OOS_ENC_AGAIN     = 1, /* poll: nothing ready yet, feed more input */
     OOS_ENC_EOS       = 2, /* poll after drain: stream finished */
     OOS_ENC_NOHW      = 3, /* no hardware H.264 MFT on this machine */
-    OOS_ENC_ERROR     = 4  /* real failure, see err buffer */
+    OOS_ENC_ERROR     = 4, /* real failure, see err buffer */
+    OOS_ENC_WEDGED    = 5  /* submit: the MFT stopped raising events (A-12);
+                              only a rebuild recovers it */
 };
 
 typedef struct {
@@ -65,7 +67,9 @@ typedef struct {
     int64_t        pts_100ns;
 } oos_enc_au;
 
-/* Opens the first hardware H.264 MFT. OOS_ENC_NOHW when none exists. */
+/* Opens the hardware H.264 MFT of the capture's adapter, else the software one
+ * (always with force_software). OOS_ENC_NOHW when no MFT fits at all, or the
+ * hardware one is not D3D11-aware (A-19). */
 int oos_enc_open(const oos_enc_cfg *cfg, oos_enc **out, char *err, int32_t err_len);
 
 /* Submits one NV12 frame from CPU memory (copied into an IMFMediaBuffer). */

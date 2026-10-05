@@ -51,22 +51,6 @@ func TestClampStartOutput(t *testing.T) {
 	}
 }
 
-func TestNextOutput(t *testing.T) {
-	cases := []struct{ cur, count, want int }{
-		{0, 2, 1},
-		{1, 2, 0}, // по колу
-		{2, 3, 0},
-		{0, 1, 0},  // один монітор — нікуди перемикатись
-		{0, 0, 0},  // енумерація порожня
-		{-1, 2, 0}, // невідомий поточний
-	}
-	for _, c := range cases {
-		if got := nextOutput(c.cur, c.count); got != c.want {
-			t.Fatalf("nextOutput(%d, %d) = %d, хотіли %d", c.cur, c.count, got, c.want)
-		}
-	}
-}
-
 // TestEpochShifts — головний негативний контроль усієї задачі. До неї епоха
 // була КОНСТАНТОЮ (`configEpoch1 = 1`), і цей тест на тому коді не міг би
 // навіть скомпілюватись; на «зсув є, але не працює» (bumpEpoch = no-op) він

@@ -28,7 +28,9 @@ func (r *registry) readyNodes() []string {
 		// Порожній node — T1/бенч-агент без -node: до нього все одно не
 		// підключиться жоден viewer (fail-closed у authorizeViewer), тож у
 		// переліку для консолі він був би рядком, який нічого не вмикає.
-		if ns.nodeID == "" || !ns.hasAgent() {
+		// unavailableReason — агент сам сказав, що картинки не дасть (екран
+		// заблоковано, unavailable.go): консоль має одразу взяти Mesh.
+		if ns.nodeID == "" || !ns.hasAgent() || ns.unavailableReason() != "" {
 			continue
 		}
 		out = append(out, ns.nodeID)
@@ -39,6 +41,36 @@ func (r *registry) readyNodes() []string {
 
 type nodesResp struct {
 	Nodes []string `json:"nodes"`
+	// Unavailable — ноди з живим агентом, який сам сказав, чому картинки
+	// зараз не дасть (unavailable.go): node_id -> причина, напр.
+	// "session-locked". Консоль показує людині саме цю причину замість
+	// загального «не відповідає». Старий клієнт поле ігнорує.
+	Unavailable map[string]string `json:"unavailable,omitempty"`
+}
+
+// unavailableNodes — знімок причин для /nodes. Порожня мапа -> nil (поле
+// не пишеться зовсім).
+func (r *registry) unavailableNodes() map[string]string {
+	r.mu.Lock()
+	snapshot := make([]*nodeSession, 0, len(r.nodes))
+	for _, ns := range r.nodes {
+		snapshot = append(snapshot, ns)
+	}
+	r.mu.Unlock()
+
+	var out map[string]string
+	for _, ns := range snapshot {
+		if ns.nodeID == "" || !ns.hasAgent() {
+			continue
+		}
+		if why := ns.unavailableReason(); why != "" {
+			if out == nil {
+				out = map[string]string{}
+			}
+			out[ns.nodeID] = why
+		}
+	}
+	return out
 }
 
 // handleNodes — GET /nodes: які ПК зараз готові віддавати ВЛАСНИЙ потік. Лише
@@ -69,5 +101,5 @@ func handleNodes(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "GET only", http.StatusMethodNotAllowed)
 		return
 	}
-	writeJSON(w, nodesResp{Nodes: reg.readyNodes()})
+	writeJSON(w, nodesResp{Nodes: reg.readyNodes(), Unavailable: reg.unavailableNodes()})
 }

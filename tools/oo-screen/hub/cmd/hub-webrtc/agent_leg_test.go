@@ -99,10 +99,16 @@ func dialAgentLegWith(t *testing.T, node string, withAudio bool) (*webrtc.PeerCo
 	return remote, atrk, ctl
 }
 
-// waitFor — умова протягом d, з кроком 20мс. Час тут про ICE на loopback, а не
-// про логіку: перевіряємо ФАКТ переходу, а не його швидкість.
-func waitFor(d time.Duration, cond func() bool) bool {
-	deadline := time.Now().Add(d)
+// eventGuard — запобіжник від вічного зависання, а НЕ вікно очікування.
+// Позитивні очікування («канал відкрився», «пакет доїхав») чекають подію; скільки
+// вона йде під -race і навантаженням, тесту байдуже. Раніше тут стояли 2–15 с, і
+// на завантаженій машині тест падав, хоча хаб робив усе правильно.
+const eventGuard = 3 * time.Minute
+
+// waitFor — чекає, поки умова стане істинною (крок 20мс), до eventGuard.
+// Перевіряємо ФАКТ переходу, а не його швидкість.
+func waitFor(cond func() bool) bool {
+	deadline := time.Now().Add(eventGuard)
 	for time.Now().Before(deadline) {
 		if cond() {
 			return true
@@ -141,7 +147,7 @@ func TestPublisherReadyBeforeFirstFrame(t *testing.T) {
 	}
 	// Агентська нога піднялась — цього достатньо, щоб нода вважалась готовою.
 	// Жодного RTP не було й не буде, поки хаб не пустить глядача.
-	if !waitFor(15*time.Second, ns.hasAgent) {
+	if !waitFor(ns.hasAgent) {
 		t.Fatal("hasAgent() лишився false після піднятої агентської ноги: перший глядач не зайде НІКОЛИ")
 	}
 

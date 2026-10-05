@@ -137,6 +137,23 @@ func TestSelectOutputNotOnOtherTypes(t *testing.T) {
 	}
 }
 
+// TestMaxFpsWireFormat — контракт C1 фіксує дріт рівно так:
+// {"type":"max_fps","seq":N,"fps":F}. Агент розбирає його через IsKnownType,
+// тож тип без реєстрації в knownTypes тихо зникав би на агенті.
+func TestMaxFpsWireFormat(t *testing.T) {
+	var buf bytes.Buffer
+	if err := Write(&buf, MaxFps(9, 15)); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+	if !strings.Contains(buf.String(), `"type":"max_fps","seq":9`) || !strings.Contains(buf.String(), `"fps":15`) {
+		t.Fatalf("дріт max_fps не за контрактом: %q", buf.String())
+	}
+	got, err := ReadKnown(bufio.NewReader(&buf), func(string, ...any) { t.Fatal("max_fps пропущено як невідомий тип") })
+	if err != nil || got.Type != TypeMaxFps || got.Fps != 15 {
+		t.Fatalf("max_fps round trip: %+v, %v", got, err)
+	}
+}
+
 // errorsAs is a tiny local wrapper to avoid importing "errors" just for As
 // in a way that trips vet on unused import ordering in this small file.
 func errorsAs(err error, target **ErrUnsupportedVersion) bool {
@@ -145,4 +162,19 @@ func errorsAs(err error, target **ErrUnsupportedVersion) bool {
 		return true
 	}
 	return false
+}
+
+// TestReadRejectsOverlongLine — рядок без '\n' довший за MaxLine відкидається,
+// а не накопичується без меж. Заміни цикл ReadSlice назад на ReadString — тут
+// прийде помилка EOF замість «line longer», і стелі не буде.
+func TestReadRejectsOverlongLine(t *testing.T) {
+	br := bufio.NewReader(strings.NewReader(strings.Repeat("x", MaxLine+10) + "\n"))
+	if _, err := Read(br); err == nil || !strings.Contains(err.Error(), "longer") {
+		t.Fatalf("err = %v, want «line longer than»", err)
+	}
+	// Довгий, але в межах стелі валідний рядок (більший за буфер bufio) — читається.
+	msg := `{"v":1,"type":"shutdown","seq":1,"reason":"` + strings.Repeat("r", 8000) + `"}` + "\n"
+	if m, err := Read(bufio.NewReaderSize(strings.NewReader(msg), 16)); err != nil || len(m.Reason) != 8000 {
+		t.Fatalf("рядок 8 КБ через буфер 16 байт: %v", err)
+	}
 }

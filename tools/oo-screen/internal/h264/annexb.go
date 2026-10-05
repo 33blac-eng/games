@@ -10,12 +10,12 @@ import (
 
 // NAL unit types (H.264, nal_unit_type = b & 0x1F)
 const (
-	NALSlice    = 1
-	NALIDR      = 5
-	NALSEI      = 6
-	NALSPS      = 7
-	NALPPS      = 8
-	NALAUD      = 9
+	NALSlice = 1
+	NALIDR   = 5
+	NALSEI   = 6
+	NALSPS   = 7
+	NALPPS   = 8
+	NALAUD   = 9
 )
 
 var startCode3 = []byte{0, 0, 1}
@@ -144,10 +144,10 @@ func SplitAUs(stream []byte) []AU {
 
 // SPS — мінімально потрібні поля.
 type SPS struct {
-	ProfileIDC         byte
-	ConstraintFlags    byte
-	LevelIDC           byte
-	Width, Height      int
+	ProfileIDC      byte
+	ConstraintFlags byte
+	LevelIDC        byte
+	Width, Height   int
 }
 
 // ProfileLevelID — hex-рядок для SDP profile-level-id та avc1-кодек-стрінга.
@@ -179,7 +179,7 @@ func ParseSPS(nal []byte) (*SPS, error) {
 	s.ProfileIDC = byte(br.bits(8))
 	s.ConstraintFlags = byte(br.bits(8))
 	s.LevelIDC = byte(br.bits(8))
-	br.ue() // seq_parameter_set_id
+	br.ue()     // seq_parameter_set_id
 	chroma := 1 // chroma_format_idc: дефолт 4:2:0 для профілів без явного поля
 	sepColour := 0
 	switch s.ProfileIDC {
@@ -188,9 +188,9 @@ func ParseSPS(nal []byte) (*SPS, error) {
 		if chroma == 3 {
 			sepColour = br.bits(1) // separate_colour_plane_flag
 		}
-		br.ue() // bit_depth_luma_minus8
-		br.ue() // bit_depth_chroma_minus8
-		br.bits(1) // qpprime_y_zero_transform_bypass_flag
+		br.ue()              // bit_depth_luma_minus8
+		br.ue()              // bit_depth_chroma_minus8
+		br.bits(1)           // qpprime_y_zero_transform_bypass_flag
 		if br.bits(1) == 1 { // seq_scaling_matrix_present_flag
 			n := 8
 			if chroma == 3 {
@@ -223,8 +223,14 @@ func ParseSPS(nal []byte) (*SPS, error) {
 		br.bits(1)
 		br.se()
 		br.se()
+		// num_ref_frames_in_pic_order_cnt_cycle: за стандартом 0..255. На
+		// битому SPS ue() дає до 2^32, і цикл крутився б мільярди разів уже
+		// після br.err — секунди CPU в горутині запису хаба.
 		n := br.ue()
-		for i := 0; i < n; i++ {
+		if n > 255 {
+			return nil, errors.New("h264: num_ref_frames_in_pic_order_cnt_cycle > 255")
+		}
+		for i := 0; i < n && br.err == nil; i++ {
 			br.se()
 		}
 	}

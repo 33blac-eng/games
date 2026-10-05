@@ -65,9 +65,22 @@ func sendHeartbeat(ns *nodeSession, dc *webrtc.DataChannel) bool {
 // агентові нікуди не доїде, а от там, де транспорт ЖИВИЙ і ногу знімає сам хаб,
 // агент дізнається про це негайно, а не через поріг тиші. Тихий no-op, поки
 // каналу нема — старий агент без "oosc-ctl" лишається на власному сторожі.
-func sendShutdown(ns *nodeSession, reason string) {
-	dc := ctlChan(ns)
-	if dc == nil {
+//
+// leg — нога, про яку йдеться; nil = «уся нода» (хаб іде). Канал береться
+// лише якщо він належить саме leg: подія старої ноги, що доживає поруч із
+// новою, не має права сказати «закрито» в канал НОВОЇ — агент би послухався
+// і зробив зайвий реконект.
+func sendShutdown(ns *nodeSession, leg *webrtc.PeerConnection, reason string) {
+	// Власника й сам канал — під ОДНИМ локом: інакше між перевіркою і читанням
+	// OnDataChannel нової ноги встиг би підмінити agentCtrl, і shutdown старої
+	// пішов би в канал нової.
+	ns.mu.Lock()
+	dc := ns.agentCtrl
+	if leg != nil && ns.agentChanPC != leg {
+		dc = nil
+	}
+	ns.mu.Unlock()
+	if dc == nil || dc.ReadyState() != webrtc.DataChannelStateOpen {
 		return
 	}
 	seq := atomic.AddUint64(&ns.ctlSeq, 1)

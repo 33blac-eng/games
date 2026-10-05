@@ -72,15 +72,9 @@ func TestMonotonic(t *testing.T) {
 	}
 }
 
-func TestAppendSilence(t *testing.T) {
-	b := AppendSilence(nil, FrameSamples)
-	if len(b) != 160 {
-		t.Fatalf("кадр 20мс = %d байт, want 160", len(b))
-	}
-	for i, v := range b {
-		if Decode(v) != 0 {
-			t.Fatalf("семпл тиші %d декодується в %d, want 0", i, Decode(v))
-		}
+func TestSilenceDecodesToZero(t *testing.T) {
+	if Decode(Silence) != 0 {
+		t.Fatalf("байт тиші декодується в %d, want 0", Decode(Silence))
 	}
 }
 

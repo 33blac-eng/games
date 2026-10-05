@@ -27,12 +27,16 @@ import (
 	"github.com/organicoils/oo-screen/internal/control"
 )
 
+// minBitrateBps — нижня межа цілі. 0,5 Мбіт/с на екрані з текстом — це мило, а
+// не картинка (журнал ctl 17-24.09: ціль тричі сідала на 0,5). 1,5 Мбіт/с
+// тримає 1080p-текст читабельним; env-ручка — для каналу, який і цього не тягне.
+var minBitrateBps = envUint("OO_SCREEN_MIN_BITRATE", 1_500_000)
+
 const (
-	minBitrateBps = 500_000 // нижня межа: нижче падати нема сенсу
-	lossHighFrac  = 0.02    // >2% втрат — ріжемо
-	lossLowFrac   = 0.005   // <=0.5% — чисто, кандидат на підйом
-	downFactor    = 0.7     // крок вниз
-	upFactor      = 1.05    // крок вгору
+	lossHighFrac = 0.02  // >2% втрат — ріжемо
+	lossLowFrac  = 0.005 // <=0.5% — чисто, кандидат на підйом
+	downFactor   = 0.7   // крок вниз
+	upFactor     = 1.05  // крок вгору
 
 	// Асиметрія вниз/вгору. Симетричний дебаунс на типових для UDP коливаннях
 	// втрат 1-3% дає пилку: контролер хитається між 100% і 70% і безперервно
@@ -265,12 +269,65 @@ func newBitrateCtl(startBps uint64) bitrateCtl {
 }
 
 // ceilingBps — стеля адаптації ЦІЄЇ ноди: фактичний стартовий бітрейт агента з
-// offer, а якщо агент його не прислав — спільний фолбек. Кликати під ns.mu.
+// offer, а якщо агент його не прислав — спільний фолбек; поверх — стеля «Якості»
+// з тулбара (capBps, C1), якщо глядач її поставив. Кликати під ns.mu.
 func (ns *nodeSession) ceilingBps() uint64 {
+	c := startBitrateBps
 	if ns.startBps > 0 {
-		return ns.startBps
+		c = ns.startBps
 	}
-	return startBitrateBps
+	if ns.capBps > 0 && ns.capBps < c {
+		c = ns.capBps
+	}
+	return c
+}
+
+// setBitrateCap — C1: «Якість» з тулбара стає стелею контролера ноди замість
+// стартового бітрейту; 0 = зняти (стеля агента). Нижче minBitrateBps стелю не
+// пускаємо — це та сама підлога, під якою текст стає милом.
+//
+// Ціль стрибає на нову стелю ОДРАЗУ, в обидва боки: людина свідомо обрала
+// якість і має побачити її за секунду, а не за хвилину повзання по +5% раз на
+// 10 с. Якщо канал її не тягне — перший же RR зі втратами зріже, як і завжди.
+// lastSent НЕ чіпаємо: це вибір людини, а не вивчена адаптація, і H-26 не має
+// тримати його за «свіжий стан шляху».
+func setBitrateCap(ns *nodeSession, capBps uint64) {
+	capBps = clampBitrateCap(capBps)
+	ns.mu.Lock()
+	ns.capBps = capBps
+	ceil := ns.ceilingBps()
+	ns.bitrate.startBps, ns.bitrate.target = ceil, ceil
+	ns.mu.Unlock()
+	log.Printf("bitrate cap [node=%s]: стеля %d біт/с (запит %d, 0 = без стелі)", ns.nodeID, ceil, capBps)
+	sendBitrateTarget(ns, ceil, 0, 0, 0)
+}
+
+// clampBitrateCap — стеля так, як її зберігає ns.capBps: 0 = без стелі, інакше
+// не нижче minBitrateBps. Одна функція і для запису, і для порівняння «та сама
+// стеля» в handleControl — інакше повтор 100 кбіт/с виглядав би новою стелею.
+func clampBitrateCap(capBps uint64) uint64 {
+	if capBps > 0 && capBps < minBitrateBps {
+		return minBitrateBps
+	}
+	return capBps
+}
+
+// clearViewerCapsLocked — останній глядач пішов: стелі тулбара (C1) належали
+// йому, наступний глядач починає зі стелі агента. Повертає, чи була стеля fps —
+// тоді її треба зняти й в агента (після ns.mu). Кликати під ns.mu.
+//
+// Під стелею тулбара контролер «вчився» не на шляху, а на виборі людини: ціль
+// 1,5M після її «Якості 1» з RR-кроком у останні 30 с resetBitrate (H-26)
+// вважав би свіжою адаптацією і віддав наступному глядачеві мило, яке той
+// не обирав. Тому стеля знімається разом зі станом, що під нею набувся.
+func clearViewerCapsLocked(ns *nodeSession) (hadFps bool) {
+	hadFps = ns.maxFps > 0
+	hadCap := ns.capBps > 0
+	ns.capBps, ns.maxFps = 0, 0
+	if hadCap {
+		ns.bitrate = newBitrateCtl(ns.ceilingBps())
+	}
+	return hadFps
 }
 
 // setStartBitrate фіксує стелю ноди за полем "bitrate" з offer агента і скидає
@@ -279,7 +336,7 @@ func (ns *nodeSession) ceilingBps() uint64 {
 func setStartBitrate(ns *nodeSession, bps uint64) {
 	ns.mu.Lock()
 	ns.startBps = bps
-	ns.bitrate = newBitrateCtl(bps)
+	ns.bitrate = newBitrateCtl(ns.ceilingBps()) // стеля тулбара переживає реконект агента
 	ns.mu.Unlock()
 }
 

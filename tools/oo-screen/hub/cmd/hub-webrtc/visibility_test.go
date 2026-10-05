@@ -13,7 +13,7 @@ import (
 func gatePresent(ns *nodeSession) bool {
 	ns.mu.Lock()
 	defer ns.mu.Unlock()
-	return hasVisibleViewerLocked(ns)
+	return hasVisibleViewerLocked(ns) || hasAudioViewerLocked(ns)
 }
 
 func legLive(ns *nodeSession, vl *viewerLeg) bool {
@@ -97,9 +97,10 @@ func TestVisibilityHiddenViewerGetsNoPackets(t *testing.T) {
 	forwardN(ns, 2, 107, 921000)
 	waitSent(t, v1, 9, "видимий після повернення сусіда")
 	// Повернутій нозі, крім двох нових, міг поїхати ще й кеш GOP (пункт 41) —
-	// тому перевіряємо не точну цифру, а що потік ВІДНОВИВСЯ.
-	if got := atomic.LoadUint64(&v2.sent); got <= 3 {
-		t.Fatalf("глядач повернувся, а потік не відновився: sent = %d, want > 3", got)
+	// тому перевіряємо не точну цифру, а що потік ВІДНОВИВСЯ. Помпа v2 асинхронна
+	// й від v1 не залежить — тож чекаємо саме її, а не читаємо одразу.
+	if !waitFor(func() bool { return atomic.LoadUint64(&v2.sent) > 3 }) {
+		t.Fatalf("глядач повернувся, а потік не відновився: sent = %d, want > 3", atomic.LoadUint64(&v2.sent))
 	}
 }
 

@@ -109,7 +109,7 @@ func addAudioTrack(pc *webrtc.PeerConnection) (*webrtc.TrackLocalStaticSample, e
 	}
 	// Обовʼязковий RTCP read-loop, як і в решти ніг: без нього interceptor-и
 	// цього sender-а мертві.
-	go drainRTCP(sender.Read, "viewer-audio-rtcp")
+	go drainRTCP(sender.Read)
 	return trk, nil
 }
 
@@ -126,7 +126,7 @@ func forwardAudioToViewers(ns *nodeSession, payload []byte) {
 	ns.mu.Lock()
 	defer ns.mu.Unlock()
 	for _, vl := range ns.viewers {
-		if !vl.live || vl.audioOut == nil {
+		if !vl.audioLive || vl.audioOut == nil {
 			continue
 		}
 		select {
@@ -218,6 +218,12 @@ func (vl *viewerLeg) audioPump(ns *nodeSession, trk *webrtc.TrackLocalStaticSamp
 				// Агент на паузі або переподключається. Нічого не пишемо:
 				// пропуск у RTP браузер загладжує сам, а підсунуте сюди
 				// «щось» він відтворив би як звук.
+				//
+				// Слот запису віддаємо: або звуку нема ні в кого (тоді
+				// байдуже), або його не шлють саме нам (сховали вкладку без
+				// audio) — і тоді файл мусить годувати той, хто чує.
+				rec.releaseAudio()
+				rec = nil
 			}
 			continue
 		}

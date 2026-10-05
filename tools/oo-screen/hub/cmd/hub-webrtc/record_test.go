@@ -65,7 +65,7 @@ func TestRecordFlagOffChangesNothing(t *testing.T) {
 
 	dir := withRecordFlag(t, false)
 
-	rec := startRecording("n1")
+	rec := startRecording("n1", currentRecordCfg())
 	if rec != nil {
 		t.Fatalf("startRecording без прапорця віддав %v, want nil", rec)
 	}
@@ -81,7 +81,7 @@ func TestRecordFlagOffChangesNothing(t *testing.T) {
 	ns.mu.Lock()
 	ns.agentPC = &webrtc.PeerConnection{}
 	ns.mu.Unlock()
-	ns.rec.Store(startRecording(ns.nodeID))
+	ns.rec.Store(startRecording(ns.nodeID, currentRecordCfg()))
 	if ns.rec.Load() != nil {
 		t.Fatal("ns.rec не nil без прапорця — audioPump знайшов би рекордер")
 	}
@@ -130,7 +130,7 @@ func TestRecordWritesClosedMKVWithBothTracks(t *testing.T) {
 	aus := corpusAUs(t)
 	tone := toneFrames(t)
 
-	rec := startRecording("../../etc/passwd") // заодно перевірка санітизації імені
+	rec := startRecording("../../etc/passwd", currentRecordCfg()) // заодно перевірка санітизації імені
 	if rec == nil {
 		t.Fatal("під прапорцем startRecording віддав nil")
 	}
@@ -199,7 +199,7 @@ func TestRecordWritesClosedMKVWithBothTracks(t *testing.T) {
 // одному: без цього N глядачів написали б N копій тону в одну доріжку.
 func TestRecordAudioSlotIsExclusive(t *testing.T) {
 	withRecordFlag(t, true)
-	rec := startRecording("slot")
+	rec := startRecording("slot", currentRecordCfg())
 	t.Cleanup(rec.Close)
 
 	if !rec.claimAudio() {
@@ -211,6 +211,63 @@ func TestRecordAudioSlotIsExclusive(t *testing.T) {
 	rec.releaseAudio()
 	if !rec.claimAudio() {
 		t.Fatal("після releaseAudio слот не звільнився — нова нога лишилась би без звуку")
+	}
+}
+
+// TestRecordAudioStaysInSyncAfterPause — R5-G6: глядач сховав вкладку без
+// звуку -> агент на паузі хвилину -> повернувся. Відео у файлі йде за RTP-часом
+// агента (стінний годинник) і стрибає на +60 с; звук мусить стрибнути разом із
+// ним, а не продовжити з місця паузи. Мітки приходу задаємо самі (push замість
+// offer*), бо чекати хвилину в тесті — ні. Прибери переякорення в handleAudio —
+// звук відстане на ~60 с.
+func TestRecordAudioStaysInSyncAfterPause(t *testing.T) {
+	dir := withRecordFlag(t, true)
+	withAudioFlag(t, true)
+	aus := corpusAUs(t)
+	tone := toneFrames(t)
+
+	rec := startRecording("node-pause", currentRecordCfg())
+	if rec == nil {
+		t.Fatal("під прапорцем startRecording віддав nil")
+	}
+	t0 := time.Now()
+	var seq uint16
+	frame := func(au []byte, at time.Duration) {
+		for _, p := range packetizeAU(au, uint32(at*90000/time.Second), &seq) {
+			rec.push(recItem{pkt: p, at: t0.Add(at)})
+		}
+		// Пʼять 20-мс кадрів звуку на кожні 100 мс відео, як від живого агента.
+		for k := 0; k < 5; k++ {
+			a := at + time.Duration(k)*20*time.Millisecond
+			rec.push(recItem{aud: tone[k], dur: 20 * time.Millisecond, at: t0.Add(a)})
+		}
+	}
+	for i := 0; i < 6; i++ { // 0.0..0.5 с
+		frame(aus[i].Data, time.Duration(i)*100*time.Millisecond)
+	}
+	const gap = 60 * time.Second // пауза агента: ні відео, ні звуку
+	for i := 6; i < 12; i++ {
+		frame(aus[i].Data, gap+time.Duration(i)*100*time.Millisecond)
+	}
+	rec.Close()
+
+	path := recordedFile(t, dir)
+	if path == "" {
+		t.Fatal("файл не створився")
+	}
+	blob, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := mkvSummary{blocks: map[byte]int{}, blockTS: map[byte][]int64{}}
+	ebmlWalk(t, blob, &s, "")
+	v, a := s.blockTS[mkvVideoTrack], s.blockTS[mkvAudioTrack]
+	if len(v) == 0 || len(a) == 0 {
+		t.Fatalf("доріжки порожні: відео %d, звук %d", len(v), len(a))
+	}
+	// Останній кадр відео і останній кадр звуку зняті в одну мить (+80 мс звуку).
+	if d := a[len(a)-1] - v[len(v)-1]; d < -250 || d > 250 {
+		t.Fatalf("розсинхрон у кінці файлу: звук %d мс, відео %d мс (різниця %d мс)", a[len(a)-1], v[len(v)-1], d)
 	}
 }
 
@@ -301,6 +358,8 @@ type mkvSummary struct {
 	clusters      int
 	blocks        map[byte]int
 	width, height uint64
+	clusterTS     []uint64         // мітки кластерів по порядку, мс
+	blockTS       map[byte][]int64 // абсолютні мітки SimpleBlock за доріжкою, мс
 }
 
 // ebmlWalk обходить документ і ПАДАЄ, щойно елемент заявляє більше байтів, ніж
@@ -339,6 +398,8 @@ func ebmlWalk(t *testing.T, b []byte, s *mkvSummary, path string) {
 			ebmlWalk(t, body, s, fmt.Sprintf("%s/%X", path, id))
 		case idCodecID:
 			s.codecIDs = append(s.codecIDs, string(body))
+		case idClusterTS:
+			s.clusterTS = append(s.clusterTS, beUint(body))
 		case idPixelWidth:
 			s.width = beUint(body)
 		case idPixelHeight:
@@ -348,6 +409,11 @@ func ebmlWalk(t *testing.T, b []byte, s *mkvSummary, path string) {
 				t.Fatalf("SimpleBlock у %s/ має %d байтів — кадру в ньому немає", path, len(body))
 			}
 			s.blocks[body[0]&0x7F]++
+			if s.blockTS != nil && len(s.clusterTS) > 0 {
+				rel := int64(int16(uint16(body[1])<<8 | uint16(body[2])))
+				tr := body[0] & 0x7F
+				s.blockTS[tr] = append(s.blockTS[tr], int64(s.clusterTS[len(s.clusterTS)-1])+rel)
+			}
 		}
 	}
 }

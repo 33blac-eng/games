@@ -16,8 +16,8 @@ package main
 
 import (
 	"context"
-	"encoding/binary"
 	"errors"
+	"fmt"
 	"log"
 	"math"
 	"os"
@@ -184,7 +184,7 @@ func (e *audioEncoder) encode(data []byte, f audio.Format) [][]byte {
 	for off := 0; off+step <= len(data); off += step {
 		mono := 0.0
 		for ch := 0; ch < f.Channels; ch++ {
-			mono += audioSample(data[off+ch*(f.BitsPerSample/8):], f)
+			mono += audio.Sample(data[off+ch*(f.BitsPerSample/8):], f)
 		}
 		if frame := e.push(mono/float64(f.Channels), factor); frame != nil {
 			out = append(out, frame)
@@ -220,50 +220,6 @@ func audioLayout(f audio.Format) (factor, step int, ok bool) {
 	return f.SampleRate / pcmu.Rate, step, true
 }
 
-// audioSample читає один семпл як значення в [-1, 1]. Дзеркалить приватний
-// pcmSample з agent/audio — той пакет готовий і його не чіпаємо, а розбирати
-// байти все одно комусь треба.
-func audioSample(b []byte, f audio.Format) float64 {
-	bits := f.BitsPerSample
-	if len(b) < bits/8 {
-		return 0
-	}
-	if f.SampleFormat == audio.SampleFormatFloat {
-		if bits != 32 {
-			return 0 // 64-бітний float у mix format WASAPI не зустрічається
-		}
-		return float64(math.Float32frombits(binary.LittleEndian.Uint32(b)))
-	}
-	if f.SampleFormat != audio.SampleFormatPCM {
-		return 0
-	}
-
-	valid := f.ValidBitsPerSample
-	if valid <= 0 || valid > bits {
-		valid = bits
-	}
-	var raw int64
-	switch bits {
-	case 8:
-		return float64(int(b[0])-128) / 128
-	case 16:
-		raw = int64(int16(binary.LittleEndian.Uint16(b)))
-	case 24:
-		raw = int64(b[0]) | int64(b[1])<<8 | int64(b[2])<<16
-		if raw&0x800000 != 0 {
-			raw |= ^int64(0xffffff)
-		}
-	case 32:
-		raw = int64(int32(binary.LittleEndian.Uint32(b)))
-	default:
-		return 0
-	}
-	if shift := bits - valid; shift > 0 {
-		raw >>= shift
-	}
-	return float64(raw) / math.Ldexp(1, valid-1)
-}
-
 // audioGap — скільки семплів 8 кГц треба долити тишею, щоб доріжка наздогнала
 // спільний годинник.
 //
@@ -292,15 +248,6 @@ func audioGap(elapsed time.Duration, emitted int64, tol time.Duration) int64 {
 // audioSend — як віддати готовий кадр у транспорт.
 type audioSend func(data []byte, dur time.Duration) error
 
-// runAudio — увесь життєвий цикл звуку агента. Кличеться однією горутиною з
-// main() і повертається лише разом із ctx.
-//
-// 🚨 ГЕЙТИНГ ОКРЕМО ВІД ВІДЕО, АЛЕ ЗА ТИМ САМИМ СИГНАЛОМ. paused — той самий
-// gatePaused, яким хаб керує відео. Поки глядача немає, пристрій НЕ ВІДКРИТИЙ
-// зовсім: не «читаємо й викидаємо», а не захоплюємо. RMS у гейтингу не бере
-// участі НІ В ЯКОМУ ВИГЛЯДІ — тиша в loopback це справжні нулі, і сплутати її з
-// «нема глядача» означало б глушити звук щоразу, коли на тому ПК просто нічого
-// не грає.
 // audioCapturer — рівно те, що runAudio просить у джерела. Інтерфейс, а не
 // *audio.Capturer, лише заради шва audioOpen: WASAPI в тесті не піднімеш, а
 // інваріант «send впав -> звук вертається в НОВУ доріжку» перевірити треба.
@@ -313,6 +260,15 @@ type audioCapturer interface {
 // audioOpen — шов для тесту. У бою це рівно audio.New.
 var audioOpen = func() (audioCapturer, error) { return audio.New() }
 
+// runAudio — увесь життєвий цикл звуку агента. Кличеться однією горутиною з
+// main() і повертається лише разом із ctx.
+//
+// 🚨 ГЕЙТИНГ ОКРЕМО ВІД ВІДЕО, АЛЕ ЗА ТИМ САМИМ СИГНАЛОМ. paused — той самий
+// gatePaused, яким хаб керує відео. Поки глядача немає, пристрій НЕ ВІДКРИТИЙ
+// зовсім: не «читаємо й викидаємо», а не захоплюємо. RMS у гейтингу не бере
+// участі НІ В ЯКОМУ ВИГЛЯДІ — тиша в loopback це справжні нулі, і сплутати її з
+// «нема глядача» означало б глушити звук щоразу, коли на тому ПК просто нічого
+// не грає.
 func runAudio(ctx context.Context, paused *atomic.Bool, send audioSend) {
 	fails := 0
 	for {
@@ -320,6 +276,16 @@ func runAudio(ctx context.Context, paused *atomic.Bool, send audioSend) {
 			return
 		}
 		c, err := audioOpen()
+		// Непідтримуваний mix format — та сама «відмова відкрити», що й помилка
+		// audio.New: з паузою audioReopenAfter. Без цього audioCapture виходив на
+		// першому ж пакеті, і цикл open/close крутився гарячим, по три рядки логу
+		// на пакет.
+		if err == nil {
+			if _, _, ok := audioLayout(c.Format()); !ok {
+				err = fmt.Errorf("формат звуку не підтримано (%+v) — доріжка лишиться тихою", c.Format())
+				_ = c.Close()
+			}
+		}
 		if err != nil {
 			fails++
 			// Логуємо першу відмову й далі рідко: ПК без звукової карти не

@@ -69,6 +69,15 @@ type viewerLeg struct {
 	// квитка. Дефолт false: нога, яка нічого не сказала, дивиться. Під ns.mu.
 	hidden bool
 
+	// wantAudio — глядач прихований для ВІДЕО, але просить ЗВУК (POST
+	// /viewer/visibility {hidden:true, audio:true}). Так консоль ЕРП дає звук
+	// ПК, поки картинку показує Mesh: без цього прихованість глушила і звук, і
+	// агента (замір 16.09.2026: звук стояв на тих самих байтах). Дефолт false —
+	// поведінка F-39 без змін. audioLive — кому зараз іде звук; пише лише
+	// recomputeBinding. Обидва під ns.mu.
+	wantAudio bool
+	audioLive bool
+
 	// sessionID — секрет ренегоціації ЦІЄЇ ноги (F-11, main.go). Пишеться раз,
 	// одразу після addViewer, під ns.mu.
 	sessionID string
@@ -161,7 +170,7 @@ func addViewer(ns *nodeSession, pc *webrtc.PeerConnection, trk *webrtc.TrackLoca
 	log.Printf("viewer leg added [node=%s]: %d viewer(s)", ns.nodeID, n)
 
 	go vl.pump(ns)
-	go watchSessionCap(ns, vl)
+	go watchSessionCap(ns, vl, sessionCap) // стелю читаємо тут, а не в горутині: тест її підміняє
 	return vl
 }
 
@@ -186,19 +195,19 @@ var sessionCap = envDuration("OO_SCREEN_SESSION_CAP", 120*time.Minute)
 
 // watchSessionCap рве ногу глядача, коли її час вичерпано. Нуль або відʼємне
 // значення вимикає стелю зовсім — для налагодження, коли сесію треба тримати
-// довго свідомо.
-func watchSessionCap(ns *nodeSession, vl *viewerLeg) {
-	if sessionCap <= 0 {
+// довго свідомо. capD — значення sessionCap на момент додавання ноги.
+func watchSessionCap(ns *nodeSession, vl *viewerLeg, capD time.Duration) {
+	if capD <= 0 {
 		return
 	}
-	t := time.NewTimer(sessionCap)
+	t := time.NewTimer(capD)
 	defer t.Stop()
 	select {
 	case <-vl.done:
 		// Нога знята раніше — звичайний шлях, нічого робити.
 	case <-t.C:
-		log.Printf("viewer leg [node=%s]: стеля сесії %s вичерпана — рву", ns.nodeID, sessionCap)
-		dropViewer(ns, vl, "стеля сесії "+sessionCap.String())
+		log.Printf("viewer leg [node=%s]: стеля сесії %s вичерпана — рву", ns.nodeID, capD)
+		dropViewer(ns, vl, "стеля сесії "+capD.String())
 	}
 }
 
@@ -212,9 +221,13 @@ func removeViewer(ns *nodeSession, vl *viewerLeg) bool {
 	if ok {
 		delete(ns.viewers, vl.pc)
 	}
-	vl.ready, vl.live = false, false
+	vl.ready, vl.live, vl.audioLive = false, false, false
 	left := len(ns.viewers)
 	ns.viewerCount.Store(int32(left))
+	hadFps := false
+	if ok && left == 0 {
+		hadFps = clearViewerCapsLocked(ns)
+	}
 	ns.mu.Unlock()
 	if !ok {
 		return false
@@ -222,6 +235,9 @@ func removeViewer(ns *nodeSession, vl *viewerLeg) bool {
 	close(vl.done)
 	if left == 0 {
 		scheduleRecordClose(ns)
+		if hadFps {
+			sendMaxFps(ns, maxFpsCeil) // знімаємо стелю в агента; нема каналу — агент і так стартує без неї
+		}
 	}
 	return true
 }
@@ -277,29 +293,29 @@ func markViewerNotReady(ns *nodeSession, vl *viewerLeg) {
 	ns.mu.Unlock()
 }
 
-// hasReadyViewerLocked — чи є у ноди ХОЧА Б ОДИН Connected глядач, БЕЗ огляду
-// на те, дивиться він зараз чи згорнув вкладку. Це відповідь на питання «чи
-// хтось іще тут», а НЕ предикат гейтингу (ним із F-39 став
-// hasVisibleViewerLocked). Кликати під ns.mu.
-func hasReadyViewerLocked(ns *nodeSession) bool {
+// hasVisibleViewerLocked — чи є у ноди ХОЧА Б ОДИН глядач, який реально
+// дивиться: Connected І не сховався (F-39). Це і є предикат гейтингу — "pause"
+// лише коли таких НУЛЬ, "resume" від ПЕРШОГО, хто повернувся. Кликати під ns.mu.
+//
+// Свідомо не «будь-який Connected глядач» (hasReadyViewerLocked у тестах):
+// сплутати ці два предикати означало б
+// або тримати агента в кодуванні заради згорнутих вкладок (нічого не змінилось
+// би), або вважати згорнутого глядача таким, що пішов, — і рвати йому сесію.
+func hasVisibleViewerLocked(ns *nodeSession) bool {
 	for _, vl := range ns.viewers {
-		if vl.ready {
+		if vl.ready && !vl.hidden {
 			return true
 		}
 	}
 	return false
 }
 
-// hasVisibleViewerLocked — чи є у ноди ХОЧА Б ОДИН глядач, який реально
-// дивиться: Connected І не сховався (F-39). Це і є предикат гейтингу — "pause"
-// лише коли таких НУЛЬ, "resume" від ПЕРШОГО, хто повернувся. Кликати під ns.mu.
-//
-// Свідомо окремо від hasReadyViewerLocked: сплутати ці два предикати означало б
-// або тримати агента в кодуванні заради згорнутих вкладок (нічого не змінилось
-// би), або вважати згорнутого глядача таким, що пішов, — і рвати йому сесію.
-func hasVisibleViewerLocked(ns *nodeSession) bool {
+// hasAudioViewerLocked — чи є Connected глядач, що просить звук, навіть
+// прихований для відео. Тримає агента в "resume": звук агент знімає тим самим
+// гейтом, що й відео. Кликати під ns.mu.
+func hasAudioViewerLocked(ns *nodeSession) bool {
 	for _, vl := range ns.viewers {
-		if vl.ready && !vl.hidden {
+		if vl.ready && vl.wantAudio {
 			return true
 		}
 	}

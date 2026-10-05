@@ -20,6 +20,8 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/pion/webrtc/v4"
+
 	"github.com/organicoils/oo-screen/agent/input"
 )
 
@@ -35,6 +37,24 @@ var inputEnabled = os.Getenv("OO_SCREEN_INPUT") == "1"
 // тестом: справжній Injector стріляє в живу мишу тієї машини, де йде тест.
 type eventInjector interface {
 	Inject(input.Event) error
+	ReleaseAll() error
+}
+
+// attachInputChannel вішає канал вводу на інʼєктор. На закритті каналу
+// (реконект, розрив, хаб закрив ногу) — ReleaseAll: key-up, який глядач так і
+// не надіслав, уже не прийде цим каналом ніколи, а клавіша на цьому ПК
+// лишилась би затиснутою, доки людина за ним не натисне її сама.
+func attachInputChannel(dc *webrtc.DataChannel, inj eventInjector) {
+	dc.OnMessage(func(msg webrtc.DataChannelMessage) {
+		if err := handleInputMessage(msg.Data, inj); err != nil {
+			logInputProblem(time.Now(), err)
+		}
+	})
+	dc.OnClose(func() {
+		if err := inj.ReleaseAll(); err != nil {
+			log.Printf("oo-agent: канал вводу закрито, відпустити клавіші не вдалось: %v", err)
+		}
+	})
 }
 
 // handleInputMessage — одне повідомлення каналу вводу. Помилку повертає, а не

@@ -256,12 +256,61 @@ func TestEventInputs(t *testing.T) {
 	})
 }
 
+// A hostile wheel_y:1e6 must not become millions of lines of scrolling: the
+// hub rate-limits events, not their size. Remove the clamp and this fails.
 func TestWheelDataClamps(t *testing.T) {
-	if got := wheelData(1e12); int32(got) != int32(2147483647) {
-		t.Fatalf("wheelData(1e12) = %d, want it clamped to MaxInt32", int32(got))
+	limit := int32(wheelMaxNotches * wheelDeltaUnit)
+	if got := wheelData(1e6); int32(got) != limit {
+		t.Fatalf("wheelData(1e6) = %d, want it clamped to %d", int32(got), limit)
 	}
-	if got := wheelData(-1e12); int32(got) != int32(-2147483648) {
-		t.Fatalf("wheelData(-1e12) = %d, want it clamped to MinInt32", int32(got))
+	if got := wheelData(-1e12); int32(got) != -limit {
+		t.Fatalf("wheelData(-1e12) = %d, want it clamped to %d", int32(got), -limit)
+	}
+	if got := wheelData(1.5); int32(got) != 180 {
+		t.Fatalf("wheelData(1.5) = %d, want 180", int32(got))
+	}
+}
+
+// A viewer that disappears with Ctrl and the left button held never sends the
+// releases. The injector must remember what it pressed so ReleaseAll can undo
+// exactly that — no more (moves, wheels, released keys) and no less.
+// Drop the note() bookkeeping and this fails.
+func TestHeldSetReleasesWhatIsStillDown(t *testing.T) {
+	var h heldSet
+	ctrl := Event{V: Version, Kind: KindKey, Scancode: 0x1D, Down: true}
+	rightArrow := Event{V: Version, Kind: KindKey, Scancode: 0xE04D, Down: true}
+	left := Event{V: Version, Kind: KindMouseButton, Button: ButtonLeft, Down: true}
+	h.note(ctrl)
+	h.note(rightArrow)
+	h.note(left)
+	h.note(Event{V: Version, Kind: KindMouseWheel, WheelY: 1})
+	// The arrow released under its other spelling is the same physical key.
+	h.note(Event{V: Version, Kind: KindKey, Scancode: 0x4D, Extended: true})
+
+	ups := h.releases()
+	if len(ups) != 2 {
+		t.Fatalf("releases = %+v, want Ctrl and the left button", ups)
+	}
+	var sawCtrl, sawLeft bool
+	for _, up := range ups {
+		if up.Down || up.Validate() != nil {
+			t.Fatalf("release %+v is not a valid key-up", up)
+		}
+		sawCtrl = sawCtrl || (up.Kind == KindKey && up.Scancode == 0x1D)
+		sawLeft = sawLeft || (up.Kind == KindMouseButton && up.Button == ButtonLeft)
+	}
+	if !sawCtrl || !sawLeft {
+		t.Fatalf("releases = %+v, want Ctrl and the left button", ups)
+	}
+	if again := h.releases(); len(again) != 0 {
+		t.Fatalf("second ReleaseAll would re-send %+v", again)
+	}
+}
+
+func TestReleaseAllParses(t *testing.T) {
+	ev, err := ParseEvent([]byte(`{"v":1,"type":"release_all"}`))
+	if err != nil || ev.Kind != KindReleaseAll {
+		t.Fatalf("release_all: %+v %v", ev, err)
 	}
 }
 

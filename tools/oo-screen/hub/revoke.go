@@ -46,8 +46,9 @@ import (
 )
 
 // revocationEntry — один запис зі сторінки ERP-ендпоінта
-// {erpBase}/remote-access/screen/revocations. Заповнене рівно одне з полів
-// NodeID/UserID (валідується у subscribeRevoke, не тут).
+// {erpBase}/remote-access/screen/revocations. Контракт C5: лише node_id — усі
+// ноги вузла; лише user_id — усі ноги користувача; обидва — лише ноги цього
+// користувача на цьому вузлі («ця людина на цьому ПК»).
 type revocationEntry struct {
 	NodeID string `json:"node_id"`
 	UserID string `json:"user_id"`
@@ -56,10 +57,22 @@ type revocationEntry struct {
 
 // RevokeKindStale — псевдо-"відкликання", яке hub видає САМ, коли ERP надто
 // довго недосяжний. Val — скільки саме тривала недоступність. Обробник (див.
-// startRevokeSubscription у hub/cmd/hub-webrtc/main.go) закриває ВСІ ноди тим
-// самим closeNode, яким закривається звичайне kind="node": окремого шляху
-// обриву не заводимо, щоб fail-closed не розійшовся з нормальним відкликанням.
+// applyRevoke у hub/cmd/hub-webrtc/main.go) знімає ВСІ viewer-ноги всіх нод;
+// агенти лишаються — дозвіл потрібен глядачам, а не publisher-ам.
 const RevokeKindStale = "stale"
+
+// RevokeKindNodeUser — запис з ОБОМА полями (C5): рвати лише ноги користувача
+// на одному вузлі. Val — JoinNodeUser(node, user), розбирати SplitNodeUser.
+const RevokeKindNodeUser = "node_user"
+
+// JoinNodeUser / SplitNodeUser — val для RevokeKindNodeUser. Роздільник \x00:
+// у node_id ("node//…") і user_id його не буває, тож розбір однозначний.
+func JoinNodeUser(nodeID, userID string) string { return nodeID + "\x00" + userID }
+
+func SplitNodeUser(val string) (nodeID, userID string) {
+	nodeID, userID, _ = strings.Cut(val, "\x00")
+	return nodeID, userID
+}
 
 // envStaleAfter — env, що перекриває поріг. Значення — будь-що, що розуміє
 // time.ParseDuration ("45s", "2m").
@@ -85,16 +98,15 @@ const envStaleAfter = "OO_SCREEN_REVOKE_STALE_AFTER"
 // 90 с = ~1,8× найдовшого відомого вікна перезапуску і вдвічі менше за "кілька
 // хвилин" з інциденту. Порядок величини тут і є відповіддю: десятки секунд, не
 // секунди (клали б усіх на кожному деплої) і не десятки хвилин (рубильник знову
-// був би декоративним). При pollInterval=2 с і таймауті клієнта 5 с це 13-45
-// провалених спроб — справжня недоступність, а не блимання.
+// був би декоративним). При pollInterval=3 с (main.go) і таймауті запиту 8 с
+// (revokeTimeoutFromEnv) це 11-30 провалених спроб: 30, якщо ERP відмовляє
+// одразу, ~11, якщо кожен запит висить до таймауту, — справжня недоступність,
+// а не блимання.
 const defaultStaleAfter = 90 * time.Second
 
-// staleAfterFromEnv — поріг з оточення; невалідне/непарсабельне/нульове
-// значення НЕ вимикає рубильник, а лишає дефолт (мовчазне "0 = вимкнено" було б
-// найгіршим варіантом: fail-open через друкарську помилку в env).
 // sharedERPTransport — один транспорт на весь процес: keep-alive тримає
 // зʼєднання до ERP живим між тіками, тож типовий опит коштує один HTTP-запит,
-// а не «TCP + TLS + запит» кожні дві секунди.
+// а не «TCP + TLS + запит» на кожен тік.
 var (
 	erpTransportOnce sync.Once
 	erpTransport     *http.Transport
@@ -122,11 +134,14 @@ func revokeTimeoutFromEnv() time.Duration {
 		if d, err := time.ParseDuration(v); err == nil && d > 0 {
 			return d
 		}
-		log.Printf("subscribeRevoke: OO_SCREEN_REVOKE_TIMEOUT=%q не розібрано, беру 8s", v)
+		log.Printf("SubscribeRevoke: OO_SCREEN_REVOKE_TIMEOUT=%q не розібрано, беру 8s", v)
 	}
 	return 8 * time.Second
 }
 
+// staleAfterFromEnv — поріг з оточення; невалідне/непарсабельне/нульове
+// значення НЕ вимикає рубильник, а лишає дефолт (мовчазне "0 = вимкнено" було б
+// найгіршим варіантом: fail-open через друкарську помилку в env).
 func staleAfterFromEnv() time.Duration {
 	v := strings.TrimSpace(os.Getenv(envStaleAfter))
 	if v == "" {
@@ -134,10 +149,24 @@ func staleAfterFromEnv() time.Duration {
 	}
 	d, err := time.ParseDuration(v)
 	if err != nil || d <= 0 {
-		log.Printf("subscribeRevoke: %s=%q не є додатною тривалістю, беру дефолт %s", envStaleAfter, v, defaultStaleAfter)
+		log.Printf("SubscribeRevoke: %s=%q не є додатною тривалістю, беру дефолт %s", envStaleAfter, v, defaultStaleAfter)
 		return defaultStaleAfter
 	}
 	return d
+}
+
+// revokeLastOK — unix ms останнього вдалого пола ревокацій (0 = ще не було);
+// читає /healthz (H-16): застарілий пол = хаб не може підтвердити дозволи.
+var revokeLastOK atomic.Int64
+
+// RevokePollAge — скільки часу минуло від останнього вдалого пола; ok=false,
+// якщо вдалого ще не було.
+func RevokePollAge(now time.Time) (time.Duration, bool) {
+	ms := revokeLastOK.Load()
+	if ms == 0 {
+		return 0, false
+	}
+	return now.Sub(time.UnixMilli(ms)), true
 }
 
 // staleGate тримає рівно те, що потрібно для переходу "м'яко -> твердо", і
@@ -156,20 +185,6 @@ func staleAfterFromEnv() time.Duration {
 // успішного ConsumeTicket на тому ж ERP (ticket.go, fail-closed), тож поки ERP
 // мовчить, нових глядачів і так не з'являється. Плутанина цих двох станів
 // клала б усіх одразу після кожного перезапуску хаба.
-// revokeLastOK — unix ms останнього вдалого пола ревокацій (0 = ще не було);
-// читає /healthz (H-16): застарілий пол = хаб не може підтвердити дозволи.
-var revokeLastOK atomic.Int64
-
-// RevokePollAge — скільки часу минуло від останнього вдалого пола; ok=false,
-// якщо вдалого ще не було.
-func RevokePollAge(now time.Time) (time.Duration, bool) {
-	ms := revokeLastOK.Load()
-	if ms == 0 {
-		return 0, false
-	}
-	return now.Sub(time.UnixMilli(ms)), true
-}
-
 type staleGate struct {
 	after    time.Duration
 	url      string
@@ -202,18 +217,19 @@ func (g *staleGate) observe(now time.Time, ok bool) {
 	g.onRevoke(RevokeKindStale, down.Round(time.Second).String())
 }
 
-// subscribeRevoke кожні pollInterval (0 -> дефолт 2с) робить GET
+// SubscribeRevoke кожні pollInterval (0 -> дефолт 2с) робить GET
 // {erpBase}/remote-access/screen/revocations?since=<since_ms> із заголовком
-// X-OO-Hub-Key, і для кожного нового запису кличе onRevoke("node", node_id)
-// або onRevoke("user", user_id) — залежно від того, яке з полів непорожнє.
+// X-OO-Hub-Key, і для кожного нового запису кличе onRevoke("node", node_id),
+// onRevoke("user", user_id) або — обидва поля — onRevoke(RevokeKindNodeUser,
+// JoinNodeUser(node_id, user_id)).
 // Курсор since рухається вперед на max(at) серед ОБРОБЛЕНИХ у цьому тіку
 // записів; HTTP/JSON-помилки логуються й НЕ рухають since (наступний тік
 // повторить той самий діапазон — fail-soft, не fail-closed і не fail-open).
 //
-// Блокується, поки ctx не скасовано (виклик — go subscribeRevoke(...)).
+// Блокується, поки ctx не скасовано (виклик — go SubscribeRevoke(...)).
 func SubscribeRevoke(ctx context.Context, erpBase, hubKey string, pollInterval time.Duration, onRevoke func(kind, val string)) {
 	if strings.TrimSpace(erpBase) == "" {
-		log.Printf("subscribeRevoke: erpBase порожній, поллінг не запущено")
+		log.Printf("SubscribeRevoke: erpBase порожній, поллінг не запущено")
 		return
 	}
 	if pollInterval <= 0 {
@@ -261,44 +277,49 @@ func SubscribeRevoke(ctx context.Context, erpBase, hubKey string, pollInterval t
 func pollRevocationsOnce(ctx context.Context, client *http.Client, url, hubKey string, since int64, onRevoke func(kind, val string)) (int64, bool) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url+"?since="+strconv.FormatInt(since, 10), nil)
 	if err != nil {
-		log.Printf("subscribeRevoke: build request: %v", err)
+		log.Printf("SubscribeRevoke: build request: %v", err)
 		return since, false
 	}
 	req.Header.Set("X-OO-Hub-Key", hubKey)
 
 	resp, err := client.Do(req)
 	if err != nil {
-		log.Printf("subscribeRevoke: erp unreachable: %v", err)
+		log.Printf("SubscribeRevoke: erp unreachable: %v", err)
 		return since, false
 	}
 	defer resp.Body.Close()
 
 	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	if err != nil {
-		log.Printf("subscribeRevoke: read body: %v", err)
+		log.Printf("SubscribeRevoke: read body: %v", err)
 		return since, false
 	}
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		log.Printf("subscribeRevoke: erp status %d: %s", resp.StatusCode, string(body))
+		// truncBody: ERP на збої віддає цілу сторінку помилки, а цей рядок
+		// пишеться на кожному тіку, поки збій триває.
+		log.Printf("SubscribeRevoke: erp status %d: %s", resp.StatusCode, truncBody(body))
 		return since, false
 	}
 
 	var entries []revocationEntry
 	if err := json.Unmarshal(body, &entries); err != nil {
-		log.Printf("subscribeRevoke: bad json from erp: %v (body=%q)", err, string(body))
+		log.Printf("SubscribeRevoke: bad json from erp: %v (body=%q)", err, truncBody(body))
 		return since, false
 	}
 
 	next := since
 	for _, e := range entries {
+		hasNode, hasUser := strings.TrimSpace(e.NodeID) != "", strings.TrimSpace(e.UserID) != ""
 		switch {
-		case strings.TrimSpace(e.NodeID) != "":
+		case hasNode && hasUser:
+			onRevoke(RevokeKindNodeUser, JoinNodeUser(e.NodeID, e.UserID))
+		case hasNode:
 			onRevoke("node", e.NodeID)
-		case strings.TrimSpace(e.UserID) != "":
+		case hasUser:
 			onRevoke("user", e.UserID)
 		default:
-			log.Printf("subscribeRevoke: запис без node_id і user_id, пропущено: %s", fmt.Sprintf("at=%d", e.At))
+			log.Printf("SubscribeRevoke: запис без node_id і user_id, пропущено: %s", fmt.Sprintf("at=%d", e.At))
 			continue
 		}
 		if e.At > next {

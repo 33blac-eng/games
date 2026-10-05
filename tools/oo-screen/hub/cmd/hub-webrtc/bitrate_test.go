@@ -34,10 +34,10 @@ func checkAll(step stepFn) []string {
 			0.03, t0, 5_600_000, true},
 		{"hold-in-gray-zone", bitrateCtl{target: 8_000_000, startBps: 8_000_000},
 			0.01, t0, 8_000_000, false},
-		{"cut-clamped-to-floor", bitrateCtl{target: 600_000, startBps: 8_000_000},
-			0.5, t0, 500_000, true},
-		{"floor-is-sticky", bitrateCtl{target: 500_000, startBps: 8_000_000},
-			0.5, t0, 500_000, false},
+		{"cut-clamped-to-floor", bitrateCtl{target: 1_800_000, startBps: 8_000_000},
+			0.5, t0, minBitrateBps, true},
+		{"floor-is-sticky", bitrateCtl{target: minBitrateBps, startBps: 8_000_000},
+			0.5, t0, minBitrateBps, false},
 
 		// --- підйом: лише після 5с чистих ---
 		{"no-up-before-streak", bitrateCtl{target: 4_000_000, startBps: 8_000_000, goodSince: t0},

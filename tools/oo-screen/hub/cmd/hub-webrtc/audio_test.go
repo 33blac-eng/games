@@ -96,22 +96,62 @@ func mediaPorts(sdp, kind string) []string {
 func withAudioFlag(t *testing.T, on bool) {
 	t.Helper()
 	prevFlag, prevReg := audioEnabled, reg
-	audioEnabled, reg = on, newRegistry()
-	t.Cleanup(func() { audioEnabled, reg = prevFlag, prevReg })
+	mine := newRegistry()
+	audioEnabled, reg = on, mine
+	t.Cleanup(func() {
+		audioEnabled, reg = prevFlag, prevReg
+		// Хабові ноги тесту закриваємо разом із ним. Інакше вони лишались
+		// жити на спільному ICE-mux і ще ~30 с слали STUN-перевірки, поки
+		// pion не визнає їх failed, — тобто крали CPU і сокет у НАСТУПНОГО
+		// тесту саме тоді, коли той піднімає свою ногу.
+		mine.mu.Lock()
+		var pcs []*webrtc.PeerConnection
+		for _, ns := range mine.nodes {
+			ns.mu.Lock()
+			if ns.agentPC != nil {
+				pcs = append(pcs, ns.agentPC)
+			}
+			for _, vl := range ns.viewers {
+				pcs = append(pcs, vl.pc)
+			}
+			ns.mu.Unlock()
+		}
+		mine.mu.Unlock()
+		for _, pc := range pcs {
+			_ = pc.Close()
+		}
+	})
 }
 
 // awaitAudioTrack чекає, поки в браузерну ногу приїде саме аудіо-доріжка.
-func awaitAudioTrack(t *testing.T, tracks <-chan *webrtc.TrackRemote) *webrtc.TrackRemote {
+//
+// Вердикт дає ПОДІЯ, а не секундомір: доріжка приїхала — успіх; нога впала
+// в failed/closed — провал. Раніше тут стояли фіксовані 20 с, і на завантаженій
+// машині (гейт під -race поруч з іншими збираннями) ICE встигав лише дійти до
+// checking — тест падав, хоча нога ще жила й конектилась. Скільки чекати на
+// ICE, вирішує сам pion (його failed-тайм-аут), а stuckGuard — лише запобіжник
+// від вічного зависання, якщо не прийде взагалі жодної події.
+func awaitAudioTrack(t *testing.T, pc *webrtc.PeerConnection, tracks <-chan *webrtc.TrackRemote) *webrtc.TrackRemote {
 	t.Helper()
-	deadline := time.After(20 * time.Second)
+	// Стан ноги опитуємо, а не ставимо OnConnectionStateChange: у pion обробник
+	// один на PeerConnection, і наш затирав би обробник того, хто ногу підняв.
+	poll := time.NewTicker(20 * time.Millisecond)
+	defer poll.Stop()
+	const stuckGuard = 3 * time.Minute
+	guard := time.After(stuckGuard)
 	for {
 		select {
 		case tr := <-tracks:
 			if tr.Kind() == webrtc.RTPCodecTypeAudio {
 				return tr
 			}
-		case <-deadline:
-			t.Fatal("аудіо-доріжка не приїхала в браузерну ногу за 20с")
+		case <-poll.C:
+			if s := pc.ConnectionState(); s == webrtc.PeerConnectionStateFailed || s == webrtc.PeerConnectionStateClosed {
+				t.Fatalf("браузерна нога впала (%s), аудіо-доріжка так і не приїхала", s)
+				return nil
+			}
+		case <-guard:
+			t.Fatalf("за %s браузерна нога не отримала аудіо-доріжки і не впала", stuckGuard)
 			return nil
 		}
 	}
@@ -172,7 +212,7 @@ func TestAudioFlagOffChangesNothing(t *testing.T) {
 func TestAudioFlagOnDeliversPackets(t *testing.T) {
 	withAudioFlag(t, true)
 
-	_, sdp, tracks := dialViewerLeg(t, true)
+	vpc, sdp, tracks := dialViewerLeg(t, true)
 
 	ports := mediaPorts(sdp, "audio")
 	if len(ports) != 1 || ports[0] == "0" {
@@ -182,7 +222,7 @@ func TestAudioFlagOnDeliversPackets(t *testing.T) {
 		t.Fatalf("у answer немає PCMU/8000:\n%s", sdp)
 	}
 
-	audio := awaitAudioTrack(t, tracks)
+	audio := awaitAudioTrack(t, vpc, tracks)
 	if err := audio.SetReadDeadline(time.Now().Add(15 * time.Second)); err != nil {
 		t.Fatalf("SetReadDeadline: %v", err)
 	}
@@ -235,12 +275,12 @@ func TestAgentAudioReachesViewer(t *testing.T) {
 		}
 	}()
 
-	_, sdp, tracks := dialViewerLeg(t, true)
+	vpc, sdp, tracks := dialViewerLeg(t, true)
 	if !strings.Contains(strings.ToUpper(sdp), "PCMU/8000") {
 		t.Fatalf("у answer глядача немає PCMU/8000:\n%s", sdp)
 	}
 
-	audio := awaitAudioTrack(t, tracks)
+	audio := awaitAudioTrack(t, vpc, tracks)
 	if err := audio.SetReadDeadline(time.Now().Add(20 * time.Second)); err != nil {
 		t.Fatalf("SetReadDeadline: %v", err)
 	}
@@ -278,8 +318,8 @@ func TestAgentWithoutAudioFallsBackToTone(t *testing.T) {
 		t.Fatal("хаб вирішив, що агент шле звук, хоча той цього не оголошував")
 	}
 
-	_, _, tracks := dialViewerLeg(t, true)
-	audio := awaitAudioTrack(t, tracks)
+	vpc, _, tracks := dialViewerLeg(t, true)
+	audio := awaitAudioTrack(t, vpc, tracks)
 	if err := audio.SetReadDeadline(time.Now().Add(15 * time.Second)); err != nil {
 		t.Fatalf("SetReadDeadline: %v", err)
 	}
@@ -307,5 +347,70 @@ func TestToneIsNotConstant(t *testing.T) {
 		if bytes.Equal(f, bytes.Repeat(f[:1], len(f))) {
 			t.Fatalf("кадр %d тону складається з однакових байтів — мітка джерела втратила сенс", i)
 		}
+	}
+}
+
+// TestRecordAudioSlotFollowsListeningLeg — R5-G6: слот запису звуку тримає нога,
+// якій звук реально йде. Два глядачі, слот узяв A; A сховав вкладку без звуку
+// (audioLive=false), B чує. Звук мусить і далі потрапляти у файл — через B.
+// Прибери віддачу слота на тиші в audioPump — A триматиме його, і запис
+// оглухне, поки A прихований.
+func TestRecordAudioSlotFollowsListeningLeg(t *testing.T) {
+	withAudioFlag(t, true)
+	ns := readyNode(t, "rec-slot")
+	a := ns.onlyViewer(t)
+	b := addReadyViewerNotFirst(t, ns)
+	setAgentAudio(ns, true)
+
+	// Рекордер без писаря: offerAudio кладе кадри в чергу, звідки їх і читаємо.
+	rec := &recorder{ch: make(chan recItem, 4096), done: make(chan struct{})}
+	ns.rec.Store(rec)
+	for _, vl := range []*viewerLeg{a, b} {
+		trk, err := webrtc.NewTrackLocalStaticSample(webrtc.RTPCodecCapability{MimeType: webrtc.MimeTypePCMU, ClockRate: pcmu.Rate}, "audio", "oo-screen")
+		if err != nil {
+			t.Fatal(err)
+		}
+		go vl.audioPump(ns, trk)
+	}
+
+	frame := bytes.Repeat([]byte{0x11}, pcmu.FrameSamples)
+	// feedUntil годує ноду кадрами в темпі агента, доки у файл не ляже want
+	// кадрів. Вердикт — за ПОДІЄЮ (кадри дійшли), а не за вікном у N мс: раніше
+	// тест давав pump-ам рівно 400+500 мс настінного часу, і під -race на
+	// завантаженій машині горутина A просто не встигала прокинутись на своєму
+	// audioIdleTick — «0 кадрів» без жодної вади в коді. stuckGuard — лише
+	// запобіжник: без віддачі слота на тиші (регресія, яку ловить тест) A
+	// тримає його вічно, і кадрів не буде за будь-який час.
+	const stuckGuard = 30 * time.Second
+	feedUntil := func(want int) (recorded int) {
+		for end := time.Now().Add(stuckGuard); recorded < want && time.Now().Before(end); {
+			forwardAudioToViewers(ns, frame)
+			time.Sleep(pcmu.Duration(pcmu.FrameSamples))
+			for drained := false; !drained; {
+				select {
+				case it := <-rec.ch:
+					if it.aud != nil {
+						recorded++
+					}
+				default:
+					drained = true
+				}
+			}
+		}
+		return recorded
+	}
+
+	// Слот віддаємо саме A: B поки не чує.
+	setViewerHidden(ns, b, true)
+	if n := feedUntil(1); n == 0 {
+		t.Fatal("звук не пишеться навіть з одним слухачем")
+	}
+	// A сховався без звуку, B повернувся й чує. A ще може дописати свою
+	// чергу (≤ audioQueueDepth кадрів) — тому чекаємо на 10 кадрів ПОНАД неї:
+	// їх уже може написати лише B.
+	setViewerHidden(ns, b, false)
+	setViewerHidden(ns, a, true)
+	if n := feedUntil(10 + audioQueueDepth); n < 10+audioQueueDepth {
+		t.Fatalf("B чує звук, а у файл за %s лягло %d кадрів — слот застряг у прихованого A", stuckGuard, n)
 	}
 }

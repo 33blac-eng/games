@@ -73,6 +73,10 @@ struct oos_cap {
     /* Cached pointer state; DXGI only re-sends the shape when it changes. */
     uint8_t *shape;
     uint32_t shape_cap;
+    /* Blended cursor rectangle on its way back into bgra; kept across frames
+     * (like shape) so compositing does no malloc/free per frame. */
+    uint8_t *cur_tmp;
+    size_t cur_tmp_cap;
     DXGI_OUTDUPL_POINTER_SHAPE_INFO shape_info;
     int32_t have_shape;
     int32_t cur_visible;
@@ -531,16 +535,20 @@ static int composite_cursor(oos_cap *c)
     /* Copy out before Unmap: UpdateSubresource cannot read a mapped resource. */
     {
         size_t need = (size_t)rw * 4 * (size_t)rh;
-        uint8_t *tmp = (uint8_t *)malloc(need);
+        uint8_t *tmp;
         int i;
-        if (!tmp) { c->ctx->lpVtbl->Unmap(c->ctx, (ID3D11Resource *)c->cur_stage, 0); return 0; }
+        if (c->cur_tmp_cap < need) {
+            uint8_t *p = (uint8_t *)realloc(c->cur_tmp, need);
+            if (!p) { c->ctx->lpVtbl->Unmap(c->ctx, (ID3D11Resource *)c->cur_stage, 0); return 0; }
+            c->cur_tmp = p; c->cur_tmp_cap = need;
+        }
+        tmp = c->cur_tmp;
         for (i = 0; i < rh; i++)
             memcpy(tmp + (size_t)i * rw * 4,
                    (uint8_t *)m.pData + (size_t)i * m.RowPitch, (size_t)rw * 4);
         c->ctx->lpVtbl->Unmap(c->ctx, (ID3D11Resource *)c->cur_stage, 0);
         c->ctx->lpVtbl->UpdateSubresource(c->ctx, (ID3D11Resource *)c->bgra, 0,
                                           &box, tmp, (UINT)(rw * 4), 0);
-        free(tmp);
     }
     return 1;
 }
@@ -819,6 +827,7 @@ void oos_close(oos_cap *c)
     SAFE_RELEASE(c->ctx);
     SAFE_RELEASE(c->dev);
     if (c->shape) free(c->shape);
+    free(c->cur_tmp);
     free(c);
 }
 
