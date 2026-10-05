@@ -434,7 +434,7 @@ type rcvbufNet struct {
 func (r rcvbufNet) ListenUDP(network string, a *net.UDPAddr) (transport.UDPConn, error) {
 	c, err := r.Net.ListenUDP(network, a)
 	if err == nil {
-		_ = c.SetReadBuffer(r.n)
+		setRcvbuf(c, r.n)
 	}
 	return c, err
 }
@@ -442,7 +442,29 @@ func (r rcvbufNet) ListenUDP(network string, a *net.UDPAddr) (transport.UDPConn,
 func (r rcvbufNet) ListenPacket(network, address string) (net.PacketConn, error) {
 	c, err := r.Net.ListenPacket(network, address)
 	if u, ok := c.(*net.UDPConn); err == nil && ok {
-		_ = u.SetReadBuffer(r.n)
+		setRcvbuf(u, r.n)
 	}
 	return c, err
+}
+
+var rcvbufWarnOnce sync.Once
+
+// setRcvbuf ставить SO_RCVBUF і один раз попереджає, якщо виклик упав або
+// ядро мовчки обріже значення до net.core.rmem_max (Linux).
+func setRcvbuf(c interface{ SetReadBuffer(int) error }, n int) {
+	err := c.SetReadBuffer(n)
+	rcvbufWarnOnce.Do(func() {
+		if err != nil {
+			logf("HUBBENCH_RCVBUF=%d: SetReadBuffer failed: %v", n, err)
+			return
+		}
+		b, e := os.ReadFile("/proc/sys/net/core/rmem_max")
+		if e != nil {
+			return
+		}
+		var max int
+		if _, e := fmt.Sscan(string(b), &max); e == nil && max < n {
+			logf("HUBBENCH_RCVBUF=%d exceeds net.core.rmem_max=%d; kernel caps SO_RCVBUF, knob is ineffective (raise with sysctl -w net.core.rmem_max=%d)", n, max, n)
+		}
+	})
 }
