@@ -1436,11 +1436,15 @@ func main() {
 	}
 
 	// N6: ціль локального контролера прямої ноги — тим самим шляхом.
+	// Енкодер один, тож ціль хаба і цілі ніг ідуть через арбітраж p2pAg
+	// (мінімум): hubBitrateTarget — те, що отримує транспорт хаба.
+	hubBitrateTarget := onBitrateTarget
 	if p2pAg != nil && p2pAg.bwe {
 		p2pAg.onBitrate = func(bps uint64) {
-			log.Printf("oo-agent: p2p bwe -> %d bps", bps)
+			log.Printf("oo-agent: p2p bwe (мін. ніг і хаба) -> %d bps", bps)
 			onBitrateTarget(bps)
 		}
+		hubBitrateTarget = p2pAg.setHubTarget
 	}
 
 	// onSelectOutput — hub попросив інший монітор (control §select_output; сам
@@ -1481,7 +1485,7 @@ func main() {
 	}
 
 	tp, err := retryUntil(ctx, "initial dial "+*hubAddr, func() (transport, error) {
-		t, err := dial(*transportKind, hubSel.current(), frameInterval, onKeyframeRequest, onGate, onBitrateTarget, onSelectOutput, onDown)
+		t, err := dial(*transportKind, hubSel.current(), frameInterval, onKeyframeRequest, onGate, hubBitrateTarget, onSelectOutput, onDown)
 		if err != nil {
 			hubSel.failed(ctx)
 			return nil, err
@@ -1703,7 +1707,7 @@ func main() {
 			tp.close()
 			tpMu.Unlock()
 
-			newTp, err := dial(*transportKind, hubSel.current(), frameInterval, onKeyframeRequest, onGate, onBitrateTarget, onSelectOutput, onDown)
+			newTp, err := dial(*transportKind, hubSel.current(), frameInterval, onKeyframeRequest, onGate, hubBitrateTarget, onSelectOutput, onDown)
 			if err != nil {
 				if hubSel.failed(ctx) {
 					backoff = reconnectBackoffMin // новий хаб здоровий — пробуємо одразу з короткою витримкою

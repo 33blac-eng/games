@@ -95,6 +95,15 @@ type p2pAgent struct {
 	ceilBps   uint64
 	onBitrate func(bps uint64)
 
+	// Арбітраж цілі: енкодер один на всіх, тож застосовуємо МІНІМУМ з цілей
+	// усіх живих прямих ніг і останньої цілі хаба (relay-глядачі). Інакше
+	// здорова нога (REMB/+5 %) перебивала б зріз ноги з втратами, а локальний
+	// контролер — зріз хаба.
+	bmu     sync.Mutex
+	legBps  map[string]uint64
+	hubBps  uint64 // 0 — хаб ціль не ставив
+	lastBps uint64
+
 	legs    p2p.AgentLegs
 	mu      sync.Mutex
 	entries map[string]p2pLegEntry
@@ -107,6 +116,7 @@ func newP2PAgent(cfg p2p.Config, base func() string, node string, token func() s
 		// > PollWait брокера (25 с) із запасом.
 		client:   &http.Client{Timeout: 45 * time.Second},
 		entries:  map[string]p2pLegEntry{},
+		legBps:   map[string]uint64{},
 		lim:      rate.NewLimiter(p2pInputRate, p2pInputBurst),
 		retryMin: time.Second,
 	}
@@ -310,7 +320,7 @@ func (a *p2pAgent) handleOffer(ctx context.Context, o p2p.Offer) {
 	a.entries[id] = ent
 	a.mu.Unlock()
 	for _, s := range leg.PC.GetSenders() {
-		go a.readRTCP(s, ent, s.Track() == webrtc.TrackLocal(track))
+		go a.readRTCP(id, s, ent, s.Track() == webrtc.TrackLocal(track))
 	}
 	if st := a.post("/p2p/answer", p2p.AgentAnswerReq{ID: id, Node: a.node, SDP: sdp}); st == http.StatusGone || st == 0 {
 		// Хаб уже не знає сесії (таймаут/відкликання) або недосяжний.
@@ -350,7 +360,7 @@ func offersAudio(sdpText string) bool {
 
 // readRTCP — PLI/FIR -> IDR; для відео-sender-а з контролером — ще RR,
 // REMB і TWCC у bwe.LegCtl.
-func (a *p2pAgent) readRTCP(s *webrtc.RTPSender, e p2pLegEntry, video bool) {
+func (a *p2pAgent) readRTCP(id string, s *webrtc.RTPSender, e p2pLegEntry, video bool) {
 	for {
 		pkts, _, err := s.ReadRTCP()
 		if err != nil {
@@ -364,38 +374,84 @@ func (a *p2pAgent) readRTCP(s *webrtc.RTPSender, e p2pLegEntry, video bool) {
 				}
 			case *rtcp.ReceiverReport:
 				if video && e.ctl != nil {
-					a.onRR(s, e, pk)
+					a.onRR(id, s, e, pk)
 				}
 			case *rtcp.ReceiverEstimatedMaximumBitrate:
 				if video && e.ctl != nil {
-					a.applyBitrate(e.ctl.OnRemb(uint64(pk.Bitrate), time.Now()))
+					a.legTarget(id)(e.ctl.OnRemb(uint64(pk.Bitrate), time.Now()))
 				}
 			case *rtcp.TransportLayerCC:
 				if video && e.ctl != nil && e.twcc != nil {
-					a.applyBitrate(e.ctl.OnTWCC(e.twcc.OnFeedback(pk), time.Now()))
+					a.legTarget(id)(e.ctl.OnTWCC(e.twcc.OnFeedback(pk), time.Now()))
 				}
 			}
 		}
 	}
 }
 
-func (a *p2pAgent) onRR(s *webrtc.RTPSender, e p2pLegEntry, rr *rtcp.ReceiverReport) {
+func (a *p2pAgent) onRR(id string, s *webrtc.RTPSender, e p2pLegEntry, rr *rtcp.ReceiverReport) {
 	ssrc := map[uint32]bool{}
 	for _, enc := range s.GetParameters().Encodings {
 		ssrc[uint32(enc.SSRC)] = true
 	}
 	for _, r := range rr.Reports {
 		if ssrc[r.SSRC] {
-			a.applyBitrate(e.ctl.OnLoss(float64(r.FractionLost)/256, time.Now()))
+			a.legTarget(id)(e.ctl.OnLoss(float64(r.FractionLost)/256, time.Now()))
 		}
 	}
 }
 
-func (a *p2pAgent) applyBitrate(bps uint64, changed bool) {
-	if !changed || a.onBitrate == nil {
+// legTarget — приймач (ціль, змінилась) LegCtl ноги id.
+func (a *p2pAgent) legTarget(id string) func(bps uint64, changed bool) {
+	return func(bps uint64, changed bool) { a.applyBitrate(id, bps, changed) }
+}
+
+func (a *p2pAgent) applyBitrate(id string, bps uint64, changed bool) {
+	if !changed {
 		return
 	}
-	a.onBitrate(bps)
+	a.bmu.Lock()
+	a.legBps[id] = bps
+	a.arbitrateLocked()
+	a.bmu.Unlock()
+}
+
+// setHubTarget — bitrate_target хаба (relay-глядачі) іде в той самий арбітраж.
+func (a *p2pAgent) setHubTarget(bps uint64) {
+	a.bmu.Lock()
+	a.hubBps = bps
+	a.arbitrateLocked()
+	a.bmu.Unlock()
+}
+
+// forgetLeg — нога пішла: її ціль більше не тримає енкодер.
+func (a *p2pAgent) forgetLeg(id string) {
+	a.bmu.Lock()
+	if _, ok := a.legBps[id]; ok {
+		delete(a.legBps, id)
+		a.arbitrateLocked()
+	}
+	a.bmu.Unlock()
+}
+
+// arbitrateLocked — мінімум ненульових цілей; викликає onBitrate лише на зміну.
+// onBitrate (main) лише кладе ціль для кадрового циклу — під bmu безпечно і
+// зберігає порядок застосувань.
+func (a *p2pAgent) arbitrateLocked() {
+	var m uint64
+	for _, b := range a.legBps {
+		if b > 0 && (m == 0 || b < m) {
+			m = b
+		}
+	}
+	if a.hubBps > 0 && (m == 0 || a.hubBps < m) {
+		m = a.hubBps
+	}
+	if m == 0 || m == a.lastBps || a.onBitrate == nil {
+		return
+	}
+	a.lastBps = m
+	a.onBitrate(m)
 }
 
 // input — подія з oosc-input прямої ноги (grant і згоду вже перевірив
@@ -424,6 +480,7 @@ func (a *p2pAgent) drop(id string) {
 	_, had := a.entries[id]
 	delete(a.entries, id)
 	a.mu.Unlock()
+	a.forgetLeg(id)
 	if had {
 		a.notifyActive()
 	}
