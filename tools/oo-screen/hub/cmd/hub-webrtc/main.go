@@ -257,6 +257,11 @@ type answerResp struct {
 type nodeSession struct {
 	nodeID string // незмінний ключ у реєстрі
 
+	// touched — UnixNano останнього getOrCreate цієї ноди (R5, nodereap.go):
+	// жнець не прибирає ноду, до якої щойно прийшов offer і агент ще
+	// домовляється (agentPC == nil до Connected).
+	touched atomic.Int64
+
 	mu      sync.Mutex
 	agentPC *webrtc.PeerConnection
 	// viewers — УСІ глядачі цієї ноди (fanout, див. fanout.go). Ключ — їхній
@@ -458,12 +463,14 @@ func (r *registry) getOrCreateNew(nodeID string) (*nodeSession, bool) {
 	defer r.mu.Unlock()
 	ns := r.nodes[nodeID]
 	if ns != nil {
+		ns.touched.Store(time.Now().UnixNano())
 		return ns, false
 	}
 	if len(r.nodes) >= maxNodes {
 		return nil, false
 	}
 	ns = &nodeSession{nodeID: nodeID}
+	ns.touched.Store(time.Now().UnixNano())
 	r.nodes[nodeID] = ns
 	return ns, true
 }
@@ -2324,6 +2331,8 @@ func main() {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	startRevokeSubscription(ctx)
+	// R5: ноди без агента й глядачів не живуть вічно (nodereap.go).
+	go reapIdleNodesLoop(ctx)
 
 	// pprof — ОКРЕМИЙ слухач і лише за явним OO_SCREEN_PPROF_ADDR. Не на mux
 	// сигналінгу: /debug/pprof віддає дампи горутин і профілі, і на проді він
