@@ -130,6 +130,10 @@ func handleControl(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "output must be >= 0", http.StatusBadRequest)
 			return
 		}
+		if hasMonitorStreams(ns.nodeID) {
+			http.Error(w, "multimon active: monitors are published as separate streams, select_output disabled", http.StatusConflict)
+			return
+		}
 		if !sendSelectOutput(ns, idx) {
 			http.Error(w, "agent control channel not open", http.StatusConflict)
 			return

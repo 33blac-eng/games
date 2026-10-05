@@ -103,6 +103,13 @@ func TestMultimonEndToEndRouting(t *testing.T) {
 		t.Fatalf("monitor=-1: %d, want 400", c)
 	}
 
+	// Рев'ю F6: з живим nodeA#m1 select_output основного потоку заблоковано —
+	// інакше він переїхав би на монітор, який уже захоплює дитина.
+	one := 1
+	if w := postControl(controlReq{offerReq: offerReq{Ticket: "t-nodeA"}, Output: &one}); w.Code != http.StatusConflict {
+		t.Fatalf("select_output при живих потоках моніторів: %d, want 409", w.Code)
+	}
+
 	// Вимкнений прапорець: monitor>0 — 400, monitor 0 — старий шлях.
 	multimonEnabled = false
 	if c := postViewerMonitor("t-nodeA", 1); c != badMonitor {
@@ -209,5 +216,25 @@ func BenchmarkMultimonForward(b *testing.B) {
 				}
 			}
 		})
+	}
+}
+
+// TestMultimonHasMonitorStreams — блокування select_output вмикається лише
+// фічею і лише живим publisher-ом X#m<i> саме цієї ноди.
+func TestMultimonHasMonitorStreams(t *testing.T) {
+	withTicketMode(t)
+	withMultimon(t, true)
+	nodeWithAgent("solo", nil, 0)
+	nodeWithAgent("soloX#m1", nil, 0)
+	if hasMonitorStreams("solo") {
+		t.Fatal("solo без solo#m<i> вважається multimon")
+	}
+	nodeWithAgent("solo#m3", nil, 0)
+	if !hasMonitorStreams("solo") {
+		t.Fatal("solo#m3 живий, а блокування нема")
+	}
+	multimonEnabled = false
+	if hasMonitorStreams("solo") {
+		t.Fatal("фіча вимкнена, а select_output блокується")
 	}
 }

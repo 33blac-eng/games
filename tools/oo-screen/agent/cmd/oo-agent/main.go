@@ -49,6 +49,10 @@ var httpClient = &http.Client{Timeout: dialTimeout}
 // nodeID — mesh node_id цього ПК, задається прапорцем -node у main(). Порожній
 // = старий T1/бенч-режим (hub бере node з env). Читається лише з sender-шляху
 // dialWebRTC, який стартує після main() встановив значення.
+// multimonParentPinned — F6: батько -multimon запустив дочірні потоки, тож
+// select_output основного потоку ігнорується (рев'ю: дубль монітора, A-36).
+var multimonParentPinned atomic.Bool
+
 var nodeID string
 
 // cliToken — токен агента, обраний у main() з -token-file / OO_AGENT_TOKEN /
@@ -1151,7 +1155,14 @@ func main() {
 			case *transportKind != "webrtc" || nodeID == "":
 				log.Printf("oo-agent: multimon потребує -transport=webrtc і -node — вимкнено")
 			default:
-				startMultimonChildren(ctx, multimonChildren(len(l.Outputs), outIdx, *multimonMax), nodeID, *logPath, cliToken)
+				kids := multimonChildren(len(l.Outputs), outIdx, *multimonMax)
+				if len(kids) > 0 {
+					// Рев'ю F6: з дітьми основний потік теж закріплений —
+					// інакше select_output перевів би його на монітор, який
+					// уже захоплює дитина (дубль + конфлікт DXGI, A-36).
+					multimonParentPinned.Store(true)
+				}
+				startMultimonChildren(ctx, kids, nodeID, *logPath, cliToken)
 			}
 		}
 	}
@@ -1251,6 +1262,10 @@ func main() {
 	onSelectOutput := func(idx int) {
 		if *multimonChild > 0 {
 			log.Printf("oo-agent: select_output -> %d проігноровано: потік закріплений за монітором %d (F6)", idx, *multimonChild)
+			return
+		}
+		if multimonParentPinned.Load() {
+			log.Printf("oo-agent: select_output -> %d проігноровано: -multimon активний, монітори вже публікуються окремими потоками (F6)", idx)
 			return
 		}
 		log.Printf("oo-agent: select_output -> %d (застосує кадровий цикл)", idx)

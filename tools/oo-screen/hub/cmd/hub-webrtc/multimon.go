@@ -84,3 +84,18 @@ func monitorStreamSessions(base string) []*nodeSession {
 	}
 	return out
 }
+
+// hasMonitorStreams — чи публікує нода base хоч один додатковий потік X#m<i>.
+// Тоді основний потік закріплений: select_output перевів би його на монітор,
+// який уже захоплює дочірній процес (дубль, конфлікт DXGI).
+func hasMonitorStreams(base string) bool {
+	if !multimonEnabled {
+		return false
+	}
+	for i := 1; i <= multimon.MaxIndex; i++ {
+		if ns := reg.get(multimon.NodeID(base, i)); ns != nil && ns.hasAgent() {
+			return true
+		}
+	}
+	return false
+}
