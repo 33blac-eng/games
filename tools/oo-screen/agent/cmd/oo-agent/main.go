@@ -1304,6 +1304,7 @@ func main() {
 			var p2pLive atomic.Int32
 			onGate = func(resume bool) {
 				hubWantsView.Store(resume)
+				p2pAg.setHubViewers(resume) // relay-глядачів нема — ціль хаба не тримає енкодер
 				if !resume && p2pLive.Load() > 0 {
 					return
 				}
@@ -1484,6 +1485,9 @@ func main() {
 	// обробник стану pion блокувати не можна.
 	pcDown := make(chan string, 1)
 	onDown := func(reason string) {
+		if p2pAg != nil {
+			p2pAg.setHubViewers(false) // хаб відпав — relay-глядачів нема; gate після реконекту поверне
+		}
 		select {
 		case pcDown <- reason:
 		default:

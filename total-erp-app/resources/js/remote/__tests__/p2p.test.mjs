@@ -2,7 +2,7 @@
 import assert from 'node:assert/strict';
 import {
     p2pOfferUrl, postP2POffer, redeemRelay, waitIceOutcome, negotiateViewer, offerBody,
-    createDirectRescue, PATH_DIRECT, PATH_RELAY,
+    createDirectRescue, PATH_DIRECT, PATH_RELAY, resolveP2P,
 } from '../desktop-oo-webrtc.js';
 import { formatPathLine } from '../desktop-oo-stats.js';
 
@@ -13,6 +13,12 @@ assert.equal(p2pOfferUrl(SIG), P2P);
 assert.equal(p2pOfferUrl('https://hub/x/offer/viewer/'), 'https://hub/x/p2p/offer');
 assert.equal(p2pOfferUrl('https://hub/other'), null);
 assert.equal(p2pOfferUrl(SIG, 'https://o/p2p'), 'https://o/p2p');
+// resolveP2P: типово OFF; відповідь ERP (ticket) має пріоритет над config.
+assert.deepEqual(resolveP2P(null, {}), { p2p: false, p2pUrl: undefined });
+assert.deepEqual(resolveP2P({}, { p2p: true }), { p2p: true, p2pUrl: undefined });
+assert.deepEqual(resolveP2P({ p2p: false }, { p2p: true, p2pUrl: 'https://c' }), { p2p: false, p2pUrl: 'https://c' });
+assert.deepEqual(resolveP2P({ p2p: true, p2pUrl: 'https://t' }, { p2pUrl: 'https://c' }), { p2p: true, p2pUrl: 'https://t' });
+assert.deepEqual(resolveP2P({}, { p2p: 'true' }), { p2p: false, p2pUrl: undefined });
 assert.equal(formatPathLine('direct'), 'Шлях: direct (P2P)');
 assert.equal(formatPathLine('relay'), 'Шлях: relay (хаб)');
 assert.equal(formatPathLine(null), 'Шлях: —');

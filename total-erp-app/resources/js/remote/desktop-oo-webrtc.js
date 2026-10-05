@@ -568,6 +568,19 @@ export function resolveStandby(ticketResp, config) {
     return undefined;
 }
 
+/**
+ * N6: звідки брати прапор прямої ноги. Як і resolveStandby: пріоритет —
+ * відповідь requestTicket() (поля p2p / p2pUrl поруч із signalUrl; ERP ставить
+ * їх із env OO_SCREEN_P2P / OO_SCREEN_P2P_URL), інакше — config.p2p / config.p2pUrl.
+ * Лише строге true вмикає; нічого нема → { p2p: false } (типово OFF).
+ */
+export function resolveP2P(ticketResp, config) {
+    const src = (ticketResp && typeof ticketResp.p2p === 'boolean') ? ticketResp : (config || {});
+    const p2pUrl = (ticketResp && typeof ticketResp.p2pUrl === 'string' && ticketResp.p2pUrl)
+        || (config && typeof config.p2pUrl === 'string' && config.p2pUrl) || undefined;
+    return { p2p: src.p2p === true, p2pUrl };
+}
+
 export function shouldFailover(err, status, tornDown) {
     if (err) return !tornDown;
     return status === 404 || status === 502 || status === 503 || status === 504;
@@ -1413,13 +1426,14 @@ export function createOoWebrtcLayer(o) {
         // N6: config.p2p (типово вимкнено) — спершу пряма нога (negotiateViewer);
         // без нього — рівно той самий postOfferWithFailover, що й раніше.
         // Додаткові монітори (F6) лишаються на relay.
-        const p2pOn = !rescue && config.p2p === true && !(Number.isInteger(config.monitor) && config.monitor > 0);
+        const p2pCfg = resolveP2P(ticketResp, config);
+        const p2pOn = !rescue && p2pCfg.p2p && !(Number.isInteger(config.monitor) && config.monitor > 0);
         if (p2pOn) p2pTrialPeer = peer;
         let res;
         try {
             res = await negotiateViewer({
                 p2p: p2pOn,
-                p2pUrl: config.p2pUrl,
+                p2pUrl: p2pCfg.p2pUrl,
                 relayTicket: rescue ? rescue.relayTicket : null,
                 signalUrl,
                 standby: resolveStandby(ticketResp, config),

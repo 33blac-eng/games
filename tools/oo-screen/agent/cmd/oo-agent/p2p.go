@@ -99,9 +99,13 @@ type p2pAgent struct {
 	// усіх живих прямих ніг і останньої цілі хаба (relay-глядачі). Інакше
 	// здорова нога (REMB/+5 %) перебивала б зріз ноги з втратами, а локальний
 	// контролер — зріз хаба.
-	bmu     sync.Mutex
-	legBps  map[string]uint64
-	hubBps  uint64 // 0 — хаб ціль не ставив
+	bmu    sync.Mutex
+	legBps map[string]uint64
+	hubBps uint64 // 0 — хаб ціль не ставив
+	// hubIdle — у хаба НЕМА relay-глядачів (його gate "pause" або хаб відпав):
+	// тоді остання ціль хаба — застаріла і енкодер не тримає. Типово false:
+	// старий хаб без gate лишається в мінімумі, як до цього.
+	hubIdle bool
 	lastBps uint64
 
 	legs    p2p.AgentLegs
@@ -424,6 +428,18 @@ func (a *p2pAgent) setHubTarget(bps uint64) {
 	a.bmu.Unlock()
 }
 
+// setHubViewers — присутність relay-глядачів за gate хаба ("resume"/"pause").
+// Без них ціль хаба виходить з мінімуму; з новим глядачем — повертається
+// (хаб однаково пришле свіжий bitrate_target, коли зʼїде його BWE).
+func (a *p2pAgent) setHubViewers(present bool) {
+	a.bmu.Lock()
+	if a.hubIdle == present {
+		a.hubIdle = !present
+		a.arbitrateLocked()
+	}
+	a.bmu.Unlock()
+}
+
 // forgetLeg — нога пішла: її ціль більше не тримає енкодер.
 func (a *p2pAgent) forgetLeg(id string) {
 	a.bmu.Lock()
@@ -444,7 +460,7 @@ func (a *p2pAgent) arbitrateLocked() {
 			m = b
 		}
 	}
-	if a.hubBps > 0 && (m == 0 || a.hubBps < m) {
+	if !a.hubIdle && a.hubBps > 0 && (m == 0 || a.hubBps < m) {
 		m = a.hubBps
 	}
 	if m == 0 || m == a.lastBps || a.onBitrate == nil {
