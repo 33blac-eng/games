@@ -81,6 +81,12 @@ type dcRelay struct {
 	agentTx   interface{ Send([]byte) error }
 	granted   bool
 	grantSent bool
+	// grantMu серіалізує весь перерахунок «обчислити бажане → Send →
+	// записати стан»: інакше два конкурентні refreshCursorGrant можуть
+	// доставити агенту Mode у зворотному порядку від записаного стану
+	// (хаб думає granted=false, агент лишився на шарі — курсора нема).
+	// Порядок блокувань: grantMu → ns.mu / r.mu.
+	grantMu sync.Mutex
 }
 
 func newDCRelay(cfg relayConfig) *dcRelay {
@@ -226,7 +232,8 @@ func (r *dcRelay) removeViewer(s relaySink) {
 }
 
 // grant шле агенту дозвіл/відкликання шару, якщо він змінився. Повертає,
-// чи було відправлено.
+// чи було відправлено. Викликач тримає r.grantMu, тож Send іде в тому ж
+// порядку, що й записи granted.
 func (r *dcRelay) grant(on bool) bool {
 	r.mu.Lock()
 	tx := r.agentTx
@@ -285,10 +292,11 @@ func refreshCursorGrant(ns *nodeSession) {
 		return
 	}
 	r := v.(*dcRelay)
-	if r.grant(cursorGrantWanted(ns, r)) {
-		r.mu.Lock()
-		on := r.granted
-		r.mu.Unlock()
+	r.grantMu.Lock()
+	defer r.grantMu.Unlock()
+	// Бажане рахується під grantMu: рішення, обчислене до чужого Send,
+	// не може бути відправлене після нього.
+	if on := cursorGrantWanted(ns, r); r.grant(on) {
 		log.Printf("relay %s: cursor layer grant=%v [node=%s]", cursorproto.ChannelLabel, on, ns.nodeID)
 	}
 }

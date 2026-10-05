@@ -1,7 +1,9 @@
 package main
 
 import (
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/organicoils/oo-screen/internal/cursorproto"
 	"github.com/pion/webrtc/v4"
@@ -119,4 +121,60 @@ func TestCursorGrantNegotiation(t *testing.T) {
 // No relay (agent without -cursor-layer): refresh is a no-op.
 func TestCursorGrantNoRelay(t *testing.T) {
 	refreshCursorGrant(&nodeSession{nodeID: "n-none"})
+}
+
+// slowAgent widens the window between the state update and Send so that
+// unserialized grants would reach the agent out of order.
+type slowAgent struct{ *fakeSink }
+
+func (s slowAgent) Send(b []byte) error {
+	time.Sleep(50 * time.Microsecond)
+	return s.fakeSink.Send(b)
+}
+
+// Concurrent refreshCursorGrant (ticker, viewer open/close) must leave the
+// last Mode the agent received equal to what the hub recorded; otherwise the
+// 1 s ticker never re-sends and the agent can stay on the layer forever.
+func TestCursorGrantConcurrentOrder(t *testing.T) {
+	prevRec := recordEnabled.Load()
+	recordEnabled.Store(false)
+	t.Cleanup(func() { recordEnabled.Store(prevRec) })
+
+	for iter := 0; iter < 50; iter++ {
+		ns := &nodeSession{nodeID: "n-grant-race"}
+		r := relayFor(ns, cursorRelayConfig())
+		agent := slowAgent{newSink()}
+		r.setAgent(agent)
+		pc1, pc2 := &webrtc.PeerConnection{}, &webrtc.PeerConnection{}
+		r.addViewerOwned(pc1, newSink())
+
+		var wg sync.WaitGroup
+		for g := 0; g < 8; g++ {
+			wg.Add(1)
+			go func(g int) {
+				defer wg.Done()
+				for i := 0; i < 20; i++ {
+					ns.mu.Lock()
+					ns.viewers = map[*webrtc.PeerConnection]*viewerLeg{pc1: {pc: pc1}}
+					if (g+i)%2 == 0 {
+						ns.viewers[pc2] = &viewerLeg{pc: pc2} // layer-less viewer
+					}
+					ns.mu.Unlock()
+					refreshCursorGrant(ns)
+				}
+			}(g)
+		}
+		wg.Wait()
+
+		agent.mu.Lock()
+		sent, ok := cursorproto.DecodeMode(agent.got[len(agent.got)-1])
+		agent.mu.Unlock()
+		r.mu.Lock()
+		rec := r.granted
+		r.mu.Unlock()
+		forgetRelays(ns)
+		if !ok || sent != rec {
+			t.Fatalf("iter %d: agent last got on=%v, hub recorded granted=%v", iter, sent, rec)
+		}
+	}
 }
