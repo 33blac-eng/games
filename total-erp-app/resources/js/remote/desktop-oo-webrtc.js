@@ -518,6 +518,13 @@ export function mapRemoteToClient(x, y, rect, srcW, srcH) {
     return { x: b.x + x * scale, y: b.y + y * (b.height / srcH), scale };
 }
 
+/** offerBody — тіло /offer/viewer. monitor лише ціле >0 (F6, config.monitor:
+ *  потік "<node>#m<i>" на хабі), інакше поля немає — offer як до F6. */
+export function offerBody(sdp, ticket, monitor) {
+    if (Number.isInteger(monitor) && monitor > 0) return JSON.stringify({ sdp: sdp, ticket, monitor });
+    return JSON.stringify({ sdp: sdp, ticket });
+}
+
 export function createOoWebrtcLayer(o) {
     const opts = o || {};
     const container = opts.container;
@@ -1015,7 +1022,9 @@ export function createOoWebrtcLayer(o) {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 // offer несе ОДНОРАЗОВИЙ ticket, не довгоживучий токен.
-                body: JSON.stringify({ sdp: peer.localDescription.sdp, ticket }),
+                // F6: monitor>0 — потік додаткового монітора (desktop-oo-multimon.js);
+                // 0/відсутнє — поле не шлемо зовсім, offer як до F6.
+                body: offerBody(peer.localDescription.sdp, ticket, config.monitor),
                 signal: combined.signal,
             });
         } finally {

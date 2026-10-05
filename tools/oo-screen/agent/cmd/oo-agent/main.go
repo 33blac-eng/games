@@ -49,6 +49,10 @@ var httpClient = &http.Client{Timeout: dialTimeout}
 // nodeID — mesh node_id цього ПК, задається прапорцем -node у main(). Порожній
 // = старий T1/бенч-режим (hub бере node з env). Читається лише з sender-шляху
 // dialWebRTC, який стартує після main() встановив значення.
+// multimonParentPinned — F6: батько -multimon запустив дочірні потоки, тож
+// select_output основного потоку ігнорується (рев'ю: дубль монітора, A-36).
+var multimonParentPinned atomic.Bool
+
 var nodeID string
 
 // cliToken — токен агента, обраний у main() з -token-file / OO_AGENT_TOKEN /
@@ -923,6 +927,9 @@ func main() {
 	textFPS := flag.Int("text-fps", 15, "стеля FPS у текстовому режимі (gap #2: набір/читання — дрібні dirty rects); 0 = не обмежувати. Вихід із режиму (рух) знімає стелю миттєво")
 	videoModeFlag := flag.Bool("video-mode", false, "режим «Відео» (internal/contentmode): тривалий рух великої площі (відео, прокрутка) -> до -video-fps на апаратному енкодері, що встигає, і прохання до hub підняти бітрейт у межах стелі; поза ним кадри вмісту не частіше -fps. UNVERIFIED на Windows")
 	videoFPS := flag.Int("video-fps", 60, "частота в режимі «Відео» (лише з -video-mode)")
+	multimonFlag := flag.Bool("multimon", false, "F6: публікувати КОЖЕН монітор окремим потоком одночасно (дочірній процес на монітор, node_id <node>#m<i>; потрібен OO_SCREEN_MULTIMON=1 на хабі). Типово вимкнено; з одним монітором нічого не міняє. UNVERIFIED на реальних ПК")
+	multimonMax := flag.Int("multimon-max", multimonMaxDefault, "F6: стеля одночасних потоків разом з основним (кожен = апаратна сесія енкодера)")
+	multimonChild := flag.Int("multimon-child", 0, "F6, службовий: цей процес — потік монітора N, запущений батьком -multimon (без звуку/вводу, select_output ігнорує)")
 	gopSeconds := flag.Int("gop-seconds", 10, "інтервал періодичного IDR, с (ТЗ 1.4). Довгий GOP = менше важких IDR (див. bench/quality/RESULTS-workloads.md); новий глядач отримує кадр із GOP-кешу хаба (OO_SCREEN_GOP_SPAN, дефолт 12s ≥ GOP, макс 30s) або IDR на keyframe_request/PLI. >11 вимагає на хабі більшого OO_SCREEN_GOP_SPAN")
 	flag.Parse()
 
@@ -933,6 +940,11 @@ func main() {
 	// Тільки в один бік (прапорець вмикає, не вимикає): -audio=false не мусить
 	// гасити те, що людина свідомо ввімкнула через середовище.
 	applyFeatureFlags(*audioFlag, *inputFlag)
+	if *multimonChild > 0 {
+		// F6-дитина: звук, ввід і шар курсора несе лише основний потік.
+		audioEnabled, inputEnabled = false, false
+		*cursorLayerFlag = false
+	}
 	textTilesEnabled = *textTilesFlag
 	// Шар курсора (cursor.go): лише прапорцем, типово вимкнено. Ставиться ДО
 	// першого capture.New — перемикач читається при кожному відкритті капчера.
@@ -992,6 +1004,9 @@ func main() {
 
 	// A-36: другий екземпляр на тому ж ПК рве DXGI-дублікацію першого.
 	release, dup := acquireSingleInstance()
+	if *multimonChild > 0 {
+		release, dup = acquireNamedInstance(`Global\oo-screen-agent-m` + itoa(*multimonChild))
+	}
 	if dup {
 		log.Printf("oo-agent: інший агент уже працює на цьому ПК — виходжу")
 		return
@@ -1036,6 +1051,9 @@ func main() {
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+	if *multimonChild > 0 {
+		go watchParentStdin(os.Stdin, stop) // F6: батько помер -> виходимо
+	}
 
 	// A-39: logoff/shutdown гасять ctx тим самим шляхом, що Ctrl+C; lock/unlock
 	// читає кадровий цикл. nil = вікно не піднялось, поведінка як до A-39.
@@ -1139,6 +1157,23 @@ func main() {
 	publishOutputs(outIdx)
 	if l := outputs.Load(); l != nil {
 		log.Printf("oo-agent: outputs=%d active=%d %+v", len(l.Outputs), l.Active, l.Outputs)
+		// F6: решта моніторів — дочірніми потоками. Лише батько, лише webrtc
+		// і лише з node_id (без нього хабу нема з чим звʼязати потоки).
+		if (*multimonFlag || multimonEnvOn()) && *multimonChild == 0 {
+			switch {
+			case *transportKind != "webrtc" || nodeID == "":
+				log.Printf("oo-agent: multimon потребує -transport=webrtc і -node — вимкнено")
+			default:
+				kids := multimonChildren(len(l.Outputs), outIdx, *multimonMax)
+				if len(kids) > 0 {
+					// Рев'ю F6: з дітьми основний потік теж закріплений —
+					// інакше select_output перевів би його на монітор, який
+					// уже захоплює дитина (дубль + конфлікт DXGI, A-36).
+					multimonParentPinned.Store(true)
+				}
+				startMultimonChildren(ctx, kids, nodeID, *logPath, cliToken)
+			}
+		}
 	}
 	// logFirstSoftFrame: одноразове діагностичне логування геометрії CPU-кадру.
 	// Краш на Computer (Intel, native 1920x1200, encode 1920x1080) не
@@ -1234,6 +1269,14 @@ func main() {
 	// use», а ми в горутині DataChannel/QUIC-стріму. Неіснуючий індекс відсіє
 	// SwitchOutput проти живої енумерації — залишимось на поточному моніторі.
 	onSelectOutput := func(idx int) {
+		if *multimonChild > 0 {
+			log.Printf("oo-agent: select_output -> %d проігноровано: потік закріплений за монітором %d (F6)", idx, *multimonChild)
+			return
+		}
+		if multimonParentPinned.Load() {
+			log.Printf("oo-agent: select_output -> %d проігноровано: -multimon активний, монітори вже публікуються окремими потоками (F6)", idx)
+			return
+		}
 		log.Printf("oo-agent: select_output -> %d (застосує кадровий цикл)", idx)
 		s.requestOutput(idx)
 	}

@@ -229,6 +229,9 @@ type offerReq struct {
 	// не заходив перший глядач. Відсутнє поле = старий агент без звуку, і
 	// тоді глядач отримує запасний тон (audio.go).
 	Audio bool `json:"audio,omitempty"`
+	// Monitor — F6 (multimon.go, лише viewer//control): який монітор ноди
+	// дивитись. 0/відсутнє = як раніше. Нода — з квитка, монітор лише звужує.
+	Monitor int `json:"monitor,omitempty"`
 }
 
 // outputInfo — монітор ПК агента. Форма 1-в-1 з capture.OutputInfo, але
@@ -850,7 +853,11 @@ func authorizeViewer(req offerReq) (*nodeSession, *hub.TicketClaims, int, string
 		if !tokenMatches(req.Token) {
 			return nil, nil, http.StatusUnauthorized, "bad token"
 		}
-		ns := reg.getOrCreate(agentNodeIDEnv)
+		node, ok := viewerStreamNode(agentNodeIDEnv, req.Monitor)
+		if !ok {
+			return nil, nil, http.StatusBadRequest, "bad monitor"
+		}
+		ns := reg.getOrCreate(node)
 		if ns == nil {
 			return nil, nil, http.StatusServiceUnavailable, "too many nodes"
 		}
@@ -874,6 +881,10 @@ func authorizeViewer(req offerReq) (*nodeSession, *hub.TicketClaims, int, string
 	if node == "" {
 		log.Printf("viewer ticket has empty node_id, fail-closed")
 		return nil, nil, http.StatusForbidden, "node required"
+	}
+	node, ok := viewerStreamNode(node, req.Monitor)
+	if !ok {
+		return nil, nil, http.StatusBadRequest, "bad monitor"
 	}
 	ns := reg.get(node)
 	if ns == nil || !ns.hasAgent() {
@@ -973,7 +984,7 @@ func handleOffer(leg string) http.HandlerFunc {
 			if node == "" {
 				node = agentNodeIDEnv
 			}
-			if !agentAuthorized(node, req.Token) {
+			if !validAgentNodeID(node) || !agentAuthorized(agentAuthNode(node), req.Token) {
 				http.Error(w, "bad token", http.StatusUnauthorized)
 				return
 			}
@@ -2276,6 +2287,10 @@ func startRevokeSubscription(ctx context.Context) {
 		switch kind {
 		case "node":
 			if ns := reg.get(val); ns != nil {
+				closeNode(ns)
+			}
+			// F6: потоки додаткових моніторів — та сама нода.
+			for _, ns := range monitorStreamSessions(val) {
 				closeNode(ns)
 			}
 		case "user":
