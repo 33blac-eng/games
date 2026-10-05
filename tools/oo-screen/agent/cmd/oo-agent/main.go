@@ -34,6 +34,7 @@ import (
 	"github.com/organicoils/oo-screen/agent/capture"
 	"github.com/organicoils/oo-screen/agent/encode"
 	"github.com/organicoils/oo-screen/internal/agentcred"
+	"github.com/organicoils/oo-screen/internal/consent"
 	"github.com/organicoils/oo-screen/internal/contentmode"
 	"github.com/organicoils/oo-screen/internal/control"
 	"github.com/organicoils/oo-screen/internal/cursorproto"
@@ -915,6 +916,8 @@ func main() {
 	videoModeFlag := flag.Bool("video-mode", false, "режим «Відео» (internal/contentmode): тривалий рух великої площі (відео, прокрутка) -> до -video-fps на апаратному енкодері, що встигає, і прохання до hub підняти бітрейт у межах стелі; поза ним кадри вмісту не частіше -fps. UNVERIFIED на Windows")
 	videoFPS := flag.Int("video-fps", 60, "частота в режимі «Відео» (лише з -video-mode)")
 	gopSeconds := flag.Int("gop-seconds", 10, "інтервал періодичного IDR, с (ТЗ 1.4). Довгий GOP = менше важких IDR (див. bench/quality/RESULTS-workloads.md); новий глядач отримує кадр із GOP-кешу хаба (OO_SCREEN_GOP_SPAN, дефолт 12s ≥ GOP, макс 30s) або IDR на keyframe_request/PLI. >11 вимагає на хабі більшого OO_SCREEN_GOP_SPAN")
+	consentFlag := flag.String("consent-policy", os.Getenv("OO_SCREEN_CONSENT"), "S3: згода користувача ПК: off (дефолт) | always-ask | ask-if-user-logged-in (питати, якщо сесія не заблокована) | unattended-allowed-by-admin (без запиту, з індикатором). Не-off: агент стартує в паузі й не віддає кадри/ввід до згоди; поки глядач є — topmost-плашка з кнопкою «Завершити сесію»")
+	consentTimeout := flag.Duration("consent-timeout", 30*time.Second, "S3: скільки чекати відповіді на запит згоди; мовчання = відмова")
 	flag.Parse()
 
 	// Прапорці перекривають env з тієї ж причини, що й -token вище: агента
@@ -1176,6 +1179,27 @@ func main() {
 		}
 	}
 
+	// S3: згода користувача ПК. Gate стоїть МІЖ сигналом хаба і gatePaused:
+	// resume від хаба лише ПРОСИТЬ, відчиняє — локальне рішення (діалог або
+	// політика адміна з прапорця). Без згоди агент стартує на паузі, а ввід
+	// відкидає сам (inputAllowed, input.go) — глядачу нічим це обійти.
+	consentPolicy, err := consent.ParsePolicy(*consentFlag)
+	if err != nil {
+		log.Fatalf("oo-agent: %v", err)
+	}
+	consentGate = consent.New(consent.Config{
+		Policy:      consentPolicy,
+		UI:          consent.NativeUI{},
+		UserPresent: func() bool { return !session.Locked() },
+		Timeout:     *consentTimeout,
+		Logf:        log.Printf,
+	})
+	if consentGate.Required() {
+		gatePaused.Store(true)
+		log.Printf("oo-agent: consent policy=%s — старт у паузі до згоди", consentPolicy)
+	}
+	onGate = consentGate.Wrap(onGate)
+
 	// applyBitrate — ЄДИНЕ місце, де ціль реально лягає в енкодер. IDR тут
 	// БІЛЬШЕ НЕ ФОРСУЄМО (P0 B4/B5): AVEncCommonMeanBitRate — динамічна
 	// властивість MFT, CBR-контроль перераховує QP з наступного кадру, тож
@@ -1433,7 +1457,12 @@ func main() {
 		// Знімається прапорець лише якщо його поставили МИ і новий хаб за час
 		// дозвону нічого про гейт не сказав — див. reconnectGate.restore.
 		rg := beginReconnectGate(&gatePaused, &gateSeen)
-		defer rg.restore()
+		// S3: згода не переживає реконект (на тому боці може бути інший
+		// глядач), тож і паузу знімає лише новий resume через Gate.
+		consentGate.Reset()
+		if !consentGate.Required() {
+			defer rg.restore()
+		}
 		if s.cap != nil && !suspended {
 			s.cap.Suspend()
 			suspended = true

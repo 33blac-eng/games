@@ -11,6 +11,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/organicoils/oo-screen/hub"
 	"github.com/pion/rtp"
 	"github.com/pion/webrtc/v4"
 )
@@ -54,6 +55,9 @@ type viewerLeg struct {
 	pc     *webrtc.PeerConnection
 	trk    *webrtc.TrackLocalStaticRTP
 	userID string // user_id з claims тікета — для runtime-revoke за user
+
+	// audit — S4: лічильники сесії для журналу аудиту (nil = аудит вимкнено).
+	audit *hub.AuditSession
 
 	// ready — ця нога у PeerConnectionStateConnected; live — ready І є publisher
 	// ноди (єдине місце запису live — recomputeBinding, як і раніше).
@@ -269,6 +273,7 @@ func removeViewer(ns *nodeSession, vl *viewerLeg) bool {
 		return false
 	}
 	close(vl.done)
+	vl.audit.End("viewer removed")
 	if left == 0 {
 		scheduleRecordClose(ns)
 	}
