@@ -310,6 +310,10 @@ func handleCtlMessage(data []byte, onKeyframeRequest func(), onGate func(bool), 
 		onGate(true)
 	case s == "pause" && onGate != nil:
 		onGate(false)
+	case s == "viewer-join":
+		// S3: новий глядач до вже наявних — згода попереднього на нього не
+		// поширюється (nil-safe: при політиці off — no-op).
+		consentGate.ViewerJoin()
 	default:
 		// ponytail: "bitrate <bps>" лишається терпимим псевдонімом заради
 		// сумісності; основний формат — JSON вище.

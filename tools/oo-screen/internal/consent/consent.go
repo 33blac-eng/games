@@ -83,6 +83,13 @@ type Gate struct {
 	gen       uint64
 	blockedTo time.Time
 	inner     func(bool)
+	// want — чи є зараз глядач, що чекає (останній сигнал hub був resume).
+	// Pause під час відкритого діалогу НЕ скасовує діалог (на Windows
+	// MessageBoxTimeoutW не закрити ззовні — скасування лише плодило б нові
+	// вікна на кожному циклі join/leave), а лише скидає want: відповідь «Так»
+	// без глядача відкидається, повторний resume перевикористовує той самий
+	// діалог. Отже в будь-який момент на екрані щонайбільше ОДИН запит.
+	want bool
 }
 
 // New. Policy==Off → nil (Wrap/Allowed для nil — прозорі).
@@ -134,10 +141,22 @@ func (g *Gate) Wrap(inner func(bool)) func(bool) {
 
 func (g *Gate) onSignal(resume bool) {
 	if !resume {
+		g.mu.Lock()
+		if g.pending != nil {
+			g.want = false
+			if g.inner != nil {
+				g.inner(false)
+			}
+			g.mu.Unlock()
+			g.cfg.Logf("consent: viewer left while prompt open (prompt kept, answer will be ignored unless a viewer returns)")
+			return
+		}
+		g.mu.Unlock()
 		g.revoke("no viewers", 0)
 		return
 	}
 	g.mu.Lock()
+	g.want = true
 	if g.granted {
 		// Під локом: inner(true) не може обігнати конкурентний revoke.
 		g.inner(true) // ідемпотентно; згода вже є
@@ -188,6 +207,11 @@ func (g *Gate) decide(ctx context.Context, cancel context.CancelFunc, gen uint64
 		g.cfg.Logf("consent: DENIED (%s)", how)
 		return
 	}
+	if !g.want {
+		g.mu.Unlock()
+		g.cfg.Logf("consent: answer ignored — viewer left before it")
+		return
+	}
 	g.granted = true
 	g.mu.Unlock()
 	g.cfg.Logf("consent: granted (%s, policy=%s)", how, g.cfg.Policy)
@@ -213,6 +237,30 @@ func (g *Gate) End() {
 	g.revoke("ended by user", g.cfg.Cooldown)
 }
 
+// ViewerJoin — hub повідомив, що підключився ЩЕ ОДИН глядач (сигнал
+// "viewer-join", шлеться на КОЖНУ нову ногу, а не лише на перехід 0->1).
+// Згода, дана для попереднього глядача, на нового не поширюється: при
+// AlwaysAsk/AskIfUserPresent гейт закривається (кадри й ввід стоп) і
+// користувача ПК питають знову. Unattended — лише лог (індикатор уже видно).
+// Якщо згоди ще нема — нічого: відкритий/наступний запит покриває і цього.
+func (g *Gate) ViewerJoin() {
+	if g == nil {
+		return
+	}
+	g.mu.Lock()
+	granted := g.granted
+	g.mu.Unlock()
+	if !granted {
+		return
+	}
+	if g.cfg.Policy == Unattended {
+		g.cfg.Logf("consent: another viewer joined (unattended policy, no prompt)")
+		return
+	}
+	g.revoke("another viewer joined — re-asking", 0)
+	g.onSignal(true)
+}
+
 // Reset — обрив звʼязку з хабом: згода не переживає реконект (на тому боці
 // може бути вже інший глядач).
 func (g *Gate) Reset() {
@@ -226,6 +274,7 @@ func (g *Gate) revoke(why string, block time.Duration) {
 	g.mu.Lock()
 	was := g.granted
 	g.granted = false
+	g.want = false
 	g.gen++
 	if g.pending != nil {
 		g.pending()

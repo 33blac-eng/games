@@ -1535,6 +1535,7 @@ func setupViewerLeg(ns *nodeSession, pc *webrtc.PeerConnection, claims *hub.Tick
 		switch s {
 		case webrtc.PeerConnectionStateConnected:
 			first := markViewerReady(ns, vl)
+			sendViewerJoin(ns, vl) // S3: агент перепитує згоду на КОЖНОГО нового глядача
 			recomputeBinding(ns)
 			sendGate(ns) // зʼявився глядач → агент кодує (resume — вже на ПЕРШОМУ)
 			if first {
