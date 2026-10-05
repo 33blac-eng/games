@@ -44,6 +44,9 @@ type controlReq struct {
 type controlResp struct {
 	Outputs []outputInfo `json:"outputs"`
 	Active  int          `json:"active"`
+	// Streams — F6: монітори, що публікуються одночасно (0 = основний потік).
+	// Порожнє без OO_SCREEN_MULTIMON — плеєр тоді не пропонує side-by-side.
+	Streams []int `json:"streams,omitempty"`
 }
 
 // setOutputs запамʼятовує монітори ноди з offer-а агента.
@@ -104,6 +107,9 @@ func handleControl(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// select_output — команда ОСНОВНОМУ потоку ноди; потоки моніторів F6
+	// закріплені за своїм монітором і перемикати їх нема чого.
+	req.Monitor = 0
 	ns, claims, status, msg := authorizeViewer(req.offerReq)
 	if status != 0 {
 		http.Error(w, msg, status)
@@ -142,7 +148,9 @@ func handleControl(w http.ResponseWriter, r *http.Request) {
 		log.Printf("select_output [node=%s]: -> %d", ns.nodeID, idx)
 	}
 
-	writeJSON(w, outputsSnapshot(ns))
+	resp := outputsSnapshot(ns)
+	resp.Streams = liveStreams(ns.nodeID)
+	writeJSON(w, resp)
 }
 
 // controlRequiresInput — SEC #26, env OO_SCREEN_CONTROL_REQUIRES_INPUT=1.
