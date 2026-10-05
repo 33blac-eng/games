@@ -2344,9 +2344,11 @@ func main() {
 
 	if ticketModeEnabled() {
 		// H-01: токен у журнал НЕ пишемо — journald читає будь-хто з групи adm.
+		log.Printf("hub-webrtc: bitrate probe=%v pace=%v (x%.2f)", probeEnabled, paceEnabled, paceMul)
 		log.Printf("hub-webrtc listening on %s (ticket-mode: erp=%s, agent token=…%s, multi-publisher; env fallback node=%q)", listenAddr, erpBase, tokenTail(), agentNodeIDEnv)
 	} else {
 		log.Printf("WARNING: static-token mode, not for prod (OO_SCREEN_ERP_BASE not set — viewer offers accept a static OO_SCREEN_T1_TOKEN, default is public/predictable)")
+		log.Printf("hub-webrtc: bitrate probe=%v pace=%v (x%.2f)", probeEnabled, paceEnabled, paceMul)
 		log.Printf("hub-webrtc listening on %s (T1 static-token mode, token=…%s, multi-publisher; env fallback node=%q)", listenAddr, tokenTail(), agentNodeIDEnv)
 	}
 	// H-03: голий ListenAndServe = без жодного таймауту на публічному порту

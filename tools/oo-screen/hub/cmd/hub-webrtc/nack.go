@@ -139,7 +139,11 @@ func onNack(ns *nodeSession, vl *viewerLeg, n *rtcp.TransportLayerNack, now time
 
 	ns.mu.Lock()
 	defer ns.mu.Unlock()
-	vl.noteNackSeqs(seqs) // B4: втрати до ретрансмісії (legCongestion)
+	// P1: NACK під час проби — наслідок нашого ж навантаження (probe.go); у
+	// preLoss B4 він не йде, інакше невдала проба різала б ціль відео.
+	if !vl.noteProbeNack(len(seqs), now) {
+		vl.noteNackSeqs(seqs) // B4: втрати до ретрансмісії (legCongestion)
+	}
 	if vl.nackWinAt.IsZero() {
 		vl.nackWinAt = now
 	}
