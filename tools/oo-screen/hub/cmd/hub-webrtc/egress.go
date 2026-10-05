@@ -29,6 +29,7 @@ import (
 	"log"
 	"net"
 	"net/netip"
+	"os"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -45,6 +46,9 @@ const (
 	// датаграма ≤ 64 КБ).
 	gsoMaxSegs  = 64
 	gsoMaxBytes = 65000
+	// egressArena — байти арени для GSO-копій однієї пачки (egressBatch
+	// пакетів по ≤ 1500 Б уміщаються цілком).
+	egressArena = egressBatch * 1500
 )
 
 type egressPkt struct {
@@ -63,6 +67,13 @@ type egressConn struct {
 	errs  atomic.Uint64
 	full  atomic.Uint64 // скільки разів черга була повна (писар блокувався)
 	lastE atomic.Int64  // unix-нс останнього логу помилки
+	mmsg  atomic.Bool   // R4: sendmmsg доступний (Linux)
+
+	// Стан писаря (лише горутина writer): перевикористовуються між пачками.
+	msgs []egressMsg
+	ord  []int
+	sent []bool
+	mm   mmsgState
 }
 
 func newEgressConn(c *net.UDPConn) *egressConn {
@@ -74,6 +85,7 @@ func newEgressConn(c *net.UDPConn) *egressConn {
 	}
 	e.pool.New = func() any { b := make([]byte, 0, 1500); return &b }
 	e.gso.Store(gsoSupported(c))
+	e.mmsg.Store(e.mm.init(c))
 	registerEgress(e)
 	go e.writer()
 	return e
@@ -129,10 +141,17 @@ func (e *egressConn) Close() error {
 	return err
 }
 
-func (e *egressConn) LocalAddr() net.Addr                { return e.c.LocalAddr() }
-func (e *egressConn) SetDeadline(t time.Time) error      { return e.c.SetDeadline(t) }
-func (e *egressConn) SetReadDeadline(t time.Time) error  { return e.c.SetReadDeadline(t) }
-func (e *egressConn) SetWriteDeadline(t time.Time) error { return e.c.SetWriteDeadline(t) }
+func (e *egressConn) LocalAddr() net.Addr               { return e.c.LocalAddr() }
+func (e *egressConn) SetReadDeadline(t time.Time) error { return e.c.SetReadDeadline(t) }
+
+// SetDeadline/SetWriteDeadline НЕ чіпають дедлайн запису сокета. pion
+// (UDPMuxDefault.abortWrite, при закритті будь-якої muxed-ноги) ставить на
+// спільний сокет SetWriteDeadline(now), щоб розблокувати свої записи. Але
+// пише в сокет лише наш writer, а записи pion блокуються на черзі, не на fd:
+// дедлайн бив по writer-у (i/o timeout на чужих пакетах) і, гірше, вимикав
+// GSO назавжди — у логах 10×20 це траплялось на кожному прогоні.
+func (e *egressConn) SetDeadline(t time.Time) error      { return e.c.SetReadDeadline(t) }
+func (e *egressConn) SetWriteDeadline(t time.Time) error { return nil }
 
 // --- писар ---
 
@@ -164,10 +183,35 @@ func (e *egressConn) writer() {
 	}
 }
 
+// egressMsg — одна датаграма для ядра: або поодинокий пакет, або GSO-серія
+// (seg > 0) однакових пакетів на одну адресу. pkts — номери пакетів пачки
+// (у e.ord[i0:i1]): для fanoutLat і для відкату «по пакету».
+type egressMsg struct {
+	b      []byte
+	seg    int
+	to     netip.AddrPort
+	i0, i1 int
+}
+
 // flush шле пачку: по адресах у порядку першої появи, у межах адреси —
 // у порядку черги. Повертає scratch для повторного використання.
+//
+// R4: датаграми всієї пачки збираються в e.msgs і йдуть в ядро ОДНИМ
+// sendmmsg (Linux) замість sendto на кожну. На сотнях глядачів у пачці
+// майже немає двох пакетів на одну адресу, тож GSO сам по собі не рятує, і
+// syscall-и були ~45 % CPU хаба (pprof, 10×20, див. bench/RESULTS-hub.md, «R4 (хвиля 5)»).
 func (e *egressConn) flush(batch []egressPkt, scratch []byte) []byte {
-	sent := make([]bool, len(batch)) // пачка ≤ egressBatch — дешево
+	if cap(scratch) < egressArena {
+		scratch = make([]byte, 0, egressArena)
+	}
+	scratch = scratch[:0]
+	e.msgs = e.msgs[:0]
+	e.ord = e.ord[:0]
+	if cap(e.sent) < len(batch) {
+		e.sent = make([]bool, egressBatch)
+	}
+	sent := e.sent[:len(batch)]
+	clear(sent)
 	idx := make([]int, 0, len(batch))
 	for i := range batch {
 		if sent[i] {
@@ -183,11 +227,13 @@ func (e *egressConn) flush(batch []egressPkt, scratch []byte) []byte {
 		}
 		scratch = e.sendTo(batch, idx, to, scratch)
 	}
+	e.sendMsgs(batch)
 	return scratch
 }
 
-// sendTo шле пакети batch[idx...] на одну адресу: серії однакового розміру —
-// GSO-відправкою, решту — по одному.
+// sendTo розкладає пакети batch[idx...] на одну адресу в датаграми e.msgs:
+// серії однакового розміру — GSO-датаграмою (копія в арену scratch), решту —
+// по одній (без копії, буфер із черги живий до кінця flush).
 func (e *egressConn) sendTo(batch []egressPkt, idx []int, to netip.AddrPort, scratch []byte) []byte {
 	for k := 0; k < len(idx); {
 		seg := len(*batch[idx[k]].buf)
@@ -206,35 +252,93 @@ func (e *egressConn) sendTo(batch []egressPkt, idx []int, to netip.AddrPort, scr
 				}
 			}
 		}
+		i0 := len(e.ord)
+		e.ord = append(e.ord, idx[k:end]...)
 		if end-k == 1 {
-			e.write(*batch[idx[k]].buf, to)
-			k++
+			e.msgs = append(e.msgs, egressMsg{b: *batch[idx[k]].buf, to: to, i0: i0, i1: len(e.ord)})
+			k = end
 			continue
 		}
-		scratch = scratch[:0]
+		if len(scratch)+total > cap(scratch) {
+			// Арена скінчилась (пакети > 1500 Б): віддаємо зібране і
+			// починаємо арену заново — старі зрізи вже в ядрі.
+			e.sendMsgs(batch)
+			e.msgs = e.msgs[:0]
+			scratch = scratch[:0]
+		}
+		start := len(scratch)
 		for _, j := range idx[k:end] {
 			scratch = append(scratch, *batch[j].buf...)
 		}
-		err := writeGSO(e.c, scratch, seg, to)
-		if err == nil && fanoutLatOn {
-			now := time.Now().UnixNano()
-			for _, j := range idx[k:end] {
-				fanoutLatSent(*batch[j].buf, now)
-			}
-		}
-		if err != nil {
-			// Ядро/драйвер не вміє — вимикаємо GSO назавжди і шлемо ту
-			// саму серію по пакету: жоден пакет не губиться через спробу.
-			if e.gso.Swap(false) {
-				log.Printf("egress: UDP GSO вимкнено (%v) — далі sendto по пакету", err)
-			}
-			for _, j := range idx[k:end] {
-				e.write(*batch[j].buf, to)
-			}
-		}
+		e.msgs = append(e.msgs, egressMsg{b: scratch[start:len(scratch):len(scratch)], seg: seg, to: to, i0: i0, i1: len(e.ord)})
 		k = end
 	}
 	return scratch
+}
+
+var (
+	errNoMmsg          = errors.New("sendmmsg вимкнено")
+	errMmsgUnsupported = errors.New("sendmmsg недоступний")
+)
+
+// sendMulti — скільки датаграм із початку msgs ядро прийняло одним викликом.
+func (e *egressConn) sendMulti(msgs []egressMsg) (int, error) {
+	if !e.mmsg.Load() {
+		return 0, errNoMmsg
+	}
+	return e.mm.send(msgs)
+}
+
+// sendMsgs віддає e.msgs ядру: пачкою (sendmmsg), де вміємо, інакше по одній.
+func (e *egressConn) sendMsgs(batch []egressPkt) {
+	msgs := e.msgs
+	for len(msgs) > 0 {
+		n, err := e.sendMulti(msgs)
+		if n > 0 {
+			if fanoutLatOn {
+				now := time.Now().UnixNano()
+				for _, m := range msgs[:n] {
+					for _, j := range e.ord[m.i0:m.i1] {
+						fanoutLatSent(*batch[j].buf, now)
+					}
+				}
+			}
+			msgs = msgs[n:]
+			continue
+		}
+		if errors.Is(err, errMmsgUnsupported) && e.mmsg.Swap(false) {
+			log.Printf("egress: sendmmsg вимкнено (%v) — далі по датаграмі", err)
+		}
+		// Перша датаграма — окремо (тут і відкат GSO, і облік помилки).
+		e.sendOne(batch, msgs[0])
+		msgs = msgs[1:]
+	}
+}
+
+func (e *egressConn) sendOne(batch []egressPkt, m egressMsg) {
+	if m.seg == 0 {
+		e.write(m.b, m.to)
+		return
+	}
+	err := writeGSO(e.c, m.b, m.seg, m.to)
+	if err == nil {
+		if fanoutLatOn {
+			now := time.Now().UnixNano()
+			for _, j := range e.ord[m.i0:m.i1] {
+				fanoutLatSent(*batch[j].buf, now)
+			}
+		}
+		return
+	}
+	// Ядро/драйвер не вміє — вимикаємо GSO назавжди і шлемо ту
+	// саму серію по пакету: жоден пакет не губиться через спробу.
+	// Тайм-аут — не «не вміє»: GSO не чіпаємо.
+	if !errors.Is(err, os.ErrDeadlineExceeded) && e.gso.Swap(false) {
+		log.Printf("egress: UDP GSO вимкнено (%v) — далі sendto по пакету", err)
+	}
+	for _, j := range e.ord[m.i0:m.i1] {
+		e.write(*batch[j].buf, m.to)
+	}
 }
 
 func (e *egressConn) write(b []byte, to netip.AddrPort) {
