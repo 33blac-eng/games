@@ -7,6 +7,8 @@
 # Ядра: HUB_CPUS (хаб сам), AGENT_CPUS, VIEWER_CPUS. Глядачі розкладені на
 # PROCS процесів по VIEWERS/PROCS. Підсумок — зведені перцентилі по ВСІХ
 # семплах усіх процесів-глядачів.
+# PORT/ERP_PORT/ICE_PORT/PPROF_ADDR — щоб паралельні прогони не бились;
+# HUBBENCH_RCVBUF=<байт> — SO_RCVBUF сокетів клієнтів (див. bench/hubbench/rtc.go).
 set -eu
 cd "$(dirname "$0")/.."
 BIN=${BIN:-/tmp/hubbench-bin}
@@ -14,6 +16,9 @@ HUB_CPUS=${HUB_CPUS:-0,1}
 AGENT_CPUS=${AGENT_CPUS:-2}
 VIEWER_CPUS=${VIEWER_CPUS:-2,3}
 PORT=${PORT:-4471}
+ERP_PORT=${ERP_PORT:-4499}
+ICE_PORT=${ICE_PORT:-4800}
+PPROF_ADDR=${PPROF_ADDR:-127.0.0.1:6061}
 LOG=${LOG:-/tmp/hubbench-hub.log}
 WORK=${WORK:-$(mktemp -d)}
 CORPUS="" VIEWERS=16 PROCS=4 DUR=30s
@@ -31,11 +36,11 @@ mkdir -p "$BIN" "$WORK"
 [ -x "$BIN/hub" ] || go build -o "$BIN/hub" ./hub/cmd/hub-webrtc
 [ -x "$BIN/hubbench" ] || go build -o "$BIN/hubbench" ./bench/hubbench
 
-"$BIN/hubbench" erp -addr 127.0.0.1:4499 >/dev/null 2>&1 &
+"$BIN/hubbench" erp -addr 127.0.0.1:$ERP_PORT >/dev/null 2>&1 &
 erp=$!
-env OO_SCREEN_HUB_ADDR=":$PORT" OO_SCREEN_ICE_PORT=4800 \
-    OO_SCREEN_ERP_BASE=http://127.0.0.1:4499 OO_SCREEN_HUB_KEY=bench-hub-key \
-    OO_SCREEN_PPROF_ADDR=127.0.0.1:6061 OO_SCREEN_OFFER_RATE=1000 OO_SCREEN_OFFER_BURST=1000 \
+env OO_SCREEN_HUB_ADDR=":$PORT" OO_SCREEN_ICE_PORT=$ICE_PORT \
+    OO_SCREEN_ERP_BASE=http://127.0.0.1:$ERP_PORT OO_SCREEN_HUB_KEY=bench-hub-key \
+    OO_SCREEN_PPROF_ADDR=$PPROF_ADDR OO_SCREEN_OFFER_RATE=1000 OO_SCREEN_OFFER_BURST=1000 \
     ${HUB_ENV:-} taskset -c "$HUB_CPUS" "$BIN/hub" >"$LOG" 2>&1 &
 hub=$!
 pids="$hub $erp"

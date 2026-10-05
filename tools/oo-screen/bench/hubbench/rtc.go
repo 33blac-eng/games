@@ -8,8 +8,10 @@ import (
 	"io"
 	"log"
 	"math/rand"
+	"net"
 	"net/http"
 	"os"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -18,6 +20,8 @@ import (
 	"github.com/pion/rtcp"
 	"github.com/pion/rtp"
 	"github.com/pion/rtp/codecs"
+	"github.com/pion/transport/v4"
+	"github.com/pion/transport/v4/stdnet"
 	"github.com/pion/webrtc/v4"
 
 	"github.com/organicoils/oo-screen/internal/h264"
@@ -101,6 +105,18 @@ func newAPI(profile string) (*webrtc.API, error) {
 	se := webrtc.SettingEngine{}
 	se.SetNetworkTypes([]webrtc.NetworkType{webrtc.NetworkTypeUDP4})
 	se.SetIncludeLoopbackCandidate(true)
+	// HUBBENCH_RCVBUF=<байт> — SO_RCVBUF кожного UDP-сокета клієнта. Без
+	// нього — дефолт ядра (rmem_default): на боксі з 208 КБ клієнт-глядач сам
+	// губить IDR-пачку, і хвіст p99 стає клієнтським (ретрансмісія через NACK
+	// клієнта pion ≈ 100 мс), а не хабовим. Замір у RESULTS-hub.md (B7) ішов
+	// на rmem_default = 4 МБ.
+	if n, _ := strconv.Atoi(os.Getenv("HUBBENCH_RCVBUF")); n > 0 {
+		sn, err := stdnet.NewNet()
+		if err != nil {
+			return nil, err
+		}
+		se.SetNet(rcvbufNet{sn, n})
+	}
 	return webrtc.NewAPI(webrtc.WithMediaEngine(m), webrtc.WithInterceptorRegistry(i), webrtc.WithSettingEngine(se)), nil
 }
 
@@ -408,3 +424,25 @@ var debugPkts = func() int {
 	fmt.Sscan(os.Getenv("HUBBENCH_DEBUG_PKTS"), &n)
 	return n
 }()
+
+// rcvbufNet — stdnet, що ставить SO_RCVBUF на кожен UDP-сокет (HUBBENCH_RCVBUF).
+type rcvbufNet struct {
+	*stdnet.Net
+	n int
+}
+
+func (r rcvbufNet) ListenUDP(network string, a *net.UDPAddr) (transport.UDPConn, error) {
+	c, err := r.Net.ListenUDP(network, a)
+	if err == nil {
+		_ = c.SetReadBuffer(r.n)
+	}
+	return c, err
+}
+
+func (r rcvbufNet) ListenPacket(network, address string) (net.PacketConn, error) {
+	c, err := r.Net.ListenPacket(network, address)
+	if u, ok := c.(*net.UDPConn); err == nil && ok {
+		_ = u.SetReadBuffer(r.n)
+	}
+	return c, err
+}
