@@ -94,3 +94,35 @@ func TestWave5MasterRotation(t *testing.T) {
 		t.Fatal("легасі прийнято в strict")
 	}
 }
+
+// Fix: master-файл читається один раз; якщо згодом його видалено/спорожнено,
+// токени нод від справжнього master далі валідні, а спільний T1-токен НЕ стає
+// master (інакше в легасі будь-хто з T1 виковував би токени нод).
+func TestWave5SecretFileFailClosed(t *testing.T) {
+	clearAgentAuthEnv(t)
+	p := filepath.Join(t.TempDir(), "master")
+	if err := os.WriteFile(p, []byte("cached-master-0123456789"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("OO_SCREEN_AGENT_SECRET_FILE", p)
+	if err := agentAuthConfigError(); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(p); err != nil {
+		t.Fatal(err)
+	}
+	if !agentAuthorized("pc1", hub.NodeToken("cached-master-0123456789", "pc1")) {
+		t.Fatal("після видалення файлу токен справжнього master відхилено")
+	}
+	if agentAuthorized("pc1", hub.NodeToken(token, "pc1")) {
+		t.Fatal("токен ноди, підписаний T1, прийнято")
+	}
+	// Файл, що ні разу не прочитався: fail closed, а не T1.
+	t.Setenv("OO_SCREEN_AGENT_SECRET_FILE", filepath.Join(t.TempDir(), "never"))
+	if agentMaster() != "" {
+		t.Fatal("нечитний файл: master не порожній")
+	}
+	if agentAuthorized("pc2", hub.NodeToken(token, "pc2")) {
+		t.Fatal("нечитний файл: токен ноди від T1 прийнято")
+	}
+}

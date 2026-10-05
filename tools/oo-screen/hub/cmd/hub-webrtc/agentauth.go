@@ -32,18 +32,41 @@ import (
 	"github.com/organicoils/oo-screen/hub"
 )
 
+// secretFileCache — вміст OO_SCREEN_AGENT_SECRET_FILE за шляхом: читається
+// один раз (на старті, з agentAuthConfigError) і більше не перечитується —
+// без syscall на кожен /offer/agent і без залежності від того, що з файлом
+// стало потім (неатомарна ротація, видалення, chmod). Нова ротація master
+// через файл = перезапуск хаба.
+var secretFileCache sync.Map // path -> string (лише непорожні успішні читання)
+
+// loadSecretFile — master із файлу (кешовано); "" = нечитний/порожній.
+func loadSecretFile(p string) string {
+	if v, ok := secretFileCache.Load(p); ok {
+		return v.(string)
+	}
+	b, err := os.ReadFile(p)
+	if err != nil {
+		return ""
+	}
+	v := strings.TrimSpace(string(b))
+	if v == "" {
+		return ""
+	}
+	actual, _ := secretFileCache.LoadOrStore(p, v)
+	return actual.(string)
+}
+
 // agentMaster — master-секрет для токенів нод: env OO_SCREEN_AGENT_SECRET,
 // далі файл OO_SCREEN_AGENT_SECRET_FILE, далі спільний T1-токен.
+// Якщо файл задано, але він не прочитався — повертає "" (fail closed: токени
+// нод не приймаються), а НЕ спільний T1-токен, яким інакше міг би виковувати
+// токени нод будь-хто з цим токеном.
 func agentMaster() string {
 	if v := os.Getenv("OO_SCREEN_AGENT_SECRET"); v != "" {
 		return v
 	}
 	if p := os.Getenv("OO_SCREEN_AGENT_SECRET_FILE"); p != "" {
-		if b, err := os.ReadFile(p); err == nil {
-			if v := strings.TrimSpace(string(b)); v != "" {
-				return v
-			}
-		}
+		return loadSecretFile(p)
 	}
 	return token
 }
@@ -74,8 +97,7 @@ var errSecretFileUnreadable = errors.New("OO_SCREEN_AGENT_SECRET_FILE задан
 func agentAuthConfigError() error {
 	if os.Getenv("OO_SCREEN_AGENT_SECRET") == "" {
 		if p := os.Getenv("OO_SCREEN_AGENT_SECRET_FILE"); p != "" {
-			b, err := os.ReadFile(p)
-			if err != nil || strings.TrimSpace(string(b)) == "" {
+			if loadSecretFile(p) == "" {
 				return errSecretFileUnreadable
 			}
 		}
@@ -97,7 +119,9 @@ func agentAuthModeSummary() string {
 		}
 	}
 	master := "master=спільний T1-токен (небезпечно: є на кожному ПК)"
-	if agentMaster() != token {
+	if m := agentMaster(); m == "" {
+		master = "master=файл НЕЧИТНИЙ (токени нод відхиляються)"
+	} else if m != token {
 		master = "master=окремий"
 	}
 	if agentMasterPrev() != "" {
@@ -131,7 +155,7 @@ func agentAuthorized(node, tok string) bool {
 		return false
 	}
 	if master := agentMaster(); master != token || legacyAgentTokenAllowed() {
-		if hub.NodeTokenValid(master, node, tok) {
+		if master != "" && hub.NodeTokenValid(master, node, tok) {
 			return true
 		}
 		if prev := agentMasterPrev(); prev != "" && hub.NodeTokenValid(prev, node, tok) {
