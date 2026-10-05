@@ -617,6 +617,192 @@ export async function postOfferWithFailover(o) {
     throw new Error('offer/viewer: немає кандидатів');
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// N6: пряма нога агент↔браузер. Типово ВИМКНЕНО: без config.p2p плеєр шле
+// offer лише на /offer/viewer, як і раніше. З config.p2p — спершу /p2p/offer
+// того самого хаба (хаб споживає ERP-квиток, агент відповідає напряму).
+// 409 або ICE, що не зʼєднався, — relay /offer/viewer з одноразовим
+// relay_ticket, який видав хаб (ERP-квиток уже спожито, повторно не шлемо).
+// ─────────────────────────────────────────────────────────────────────────────
+
+export const PATH_DIRECT = 'direct';
+export const PATH_RELAY = 'relay';
+const DEFAULT_P2P_CONNECT_MS = 8000;
+const DEFAULT_RELAY_RETRIES = 6;
+const DEFAULT_RELAY_RETRY_MS = 1500;
+
+/** p2pOfferUrl — config.p2pUrl або …/offer/viewer → …/p2p/offer; null — не вивести. */
+export function p2pOfferUrl(signalUrl, override) {
+    if (typeof override === 'string' && override) return override;
+    if (typeof signalUrl !== 'string') return null;
+    const m = /^(.*)\/offer\/viewer\/?(\?.*)?$/.exec(signalUrl);
+    return m ? m[1] + '/p2p/offer' : null;
+}
+
+async function postJson(fetchFn, url, body, o) {
+    const combine = o.combine || combineAbortSignals;
+    const c = combine(o.teardownSignal, o.timeoutMs || DEFAULT_OFFER_TIMEOUT_MS);
+    try {
+        return await fetchFn(url, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body,
+            signal: c.signal,
+        });
+    } finally {
+        c.cancel();
+    }
+}
+
+/**
+ * postP2POffer — POST /p2p/offer. Результат:
+ *   {kind:'direct', sdp, id, relayTicket}  — 200 (relayTicket дійсний лише після відкату)
+ *   {kind:'relay', reason, relayTicket}    — 409 (relayTicket дійсний одразу)
+ *   {kind:'relay', reason, ticket:'same'}  — 404/405: маршруту нема (P2P вимкнено
+ *                                            на хабі) — ERP-квиток НЕ спожито
+ *   {kind:'relay', reason, ticket:'fresh'} — інше: квиток міг згоріти, потрібен новий
+ */
+export async function postP2POffer(o) {
+    let resp;
+    try {
+        resp = await postJson(o.fetchFn, o.url, JSON.stringify({ ticket: o.ticket, sdp: o.sdp }), o);
+    } catch (e) {
+        if (o.teardownSignal && o.teardownSignal.aborted) throw e;
+        return { kind: PATH_RELAY, reason: 'p2p-network', ticket: 'fresh' };
+    }
+    if (resp.status === 200) {
+        const a = await resp.json();
+        if (a && a.sdp) return { kind: PATH_DIRECT, sdp: a.sdp, id: a.id, relayTicket: a.relay_ticket || '' };
+        return { kind: PATH_RELAY, reason: 'p2p-empty-answer', ticket: 'fresh' };
+    }
+    if (resp.status === 409) {
+        let a = null;
+        try { a = await resp.json(); } catch (e) { /* ignore */ }
+        if (a && a.relay_ticket) return { kind: PATH_RELAY, reason: a.reason || 'conflict', relayTicket: a.relay_ticket };
+        return { kind: PATH_RELAY, reason: 'p2p-409-no-ticket', ticket: 'fresh' };
+    }
+    if (resp.status === 404 || resp.status === 405) return { kind: PATH_RELAY, reason: 'p2p-off', ticket: 'same' };
+    return { kind: PATH_RELAY, reason: 'p2p-' + resp.status, ticket: 'fresh' };
+}
+
+/**
+ * redeemRelay — /offer/viewer з relay_ticket. Після ICE-відкату квиток стає
+ * дійсним, лише коли агент звітує fallback хабу (його ICE-сторож може
+ * спрацювати трохи пізніше за браузерний), тож 403 повторюємо обмежено.
+ * Будь-яка інша відповідь — кінець: квиток одноразовий, і хаб його вже спожив.
+ */
+export async function redeemRelay(o) {
+    const retries = o.retries ?? DEFAULT_RELAY_RETRIES;
+    const sleep = o.sleep || ((ms) => new Promise((r) => setTimeout(r, ms)));
+    for (let i = 0; ; i++) {
+        const resp = await postJson(o.fetchFn, o.url, o.makeBody(o.relayTicket), o);
+        if (resp.status !== 403 || i >= retries) return resp;
+        if (o.teardownSignal && o.teardownSignal.aborted) return resp;
+        await sleep(o.retryMs ?? DEFAULT_RELAY_RETRY_MS);
+    }
+}
+
+/** waitIceOutcome — 'connected' | 'failed' (failed або таймаут). */
+export function waitIceOutcome(peer, timeoutMs, timers) {
+    const setT = (timers && timers.setTimeout) || setTimeout;
+    const clrT = (timers && timers.clearTimeout) || clearTimeout;
+    return new Promise((resolve) => {
+        let done = false;
+        let t = null;
+        const finish = (v) => {
+            if (done) return;
+            done = true;
+            if (t !== null) clrT(t);
+            peer.oniceconnectionstatechange = null;
+            resolve(v);
+        };
+        const check = () => {
+            const s = peer.iceConnectionState;
+            if (s === 'connected' || s === 'completed') finish('connected');
+            else if (s === 'failed' || s === 'closed') finish('failed');
+        };
+        t = setT(() => finish('failed'), timeoutMs || DEFAULT_P2P_CONNECT_MS);
+        peer.oniceconnectionstatechange = check;
+        check();
+    });
+}
+
+/**
+ * negotiateViewer — увесь SDP-обмін глядача: (опційно) пряма нога, інакше
+ * relay. Ставить remote description і повертає {peer, path} (null — сесія
+ * вже не поточна).
+ * o: { p2p, p2pUrl, signalUrl, standby, ticket, grant, requestTicket, peer,
+ *      rebuildPeer() → Promise<peer>, waitIce(peer) → Promise<'connected'|'failed'>,
+ *      makeBody(sdp, ticket), onTicket(ticket, grant, peer), onPath(path),
+ *      isCurrent(), fetchFn, teardownSignal, timeoutMs, relayRetries, relayRetryMs, sleep }
+ */
+export async function negotiateViewer(o) {
+    let peer = o.peer;
+    let grant = o.grant;
+    const current = o.isCurrent || (() => true);
+    const onPath = o.onPath || (() => {});
+    const net = { fetchFn: o.fetchFn, teardownSignal: o.teardownSignal, timeoutMs: o.timeoutMs || DEFAULT_OFFER_TIMEOUT_MS, combine: o.combine };
+    let relayTicket = null;
+    let ticket = o.ticket;
+    const p2pUrl = o.p2p ? p2pOfferUrl(o.signalUrl, o.p2pUrl) : null;
+    if (p2pUrl) {
+        const r = await postP2POffer({ ...net, url: p2pUrl, ticket, sdp: peer.localDescription.sdp });
+        if (!current()) return null;
+        if (r.kind === PATH_DIRECT) {
+            onPath('direct-connecting');
+            await peer.setRemoteDescription({ type: 'answer', sdp: r.sdp });
+            const out = await o.waitIce(peer);
+            if (!current()) return null;
+            if (out === 'connected') {
+                onPath(PATH_DIRECT);
+                return { peer, path: PATH_DIRECT };
+            }
+            // ICE не зʼєднався: нова PeerConnection на relay (стару вже
+            // описано answer-ом агента). Агент сам звітує fallback хабу.
+            if (!r.relayTicket) throw new Error('p2p: ICE failed і немає relay_ticket');
+            relayTicket = r.relayTicket;
+            peer = await o.rebuildPeer();
+            if (!current()) return null;
+        } else if (r.relayTicket) {
+            relayTicket = r.relayTicket; // 409: той самий offer іде на relay
+        } else if (r.ticket === 'fresh') {
+            const t = await o.requestTicket();
+            if (!current()) return null;
+            if (!t || !t.ticket) throw new Error('offer/viewer: немає ticket');
+            ticket = t.ticket;
+            grant = t.grant ?? grant;
+        }
+    }
+    let resp;
+    if (relayTicket) {
+        // Ввід на relay-нозі хаб судить за тікетом ноги — тепер це relay_ticket.
+        if (o.onTicket) o.onTicket(relayTicket, grant, peer);
+        resp = await redeemRelay({
+            ...net, url: o.signalUrl, relayTicket,
+            makeBody: (t) => o.makeBody(peer.localDescription.sdp, t),
+            retries: o.relayRetries, retryMs: o.relayRetryMs, sleep: o.sleep,
+        });
+    } else {
+        if (o.onTicket && ticket !== o.ticket) o.onTicket(ticket, grant, peer);
+        resp = await postOfferWithFailover({
+            ...net,
+            urls: signalCandidates(o.signalUrl, o.standby),
+            ticket,
+            requestTicket: o.requestTicket,
+            makeBody: (t) => o.makeBody(peer.localDescription.sdp, t),
+            onTicket: (t, g) => { if (o.onTicket) o.onTicket(t, g, peer); },
+        });
+    }
+    if (!current()) return null;
+    if (!resp.ok) throw new Error('offer/viewer ' + resp.status);
+    const answer = await resp.json();
+    if (!current()) return null;
+    if (!answer || !answer.sdp) throw new Error('offer/viewer: порожній answer');
+    await peer.setRemoteDescription({ type: 'answer', sdp: answer.sdp });
+    onPath(PATH_RELAY);
+    return { peer, path: PATH_RELAY };
+}
+
 export function createOoWebrtcLayer(o) {
     const opts = o || {};
     const container = opts.container;
@@ -655,6 +841,8 @@ export function createOoWebrtcLayer(o) {
     let inputChannel = null;      // F5: config.inputChannel — власний канал вводу (desktop-oo-input.js)
     let inputDom = null;
     let statsOverlay = null;      // getStats()-оверлей (Ctrl+Alt+S); config.statsOverlay === false — вимкнено
+    let transportPath = null;     // N6: 'direct' | 'relay' (| 'direct-connecting') — у стат-оверлеї
+    let p2pTrialPeer = null;      // N6: peer, чий ICE ще пробує пряму ногу — його стани не фолбечать у Mesh
 
     const session = createOoSession({
         firstFrameMs: config.firstFrameMs,
@@ -834,7 +1022,7 @@ export function createOoWebrtcLayer(o) {
         watchDpr();
         makeToggle();
         if (config.statsOverlay !== false && !statsOverlay) {
-            statsOverlay = createStatsOverlay({ container, doc, getPc: () => pc });
+            statsOverlay = createStatsOverlay({ container, doc, getPc: () => pc, getPath: () => transportPath });
         }
     }
 
@@ -1071,7 +1259,19 @@ export function createOoWebrtcLayer(o) {
         if (dc.readyState === 'open') attach(); else dc.onopen = attach;
     }
 
-    async function connect(gen) {
+    // N6: прибрати peer, який пробував пряму ногу й не зʼєднався (його
+    // канали теж), не чіпаючи overlay/сесію.
+    function dropTrialPeer(peer) {
+        try { peer.ontrack = null; peer.onconnectionstatechange = null; peer.oniceconnectionstatechange = null; } catch (e) { /* ignore */ }
+        if (cursorLayer) { try { cursorLayer.destroy(); } catch (e) { /* ignore */ } cursorLayer = null; }
+        detachInput();
+        if (tilesChannel) { try { tilesChannel.onmessage = null; tilesChannel.close(); } catch (e) { /* ignore */ } tilesChannel = null; }
+        if (textTiles) { try { textTiles.destroy(); } catch (e) { /* ignore */ } textTiles = null; }
+        if (disconnectGrace) { try { disconnectGrace.cancel(); } catch (e) { /* ignore */ } disconnectGrace = null; }
+        try { peer.close(); } catch (e) { /* ignore */ }
+    }
+
+    async function preparePeer(gen) {
         const peer = new RTCPeerConnection(buildRtcConfig(config));
         pc = peer;
         peer.addTransceiver('video', { direction: 'recvonly' });
@@ -1129,9 +1329,10 @@ export function createOoWebrtcLayer(o) {
             graceMs: config.disconnectGraceMs || DEFAULT_DISCONNECT_GRACE_MS,
             onFallback: (reason) => { if (session.isCurrent(gen)) session.fallback(gen, reason); },
         });
+        const grace = disconnectGrace;
         peer.onconnectionstatechange = () => {
-            if (!session.isCurrent(gen)) return;
-            disconnectGrace.note(peer.connectionState);
+            if (!session.isCurrent(gen) || peer !== pc || p2pTrialPeer === peer) return;
+            grace.note(peer.connectionState);
         };
 
         const offer = await peer.createOffer();
@@ -1141,6 +1342,11 @@ export function createOoWebrtcLayer(o) {
             ? { type: offer.type, sdp: opusStereoSdp(offer.sdp) }
             : offer);
         await waitIceGathering(peer);
+        return peer;
+    }
+
+    async function connect(gen) {
+        const peer = await preparePeer(gen);
         if (!session.isCurrent(gen)) return;
 
         // §6.4 / BLOCKER-1,3: свіжий одноразовий ticket на цю ноду САМЕ перед
@@ -1157,24 +1363,42 @@ export function createOoWebrtcLayer(o) {
         // offer несе ОДНОРАЗОВИЙ ticket, не довгоживучий токен.
         // F6: monitor>0 — потік додаткового монітора (desktop-oo-multimon.js);
         // 0/відсутнє — поле не шлемо зовсім, offer як до F6.
-        const resp = await postOfferWithFailover({
-            urls: signalCandidates(signalUrl, resolveStandby(ticketResp, config)),
-            ticket,
-            requestTicket: config.requestTicket,
-            makeBody: (t) => offerBody(peer.localDescription.sdp, t, config.monitor),
-            onTicket: (t, g) => { if (session.isCurrent(gen)) armInput(gen, t, g); },
-            teardownSignal: abort && abort.signal,
-            timeoutMs: config.offerTimeoutMs || DEFAULT_OFFER_TIMEOUT_MS,
-            fetchFn: (u, init) => fetch(u, init),
-        });
-        if (!session.isCurrent(gen)) return;
-        if (!resp.ok) throw new Error('offer/viewer ' + resp.status);
-        const answer = await resp.json();
-        if (!session.isCurrent(gen)) return;
-        if (!answer || !answer.sdp) throw new Error('offer/viewer: порожній answer');
-
-        await peer.setRemoteDescription({ type: 'answer', sdp: answer.sdp });
-        if (!session.isCurrent(gen)) return;
+        // N6: config.p2p (типово вимкнено) — спершу пряма нога (negotiateViewer);
+        // без нього — рівно той самий postOfferWithFailover, що й раніше.
+        // Додаткові монітори (F6) лишаються на relay.
+        const p2pOn = config.p2p === true && !(Number.isInteger(config.monitor) && config.monitor > 0);
+        if (p2pOn) p2pTrialPeer = peer;
+        let res;
+        try {
+            res = await negotiateViewer({
+                p2p: p2pOn,
+                p2pUrl: config.p2pUrl,
+                signalUrl,
+                standby: resolveStandby(ticketResp, config),
+                ticket,
+                grant: granted,
+                requestTicket: config.requestTicket,
+                peer,
+                rebuildPeer: async () => {
+                    p2pTrialPeer = null;
+                    dropTrialPeer(peer);
+                    const np = await preparePeer(gen);
+                    if (!session.isCurrent(gen)) throw new Error('teardown');
+                    return np;
+                },
+                waitIce: (p) => waitIceOutcome(p, config.p2pConnectTimeoutMs || DEFAULT_P2P_CONNECT_MS),
+                makeBody: (sdp, t) => offerBody(sdp, t, config.monitor),
+                onTicket: (t, g) => { if (session.isCurrent(gen)) armInput(gen, t, g); },
+                onPath: (p) => { if (session.isCurrent(gen)) transportPath = p; },
+                isCurrent: () => session.isCurrent(gen),
+                teardownSignal: abort && abort.signal,
+                timeoutMs: config.offerTimeoutMs || DEFAULT_OFFER_TIMEOUT_MS,
+                fetchFn: (u, init) => fetch(u, init),
+            });
+        } finally {
+            p2pTrialPeer = null;
+        }
+        if (!res || !session.isCurrent(gen)) return;
 
         // Аж ТЕПЕР глушимо Mesh і армимо 8с-сторож: SDP-обмін позаду, тож
         // зрив сигналізації не встиг коштувати нікому чорного екрана.
@@ -1186,6 +1410,8 @@ export function createOoWebrtcLayer(o) {
 
     return {
         state: () => session.state(),
+        // N6: 'direct' | 'relay' | null (ще не вирішено).
+        transport: () => transportPath,
         generation: () => session.current(),
         // setMuted — ручка гучності кроку 1: доріжка вже в елементі, лишається
         // її розглушити. UI-кнопки НЕМАЄ навмисно; поки джерело звуку —

@@ -940,6 +940,8 @@ func main() {
 	autoUpdateURL := flag.String("auto-update-url", "", "S6: URL підписаного (ed25519) маніфесту оновлень; порожньо = автооновлення вимкнено (дефолт). Потрібен ключ, зашитий при збірці (-X main.updatePubKey)")
 	autoUpdateEvery := flag.Duration("auto-update-interval", 6*time.Hour, "S6: як часто перевіряти маніфест")
 	autoUpdateHealth := flag.Duration("auto-update-health-window", 2*time.Minute, "S6: за скільки новий бінарь мусить достукатись до хаба, інакше автоматичний відкат")
+	p2pFlag := flag.Bool("p2p", false, "N6: пряма нога агент↔браузер (перекриває env OO_SCREEN_P2P=1; потрібен OO_SCREEN_P2P=1 на хабі і config.p2p у плеєрі). Типово вимкнено. Лише webrtc і з -node. Нога везе відео+ввід; звук/курсор/тайли/bitrate_target лишаються на relay. UNVERIFIED на реальних ПК/NAT")
+	p2pStun := flag.String("p2p-stun", "", "N6: STUN-сервери через кому (перекриває OO_SCREEN_P2P_STUN)")
 	flag.Parse()
 
 	// Прапорці перекривають env з тієї ж причини, що й -token вище: агента
@@ -1280,6 +1282,69 @@ func main() {
 	}
 	onGate = consentGate.Wrap(onGate)
 
+	// N6: пряма нога. Хаб не бачить прямого глядача, тож шле "pause" (у нього
+	// глядачів 0) — поки жива хоч одна пряма нога, цю паузу не пропускаємо, а
+	// згода/кадри тримаються прямою ногою. Без -p2p — рівно як раніше.
+	var p2pAg *p2pAgent
+	if p2pCfg := p2pConfig(*p2pFlag, *p2pStun, os.Getenv); p2pCfg.Enabled && *multimonChild == 0 {
+		base := p2pHubBase(*hubAddr)
+		if *transportKind != "webrtc" || nodeID == "" || base == "" {
+			log.Printf("oo-agent: p2p: потрібні -transport webrtc, -node і http(s) -hub — пряму ногу вимкнено")
+		} else {
+			consented := onGate
+			var hubWantsView atomic.Bool
+			var p2pLive atomic.Int32
+			onGate = func(resume bool) {
+				hubWantsView.Store(resume)
+				if !resume && p2pLive.Load() > 0 {
+					return
+				}
+				consented(resume)
+			}
+			p2pAg = newP2PAgent(p2pCfg, func() string {
+				if b := p2pHubBase(hubSel.current()); b != "" {
+					return b
+				}
+				return base
+			}, nodeID, authToken)
+			if consentGate.Required() {
+				p2pAg.consent = consentGate
+				p2pAg.requestConsent = func(ctx context.Context) bool {
+					consented(true) // діалог (або політика адміна)
+					for !consentGate.Allowed() {
+						select {
+						case <-ctx.Done():
+							return false
+						case <-time.After(100 * time.Millisecond):
+						}
+					}
+					return true
+				}
+			}
+			p2pAg.onKeyframe = onKeyframeRequest
+			p2pInj := newInputInjector()
+			p2pAg.onActive = func(n int) {
+				p2pLive.Store(int32(n))
+				if n == 0 {
+					releaseHeldInput(p2pInj, "p2p leg closed") // SEC #37
+				}
+				if n > 0 {
+					consented(true)
+				} else if !hubWantsView.Load() {
+					consented(false)
+				}
+			}
+			if p2pInj != nil {
+				p2pAg.onInput = func(ev []byte) {
+					if err := handleInputMessage(ev, p2pInj); err != nil {
+						logInputProblem(time.Now(), err)
+					}
+				}
+			}
+			log.Printf("oo-agent: p2p увімкнено (stun=%d, turn=%v)", len(p2pCfg.STUN), p2pCfg.TURNURL != "")
+		}
+	}
+
 	// applyBitrate — ЄДИНЕ місце, де ціль реально лягає в енкодер. IDR тут
 	// БІЛЬШЕ НЕ ФОРСУЄМО (P0 B4/B5): AVEncCommonMeanBitRate — динамічна
 	// властивість MFT, CBR-контроль перераховує QP з наступного кадру, тож
@@ -1503,6 +1568,9 @@ func main() {
 	// незалежно скидала спільний inFlight, ламаючи admission-контроль.
 	go func() {
 		for job := range sendQueue {
+			if p2pAg != nil {
+				p2pAg.writeVideo(job.au.Data, frameInterval) // N6: той самий AU у прямі ноги
+			}
 			tpMu.Lock()
 			cur := tp
 			tpMu.Unlock()
@@ -1517,6 +1585,10 @@ func main() {
 			queued.Add(-1)
 		}
 	}()
+
+	if p2pAg != nil {
+		go p2pAg.run(ctx)
+	}
 
 	// Звук — ОКРЕМА горутина, бо джерело в нього своє (WASAPI, ~10мс пакети) і
 	// зупиняти через нього кадровий цикл нема за що. Транспорт бере ту саму

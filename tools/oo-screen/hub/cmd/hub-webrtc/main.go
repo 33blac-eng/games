@@ -49,6 +49,7 @@ import (
 
 	"github.com/organicoils/oo-screen/hub"
 	"github.com/organicoils/oo-screen/internal/cursorproto"
+	"github.com/organicoils/oo-screen/internal/p2p"
 )
 
 const (
@@ -865,7 +866,7 @@ func authorizeViewer(req offerReq) (*nodeSession, *hub.TicketClaims, int, string
 	if req.Ticket == "" {
 		return nil, nil, http.StatusForbidden, "ticket required"
 	}
-	claims, err := hub.ConsumeTicket(erpBase, hubKey, req.Ticket)
+	claims, err := consumeViewerTicket(req.Ticket)
 	if err != nil {
 		log.Printf("viewer ticket consume failed: %v", err)
 		return nil, nil, http.StatusForbidden, "ticket consume failed"
@@ -2290,6 +2291,7 @@ func startRevokeSubscription(ctx context.Context) {
 	go hub.SubscribeRevoke(ctx, erpBase, hubKey, 3*time.Second, func(kind, val string) {
 		switch kind {
 		case "node":
+			p2pRevoke(func(g p2p.Grant) bool { return g.Node == val })
 			if ns := reg.get(val); ns != nil {
 				closeNode(ns)
 			}
@@ -2301,10 +2303,12 @@ func startRevokeSubscription(ctx context.Context) {
 			for _, ns := range reg.nodesForUser(val) {
 				dropUserViewers(ns, val)
 			}
+			p2pRevoke(func(g p2p.Grant) bool { return g.User == val })
 		case hub.RevokeKindStale:
 			// ERP мовчить довше за поріг — жоден дозвіл більше не підтверджений,
 			// тож рвемо ВСЕ тим самим closeNode. Причина й тривалість уже в журналі
 			// (revoke.go, staleGate.observe); тут — лише скільки нод це зачепило.
+			p2pRevoke(func(p2p.Grant) bool { return true })
 			all := reg.all()
 			dropped := 0
 			for _, ns := range all {
