@@ -13,7 +13,8 @@ package main
 //
 // Env: OO_SCREEN_FEC_TARGET (ймовірність, що кадр FEC не врятує, дефолт 0.01),
 // OO_SCREEN_FEC_MAX_RATE (стеля FEC/медіа, 0.5), OO_SCREEN_FEC_MIN_LOSS (0),
-// OO_SCREEN_FEC_LAYOUT=2d (2D-парність, коли 1D не дотягує; типово 1D).
+// OO_SCREEN_FEC_LAYOUT=2d (2D-парність, коли 1D не дотягує; типово 1D),
+// OO_SCREEN_FEC_MAX_RATE_2D (стеля для 2D-сітки, 0.7).
 //
 // Відомі межі: (1) контролер бітрейту не знає про накладні — на вузькому
 // каналі FEC додає навантаження (план TZ: «вимкнено при обмеженні каналу» —
@@ -72,6 +73,8 @@ func addFECInterceptor(i *interceptor.Registry) {
 		Target:  envFloat("OO_SCREEN_FEC_TARGET", 0),
 		MaxRate: envFloat("OO_SCREEN_FEC_MAX_RATE", 0),
 		MinLoss: envFloat("OO_SCREEN_FEC_MIN_LOSS", 0),
+		// N2: стеля для 2D-сітки (дефолт 0.7), окремо від 1D MaxRate.
+		MaxRate2D: envFloat("OO_SCREEN_FEC_MAX_RATE_2D", 0),
 		// N2: на RTT 200 мс 1D-інтерлівінг упирається в MaxRate раніше, ніж
 		// дає target (2 втрати в підгрупі = NACK = кадр чекає RTT).
 		Layout2D: os.Getenv("OO_SCREEN_FEC_LAYOUT") == "2d",
