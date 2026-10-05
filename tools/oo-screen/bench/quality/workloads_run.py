@@ -97,15 +97,26 @@ def qual(ref, out, mask):
     return [M.psnr(ref, out), M.ssim(ref, out), es]
 
 
-def simulate(kind, n, sample_step, tilesel, corpus):
+def block_area(f, prev, b=16):
+    """Fraction of b×b blocks that differ from prev (stand-in for DXGI dirty+move area)."""
+    if prev is None:
+        return 1.0
+    h, w = f.shape[0] // b * b, f.shape[1] // b * b
+    d = np.any(f[:h, :w] != prev[:h, :w], axis=2).reshape(h // b, b, w // b, b).any(axis=(1, 3))
+    return float(d.mean())
+
+
+def simulate(kind, n, sample_step, tilesel, corpus, per_frame=False):
     s = WL.Sources(corpus)
     wl = WL.make(kind, s)
     samples = set(range(sample_step // 4, n, sample_step))
     td = tempfile.mkdtemp()
     encs = {k: subprocess.Popen(enc_cmd(os.path.join(td, f"{k}.h264"), k), stdin=subprocess.PIPE) for k in RATES}
-    changed, prev, keep, last = [], None, {}, None
+    changed, prev, keep, last, area = [], None, {}, None, []
     for i in range(n):
         f = wl.frame(i)
+        if per_frame:
+            area.append(block_area(f, prev))
         changed.append(prev is None or not np.array_equal(f, prev))
         prev = f
         if changed[-1]:
@@ -215,10 +226,17 @@ def simulate(kind, n, sample_step, tilesel, corpus):
             qs[k] = {nm: {"mean": float(np.nanmean(a[:, j])), "p5": float(np.nanpercentile(a[:, j], 5))}
                      for j, nm in enumerate(["psnr", "ssim", "es"])}
         out["quality"] = qs
+        if per_frame:
+            out["per"] = {v: per[v].tolist() for v in VARS}
+            out["qrows"] = {k: [[i] + [float(x) for x in r] for i, r in zip(sorted(samples), rows)]
+                             for k, rows in q.items()}
         out["refine_events"] = sum(len(d["bytes"]) for d in ev.values())
         out["tile_kb_total"] = tile_bytes_total / 1e3
         res["rates"][str(kbps)] = out
         print(kind, kbps, json.dumps({v: round(out[v]["avg_mbps"], 3) for v in VARS}), flush=True)
+    if per_frame:
+        res["area"] = area
+        res["changed_flags"] = [bool(c) for c in changed]
     for k in RATES:
         os.remove(os.path.join(td, f"{k}.h264"))
     os.rmdir(td)

@@ -930,6 +930,7 @@ func main() {
 	textFPS := flag.Int("text-fps", 15, "стеля FPS у текстовому режимі (gap #2: набір/читання — дрібні dirty rects); 0 = не обмежувати. Вихід із режиму (рух) знімає стелю миттєво")
 	videoModeFlag := flag.Bool("video-mode", false, "режим «Відео» (internal/contentmode): тривалий рух великої площі (відео, прокрутка) -> до -video-fps на апаратному енкодері, що встигає, і прохання до hub підняти бітрейт у межах стелі; поза ним кадри вмісту не частіше -fps. UNVERIFIED на Windows")
 	videoFPS := flag.Int("video-fps", 60, "частота в режимі «Відео» (лише з -video-mode)")
+	lowMotionCapFlag := flag.Bool("lowmotion-cap", false, "R3: стеля бітрейту для малорухомого вмісту (internal/contentmode.Capper): рух < 25 % екрана -> 25 % цілі (у режимі Video — 50 %), не нижче 1 Мбіт/с; великий рух знімає стелю миттєво. Типово вимкнено. Лише симуляція (bench/quality/lowmotion_run.py), UNVERIFIED на реальному ПК")
 	multimonFlag := flag.Bool("multimon", false, "F6: публікувати КОЖЕН монітор окремим потоком одночасно (дочірній процес на монітор, node_id <node>#m<i>; потрібен OO_SCREEN_MULTIMON=1 на хабі). Типово вимкнено; з одним монітором нічого не міняє. UNVERIFIED на реальних ПК")
 	multimonMax := flag.Int("multimon-max", multimonMaxDefault, "F6: стеля одночасних потоків разом з основним (кожен = апаратна сесія енкодера)")
 	multimonChild := flag.Int("multimon-child", 0, "F6, службовий: цей процес — потік монітора N, запущений батьком -multimon (без звуку/вводу, select_output ігнорує)")
@@ -1286,6 +1287,12 @@ func main() {
 	// найбільший кадр, і саме при ЗНИЖЕННІ цілі (канал вузький) він б'є в
 	// чергу вузького місця: стенд показав 22-33 IDR/хв під стелею і фризи від
 	// них. Якщо глядачу потрібен IDR, хаб шле keyframe_request окремо.
+	var (
+		lowCap            = contentmode.NewCapper(contentmode.CapConfig{})
+		lowCapEnc         *encode.Encoder
+		lowCapApplied     int
+		applyLowMotionCap func(contentmode.Mode, float64)
+	)
 	applyBitrate := func(bps int) {
 		e := s.encoder()
 		if e == nil {
@@ -1299,7 +1306,34 @@ func main() {
 		// нею, інакше перемикання монітора мовчки скасовувало б притискання хаба.
 		s.bitrateBps.Store(int64(bps))
 		paceTargetBps.Store(uint64(bps))
+		lowCapApplied = bps // енкодер тепер на новій цілі; стелю перекладе наступний кадр
 		log.Printf("oo-agent: bitrate -> %d bps", bps)
+	}
+
+	// applyLowMotionCap (-lowmotion-cap, R3) — стеля поверх ЖИВОЇ цілі хаба
+	// (s.bitrateBps не чіпаємо: це ціль хаба, на ній відкривається новий
+	// енкодер). Лише з кадрового циклу (A-13). Новий енкодер (SwitchOutput,
+	// reacquire) відкривається з цілі хаба — тоді вважаємо застосованою її.
+	applyLowMotionCap = func(mode contentmode.Mode, area float64) {
+		lowCap.Update(mode, area, time.Now())
+		e := s.encoder()
+		if e == nil {
+			return
+		}
+		target := int(s.bitrateBps.Load())
+		if e != lowCapEnc {
+			lowCapEnc, lowCapApplied = e, target
+		}
+		want := lowCap.Bps(target)
+		if want == lowCapApplied {
+			return
+		}
+		if err := e.SetBitrate(want); err != nil {
+			log.Printf("oo-agent: lowmotion-cap SetBitrate(%d): %v", want, err)
+			return
+		}
+		lowCapApplied = want
+		log.Printf("oo-agent: lowmotion-cap -> %d bps (ціль %d, area≈%.3f, mode=%v)", want, target, area, mode)
 	}
 
 	// onBitrateTarget — hub просить іншу CBR-ціль. Крутимо ручку на живому
@@ -1833,6 +1867,10 @@ loop:
 				textCF,
 				textmode.Fraction(frame.MoveArea, frame.Width, frame.Height), time.Now())
 			onContentMode(mode, flipped)
+			if *lowMotionCapFlag {
+				applyLowMotionCap(mode, contentmode.Area(textCF,
+					textmode.Fraction(frame.MoveArea, frame.Width, frame.Height)))
+			}
 		case ctx.Err() != nil:
 			break loop // зупиняють агента, а не просто екран стоїть
 		case refineWait && errors.Is(err, context.DeadlineExceeded):
