@@ -2321,6 +2321,12 @@ func main() {
 	if token == defaultToken {
 		log.Fatal("hub-webrtc: OO_SCREEN_T1_TOKEN не задано (дефолт заборонено) — задай у EnvironmentFile сервісу")
 	}
+	// S1: strict, у якому не пройде жоден агент, — помилка конфігурації, а
+	// не тихе відхилення всього парку.
+	if err := agentAuthConfigError(); err != nil {
+		log.Fatal("hub-webrtc: ", err)
+	}
+	log.Print(agentAuthModeSummary())
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	startRevokeSubscription(ctx)
