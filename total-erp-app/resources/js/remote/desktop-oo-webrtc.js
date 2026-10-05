@@ -34,6 +34,7 @@ import {
     findMeshCanvas,
 } from './desktop-oo.js';
 import { createTileOverlay, TILES_LABEL } from './oo-text-tiles.js';
+import { INPUT_CHANNEL_LABEL, inputEnabledFor, createInputSender, attachInputDom } from './desktop-oo-input.js';
 import { applyLowLatency, createStatsOverlay } from './desktop-oo-stats.js';
 import {
     CURSOR_CHANNEL_LABEL,
@@ -397,8 +398,11 @@ export function buildRtcConfig(config) {
  * @param {object}   o.config  { requestTicket, firstFrameMs?, frameAgeMs?,
  *                               geometryTimeoutMs?, offerTimeoutMs?, iceServers?,
  *                               iceTransportPolicy?,
- *                               disconnectGraceMs? }
- *   requestTicket() → Promise<{ticket, signalUrl}> — §6.4 свіжий одноразовий
+ *                               disconnectGraceMs?, inputChannel?, inputGrant?,
+ *                               inputAllowed? }
+ *   inputChannel (F5, типово false) — власний канал вводу oosc-input замість
+ *   Mesh, лише для ролі control; inputAllowed() — гачок політики згоди.
+ *   requestTicket() → Promise<{ticket, signalUrl, grant?}> — §6.4 свіжий одноразовий
  *   ticket на цю ноду; offer їде з ticket, НЕ з довгоживучим токеном (BLOCKER-1/3).
  * @param {Function} o.onStateChange(state, reason)
  * @returns {{destroy: Function, state: Function, generation: Function}}
@@ -531,6 +535,8 @@ export function createOoWebrtcLayer(o) {
     let textTiles = null;         // STAGE3-444 B: canvas з lossless тайлами тексту (config.textTiles)
     let tilesChannel = null;
     let cursorLayer = null;       // config.cursorLayer: окремий курсор (desktop-oo-cursor.js)
+    let inputChannel = null;      // F5: config.inputChannel — власний канал вводу (desktop-oo-input.js)
+    let inputDom = null;
     let statsOverlay = null;      // getStats()-оверлей (Ctrl+Alt+S); config.statsOverlay === false — вимкнено
 
     const session = createOoSession({
@@ -740,6 +746,7 @@ export function createOoWebrtcLayer(o) {
         // керує Mesh (фолбек), інакше його мапінг пішов би від нашого 1:1.
         restoreMesh();
         if (cursorLayer) { try { cursorLayer.destroy(); } catch (e) { /* ignore */ } cursorLayer = null; }
+        detachInput();
         if (abort) { try { abort.abort(); } catch (e) { /* ignore */ } abort = null; }
         if (video) {
             if (rvfcHandle && typeof video.cancelVideoFrameCallback === 'function') {
@@ -911,6 +918,42 @@ export function createOoWebrtcLayer(o) {
         };
     }
 
+    function detachInput() {
+        if (inputDom) { try { inputDom.destroy(); } catch (e) { /* ignore */ } inputDom = null; }
+        if (inputChannel) {
+            try { inputChannel.onopen = null; inputChannel.onclose = null; inputChannel.close(); } catch (e) { /* ignore */ }
+            inputChannel = null;
+        }
+    }
+
+    // armInput — після квитка: grant не control => канал закриваємо, ввід
+    // лишається в Mesh. Інакше на onopen перехоплюємо ввід контейнера.
+    function armInput(gen, ticket, granted) {
+        const dc = inputChannel;
+        if (!dc) return;
+        if (!inputEnabledFor(config, resolveCursorRole(config), granted)) { detachInput(); return; }
+        const attach = () => {
+            if (!session.isCurrent(gen) || inputChannel !== dc || inputDom) return;
+            const sender = createInputSender({
+                ticket,
+                send: (s) => { if (dc.readyState === 'open') dc.send(s); else throw new Error('closed'); },
+                allowed: typeof config.inputAllowed === 'function' ? config.inputAllowed : null,
+            });
+            inputDom = attachInputDom({
+                target: container, doc, sender, containBox,
+                geometry: () => {
+                    if (!video || !(video.videoWidth > 0)) return null;
+                    return { rect: video.getBoundingClientRect(), srcW: video.videoWidth, srcH: video.videoHeight };
+                },
+            });
+        };
+        dc.onclose = () => {
+            if (inputChannel !== dc) return;
+            if (inputDom) { try { inputDom.destroy(); } catch (e) { /* ignore */ } inputDom = null; }
+        };
+        if (dc.readyState === 'open') attach(); else dc.onopen = attach;
+    }
+
     async function connect(gen) {
         const peer = new RTCPeerConnection(buildRtcConfig(config));
         pc = peer;
@@ -938,6 +981,13 @@ export function createOoWebrtcLayer(o) {
         // його спільним диспетчером OnDataChannel viewer-ноги (як input/tiles).
         // Без прапорця offer бітово той самий, що й раніше.
         if (config.cursorLayer) attachCursorChannel(peer, gen);
+        // F5: канал вводу — ЛИШЕ під config.inputChannel і лише для ролі control.
+        // Відкриваємо ДО offer-а; слухачі DOM чіпляємо, коли відомий grant
+        // квитка і канал відкритий (armInput нижче). Мовчазний канал хаб не
+        // карає: judgeInput судить повідомлення, а не сам факт відкриття.
+        if (inputEnabledFor(config, resolveCursorRole(config), config.inputGrant)) {
+            try { inputChannel = peer.createDataChannel(INPUT_CHANNEL_LABEL, { ordered: true }); } catch (e) { inputChannel = null; }
+        }
 
         peer.ontrack = (ev) => {
             if (!session.isCurrent(gen) || !video) return;
@@ -975,9 +1025,10 @@ export function createOoWebrtcLayer(o) {
         // §6.4 / BLOCKER-1,3: свіжий одноразовий ticket на цю ноду САМЕ перед
         // offer-ом (щоб не згорів по TTL, поки збирався ICE). node_id уже в
         // claims ticket-а — hub звʼяже глядача з publisher-ом цієї ноди.
-        const { ticket, signalUrl } = await config.requestTicket();
+        const { ticket, signalUrl, grant: granted } = await config.requestTicket();
         if (!session.isCurrent(gen)) return;
         if (!ticket || !signalUrl) throw new Error('offer/viewer: немає ticket або signalUrl');
+        armInput(gen, ticket, granted);
 
         // §MAJOR-5: ОДИН signal — teardown-abort АБО таймаут. Раніше fetch слухав
         // лише AbortSignal.timeout() окремо від teardown, тож знищення шару не

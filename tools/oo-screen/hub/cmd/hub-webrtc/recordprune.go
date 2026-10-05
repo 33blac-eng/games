@@ -23,6 +23,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"sync/atomic"
 	"time"
 )
 
@@ -52,6 +53,12 @@ const (
 // причини, що й прапорці фіч: тест підміняє її дрібним числом і перевіряє
 // закон на справжніх файлах, замість писати на диск вісім гігабайтів.
 var recordMaxBytesVar int64 = 8 << 30
+
+// recordMaxAgeVar — фактична межа віку (S5: OO_SCREEN_RECORD_MAX_AGE), типово
+// recordMaxAge. Атомарна: читає фонова горутина прибирання.
+var recordMaxAgeVar atomic.Int64
+
+func init() { recordMaxAgeVar.Store(int64(recordMaxAge)) }
 
 // recordingsFit прибирає застаріле й зайве, а тоді каже, чи можна починати
 // новий запис. false = місця немає; викликач мусить не починати.
@@ -101,7 +108,7 @@ func pruneRecordings(dir string, now time.Time) {
 	}
 	var files []rec
 	for _, e := range entries {
-		if e.IsDir() || filepath.Ext(e.Name()) != ".mkv" {
+		if e.IsDir() || !isRecordingFile(e.Name()) {
 			continue
 		}
 		fi, err := e.Info()
@@ -113,10 +120,11 @@ func pruneRecordings(dir string, now time.Time) {
 
 	sort.Slice(files, func(i, j int) bool { return files[i].mod.Before(files[j].mod) })
 
+	maxAge := time.Duration(recordMaxAgeVar.Load())
 	var total int64
 	kept := files[:0]
 	for _, f := range files {
-		if now.Sub(f.mod) > recordMaxAge {
+		if now.Sub(f.mod) > maxAge {
 			if err := os.Remove(f.path); err != nil {
 				log.Printf("record: не зміг прибрати старий %s: %v", f.path, err)
 				continue
