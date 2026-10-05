@@ -144,7 +144,7 @@ jobs:
         run: bash deploy/test/hub-deploy-sec2-test.sh
       - uses: actions/setup-go@v5
         with:
-          go-version-file: go.mod
+          go-version-file: tools/oo-screen/go.mod
       - name: agent-rollout test
         run: bash deploy/test/agent-rollout-test.sh
 

@@ -141,9 +141,12 @@ func Step(p Plan, s State, reports []Report, now time.Time) (State, Decision, er
 		return s, Decision{Action: Halt, Percent: 0, Reason: s.Reason}, nil
 	}
 	if !s.Since.IsZero() {
+		// Report timestamps are RFC3339 with whole seconds, so a report from
+		// the same second as init would otherwise sort before Since.
+		since := s.Since.Truncate(time.Second)
 		var fresh []Report
 		for _, r := range reports {
-			if !r.At.Before(s.Since) {
+			if !r.At.Before(since) {
 				fresh = append(fresh, r)
 			}
 		}
