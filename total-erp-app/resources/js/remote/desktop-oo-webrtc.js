@@ -985,7 +985,7 @@ export function createOoWebrtcLayer(o) {
         // Відкриваємо ДО offer-а; слухачі DOM чіпляємо, коли відомий grant
         // квитка і канал відкритий (armInput нижче). Мовчазний канал хаб не
         // карає: judgeInput судить повідомлення, а не сам факт відкриття.
-        if (inputEnabledFor(config, resolveCursorRole(config), config.inputGrant)) {
+        if (inputEnabledFor(config, resolveCursorRole(config), config.inputGrant ?? 'control')) { // мовчазний канал; DOM лише при явному grant (armInput)
             try { inputChannel = peer.createDataChannel(INPUT_CHANNEL_LABEL, { ordered: true }); } catch (e) { inputChannel = null; }
         }
 

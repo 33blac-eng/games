@@ -194,10 +194,10 @@ export function inputEnabledFor(config, role, grant) {
     const c = config || {};
     if (c.inputChannel !== true) return false;
     if (role !== 'control') return false;
-    // grant не повернули — вирішує хаб; повернули і він не control — не пробуємо
-    // (хаб інакше порвав би всю сесію глядача).
-    if (grant !== undefined && grant !== null && grant !== 'control') return false;
-    return true;
+    // Fail-safe: канал лише при ЯВНОМУ grant=control від тікета. Без grant
+    // (або з іншим) — не відкриваємо: хаб на input від view-глядача рве всю
+    // сесію разом із відео (judgeInput -> inputKill).
+    return grant === 'control';
 }
 
 // attachInputDom — DOM-частина: слухачі на контейнері (capture), мапінг через

@@ -10,7 +10,8 @@ assert.equal(INPUT_CHANNEL_LABEL, 'oosc-input'); // == hub inputChannelLabel
 
 // ── роль / grant / прапорець ───────────────────────────────────────────────
 assert.equal(inputEnabledFor({}, 'control'), false, 'типово вимкнено');
-assert.equal(inputEnabledFor({ inputChannel: true }, 'control'), true);
+assert.equal(inputEnabledFor({ inputChannel: true }, 'control'), false, 'grant відсутній -> вимкнено (fail-safe)');
+assert.equal(inputEnabledFor({ inputChannel: true }, 'control', null), false);
 assert.equal(inputEnabledFor({ inputChannel: true }, 'view'), false, 'перегляд не відкриває канал');
 assert.equal(inputEnabledFor({ inputChannel: true }, 'control', 'view'), false, 'grant=view');
 assert.equal(inputEnabledFor({ inputChannel: true }, 'control', 'control'), true);
