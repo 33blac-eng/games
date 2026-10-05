@@ -46,297 +46,43 @@ import (
 	"github.com/pion/rtp"
 	"github.com/pion/sdp/v3"
 	"github.com/pion/webrtc/v4"
+
+	"github.com/organicoils/oo-screen/internal/bwe"
 )
 
 var delayBWEEnabled = flagOn(os.Getenv("OO_SCREEN_DELAYBWE"))
 
+// Сам детектор (Trendline, AckedRate, розбір TWCC, рішення DelayCut) з N6
+// живе в internal/bwe: той самий код крутить агент на прямій нозі. Тут —
+// лише проводка viewer-ноги хаба (stamp копії пакета, проба, ns.bitrate).
 const (
-	tccRing        = 1 << 12 // відправлені пакети в памʼяті (≥ 4 с на 8 Мбіт/с)
-	tccBurst       = 5 * time.Millisecond
-	trendWindow    = 20
-	trendSmoothing = 0.9
-	trendGain      = 4.0
-	trendThrInit   = 12.5
-	trendThrMin    = 6.0
-	trendThrMax    = 600.0
-	trendKUp       = 0.0087
-	trendKDown     = 0.039
-	overuseTimeMs  = 10.0
-	ackedWindow    = 500 * time.Millisecond
-	ackedRecent    = 200 * time.Millisecond // коротке вікно: acked = min(500 мс, 200 мс)
-
-	delayBeta        = 0.85                   // ціль = acked × це на OVERUSE
-	delayLimited     = 0.9                    // acked < sent × це = впираємось у канал
-	delayCutDebounce = 300 * time.Millisecond // між зрізами по затримці (+ свіже вікно)
-	delayUpHold      = 3 * time.Second        // після OVERUSE — без підйомів і проб
+	delayUpHold      = bwe.DelayUpHold
 	delayExtRecheck  = 500 * time.Millisecond // як часто питати SDP про id розширення
-	probeDelayAbort  = 25.0                   // мс черги понад мінімум за пробу — обрив
-	delaySevere      = 0.6                    // acked < sent × це — ріжемо й без нового OVERUSE
-	delayRecentAt    = 0.85                   // acked < sent × це — довіряємо короткому вікну
-	delayKFBelow     = 0.5                    // зріз до ≤ цієї частки — разом з keyframe_request
-	delayLag         = 1.2                    // sent > ціль × це після зрізу — енкодер ще не догнав
-	delayCutMin      = 0.2                    // найглибший один крок (8 -> 1.6 Мбіт/с за раз)
+	probeDelayAbort  = bwe.ProbeDelayAbort
+	delayKFBelow     = bwe.DelayKFBelow
+	delayCutDebounce = bwe.DelayCutDebounce
 )
 
-type bwState int
-
-const (
-	bwNormal bwState = iota
-	bwOverusing
-	bwUnderusing
-)
-
-// trendline — ЧИСТИЙ (без годинника й мережі) оцінювач тренду затримки.
-type trendline struct {
-	haveGrp, havePrev        bool
-	grpFirstSend, grpSend    time.Time
-	grpArr                   time.Time
-	prevSend, prevArr        time.Time
-	firstArr                 time.Time
-	acc, smooth              float64
-	hist                     [][2]float64
-	numDeltas                int
-	thr                      float64
-	thrAt                    time.Time
-	overTime                 float64
-	overCnt                  int
-	prevTrend, lastTrend, mt float64
-	state                    bwState
-	fired                    bool // OVERUSE щойно підтверджено (споживає onFeedback)
-}
-
-func newTrendline() trendline { return trendline{thr: trendThrInit, overTime: -1} }
-
-func ms(d time.Duration) float64 { return float64(d) / float64(time.Millisecond) }
-
-// add — один отриманий пакет у порядку відправки. Повертає поточний стан.
-func (t *trendline) add(send, arr time.Time) bwState {
-	if !t.haveGrp {
-		t.haveGrp = true
-		t.grpFirstSend, t.grpSend, t.grpArr = send, send, arr
-		return t.state
-	}
-	if send.Before(t.grpSend) {
-		return t.state // переставлений — у групу вже не годиться
-	}
-	if send.Sub(t.grpFirstSend) <= tccBurst {
-		t.grpSend = send
-		if arr.After(t.grpArr) {
-			t.grpArr = arr
-		}
-		return t.state
-	}
-	// Група завершена.
-	if t.havePrev {
-		sd := t.grpSend.Sub(t.prevSend)
-		ad := t.grpArr.Sub(t.prevArr)
-		t.update(ms(ad)-ms(sd), ms(sd), t.grpArr)
-	}
-	t.havePrev = true
-	t.prevSend, t.prevArr = t.grpSend, t.grpArr
-	t.grpFirstSend, t.grpSend, t.grpArr = send, send, arr
-	return t.state
-}
-
-func (t *trendline) update(deltaMs, sendDeltaMs float64, arr time.Time) {
-	if t.numDeltas < 1000 {
-		t.numDeltas++
-	}
-	if t.firstArr.IsZero() {
-		t.firstArr = arr
-	}
-	t.acc += deltaMs
-	t.smooth = trendSmoothing*t.smooth + (1-trendSmoothing)*t.acc
-	t.hist = append(t.hist, [2]float64{ms(arr.Sub(t.firstArr)), t.smooth})
-	if len(t.hist) > trendWindow {
-		t.hist = t.hist[1:]
-	}
-	trend := t.prevTrend
-	if len(t.hist) == trendWindow {
-		if s, ok := linregSlope(t.hist); ok {
-			trend = s
-		}
-	}
-	t.lastTrend = trend
-	t.detect(trend, sendDeltaMs, arr)
-}
-
-func linregSlope(pts [][2]float64) (float64, bool) {
-	var sx, sy float64
-	for _, p := range pts {
-		sx += p[0]
-		sy += p[1]
-	}
-	n := float64(len(pts))
-	mx, my := sx/n, sy/n
-	var num, den float64
-	for _, p := range pts {
-		num += (p[0] - mx) * (p[1] - my)
-		den += (p[0] - mx) * (p[0] - mx)
-	}
-	if den == 0 {
-		return 0, false
-	}
-	return num / den, true
-}
-
-func (t *trendline) detect(trend, sendDeltaMs float64, arr time.Time) {
-	if t.numDeltas < 2 {
-		t.state = bwNormal
-		return
-	}
-	n := float64(t.numDeltas)
-	if n > 60 {
-		n = 60
-	}
-	mt := n * trend * trendGain
-	t.mt = mt
-	switch {
-	case mt > t.thr:
-		if t.overTime == -1 {
-			t.overTime = sendDeltaMs / 2
-		} else {
-			t.overTime += sendDeltaMs
-		}
-		t.overCnt++
-		if t.overTime > overuseTimeMs && t.overCnt > 1 && trend >= t.prevTrend {
-			t.overTime, t.overCnt = 0, 0
-			t.state = bwOverusing
-			t.fired = true
-		}
-	case mt < -t.thr:
-		t.overTime, t.overCnt = -1, 0
-		t.state = bwUnderusing
-	default:
-		t.overTime, t.overCnt = -1, 0
-		t.state = bwNormal
-	}
-	t.prevTrend = trend
-	t.updateThr(mt, arr)
-}
-
-func (t *trendline) updateThr(mt float64, arr time.Time) {
-	if t.thrAt.IsZero() {
-		t.thrAt = arr
-	}
-	a := mt
-	if a < 0 {
-		a = -a
-	}
-	if a > t.thr+15 {
-		t.thrAt = arr // викид (стрибок шляху) — поріг не тягнемо
-		return
-	}
-	k := trendKUp
-	if a < t.thr {
-		k = trendKDown
-	}
-	dt := ms(arr.Sub(t.thrAt))
-	if dt > 100 {
-		dt = 100
-	}
-	if dt < 0 {
-		dt = 0
-	}
-	t.thr += k * (a - t.thr) * dt
-	if t.thr < trendThrMin {
-		t.thr = trendThrMin
-	}
-	if t.thr > trendThrMax {
-		t.thr = trendThrMax
-	}
-	t.thrAt = arr
-}
-
-// ackedRate — доставлена швидкість за ackedWindow часу приходу.
-type ackedRate struct {
-	pts   []ackPt
-	bytes int
-}
-
-type ackPt struct {
-	at, send time.Time
-	seq      uint16
-	size     int
-}
-
-func (a *ackedRate) add(at, send time.Time, seq uint16, size int) {
-	a.pts = append(a.pts, ackPt{at, send, seq, size})
-	a.bytes += size
-	// Приходи в межах фідбеку монотонні; між фідбеками — майже.
-	for len(a.pts) > 1 && at.Sub(a.pts[0].at) > ackedWindow {
-		a.bytes -= a.pts[0].size
-		a.pts = a.pts[1:]
-	}
-}
-
-// bps — 0, поки вікно не набралось хоча б наполовину.
-func (a *ackedRate) bps() uint64 {
-	if len(a.pts) < 2 {
-		return 0
-	}
-	span := a.pts[len(a.pts)-1].at.Sub(a.pts[0].at)
-	if span < ackedWindow/2 {
-		return 0
-	}
-	return uint64(float64(a.bytes-a.pts[0].size) * 8 / span.Seconds())
-}
-
-// recentBps — доставлена швидкість за останні d часу приходу (≥ d/2 даних,
-// інакше 0). Під перевантаженням це і є пропускна вузького місця «зараз»;
-// 500-мс вікно на першому OVERUSE ще бачить трафік до появи стелі.
-func (a *ackedRate) recentBps(d time.Duration) uint64 {
-	n := len(a.pts)
-	if n < 2 {
-		return 0
-	}
-	last := a.pts[n-1].at
-	i := n - 1
-	for i > 0 && last.Sub(a.pts[i-1].at) <= d {
-		i--
-	}
-	span := last.Sub(a.pts[i].at)
-	if span < d/2 {
-		return 0
-	}
-	bytes := 0
-	for _, p := range a.pts[i+1:] {
-		bytes += p.size
-	}
-	return uint64(float64(bytes) * 8 / span.Seconds())
-}
-
-type tccSent struct {
-	seq  uint16
-	ok   bool
-	at   time.Time
-	size int
-}
+// newTrendline — детектор градієнта затримки (internal/bwe).
+func newTrendline() bwe.Trendline { return bwe.NewTrendline() }
 
 // twccLeg — transport-cc стан ОДНІЄЇ viewer-ноги. Пише pump (stamp), читає
-// RTCP-цикл (onFeedback) — тому свій мʼютекс, не ns.mu.
+// RTCP-цикл (onFeedback). Облік відправленого і детектор — bwe.TWCC (свій
+// мʼютекс); тут лише id розширення і стеження за пробою.
 type twccLeg struct {
 	mu     sync.Mutex
 	sender *webrtc.RTPSender
 	extID  uint8
 	extAt  time.Time
-	next   uint16
-	sent   [tccRing]tccSent
-	lastFb uint16
-	haveFb bool
-	est    trendline
-	acked  ackedRate
-	overAt time.Time // останній OVERUSE
-	overs  int
+	core   *bwe.TWCC
 	// probeFor/probeMin — проба, за якою стежимо, і мінімум накопиченої
 	// затримки від її старту (probeQueued).
 	probeFor *legProbe
 	probeMin float64
-	feedback int
 }
 
 func newTwccLeg(sender *webrtc.RTPSender) *twccLeg {
-	return &twccLeg{sender: sender, est: newTrendline()}
+	return &twccLeg{sender: sender, core: bwe.NewTWCC()}
 }
 
 // extIDLocked — id узгодженого transport-cc розширення; 0 — не узгоджено.
@@ -357,132 +103,47 @@ func (t *twccLeg) extIDLocked(now time.Time) uint8 {
 // його не чіпаємо). Без узгодженого розширення — пакет як є.
 func (t *twccLeg) stamp(pkt *rtp.Packet, now time.Time) *rtp.Packet {
 	t.mu.Lock()
-	defer t.mu.Unlock()
 	id := t.extIDLocked(now)
+	t.mu.Unlock()
 	if id == 0 {
 		return pkt
 	}
 	cp := *pkt
 	cp.Header.Extensions = append([]rtp.Extension(nil), pkt.Header.Extensions...)
-	seq := t.next
-	t.next++
-	if err := cp.Header.SetExtension(id, []byte{byte(seq >> 8), byte(seq)}); err != nil {
-		t.next--
+	// Розмір із розширенням: 2 байти seq + (за першого розширення) заголовок
+	// one-byte блоку. Точність тут — та сама, що й раніше (MarshalSize після
+	// SetExtension), бо seq має фіксовану довжину.
+	if err := cp.Header.SetExtension(id, []byte{0, 0}); err != nil {
 		return pkt
 	}
-	t.sent[int(seq)%tccRing] = tccSent{seq: seq, ok: true, at: now, size: cp.MarshalSize()}
+	seq := t.core.NextSeq(now, cp.MarshalSize())
+	_ = cp.Header.SetExtension(id, []byte{byte(seq >> 8), byte(seq)})
 	return &cp
 }
 
-// sentBpsLocked — швидкість ВІДПРАВКИ (разом із втраченими) за той самий
-// відрізок seq, що й вікно acked. acked < sent = частина відправленого не
-// доходить вчасно: черга росте або дропи, тобто ми впираємось у канал. 0 —
-// замало даних.
-func (t *twccLeg) sentBpsLocked() uint64 {
-	p := t.acked.pts
-	if len(p) < 2 {
-		return 0
-	}
-	first, last := p[0], p[len(p)-1]
-	span := last.send.Sub(first.send)
-	n := int(uint16(last.seq - first.seq))
-	if span < ackedWindow/4 || n <= 0 || n >= tccRing {
-		return 0
-	}
-	bytes := 0
-	for i := 1; i <= n; i++ {
-		sq := first.seq + uint16(i)
-		if s := t.sent[int(sq)%tccRing]; s.ok && s.seq == sq {
-			bytes += s.size
-		}
-	}
-	return uint64(float64(bytes) * 8 / span.Seconds())
-}
-
-// onFeedback — розбір TWCC-фідбеку. Повертає acked і sent (біт/с) та чи
-// стався НОВИЙ (щойно підтверджений) OVERUSE у цьому фідбеку.
-// winStart — момент ВІДПРАВКИ першого пакета вікна acked: контролер не ріже
-// вдруге по вікну, яке ще бачить трафік до попереднього зрізу.
+// onFeedback — розбір TWCC-фідбеку (bwe.TWCC.OnFeedback).
 func (t *twccLeg) onFeedback(fb *rtcp.TransportLayerCC) (acked, sent uint64, winStart time.Time, newOver bool) {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	t.feedback++
-	ref := time.Unix(0, 0).Add(time.Duration(fb.ReferenceTime) * 64 * time.Millisecond)
-	arr := ref
-	di := 0
-	seq := fb.BaseSequenceNumber
-	remaining := int(fb.PacketStatusCount)
-	handle := func(sym uint16) {
-		received := sym == rtcp.TypeTCCPacketReceivedSmallDelta || sym == rtcp.TypeTCCPacketReceivedLargeDelta
-		if received && di < len(fb.RecvDeltas) {
-			arr = arr.Add(time.Duration(fb.RecvDeltas[di].Delta) * time.Microsecond)
-			di++
-			fresh := !t.haveFb || int16(seq-t.lastFb) > 0
-			if s := t.sent[int(seq)%tccRing]; fresh && s.ok && s.seq == seq {
-				t.est.add(s.at, arr)
-				if t.est.fired {
-					t.est.fired = false
-					newOver = true
-				}
-				t.acked.add(arr, s.at, seq, s.size)
-				t.lastFb, t.haveFb = seq, true
-			}
-		}
-		seq++
-		remaining--
-	}
-	for _, c := range fb.PacketChunks {
-		if remaining <= 0 {
-			break
-		}
-		switch ch := c.(type) {
-		case *rtcp.RunLengthChunk:
-			for i := 0; i < int(ch.RunLength) && remaining > 0; i++ {
-				handle(ch.PacketStatusSymbol)
-			}
-		case *rtcp.StatusVectorChunk:
-			for _, s := range ch.SymbolList {
-				if remaining <= 0 {
-					break
-				}
-				handle(s)
-			}
-		}
-	}
-	if newOver {
-		t.overs++
-	}
-	if len(t.acked.pts) > 0 {
-		winStart = t.acked.pts[0].send
-	}
-	acked, sent = t.acked.bps(), t.sentBpsLocked()
-	// Коротке вікно — лише при явному перевантаженні (acked < delayRecentAt×sent):
-	// без нього 200 мс на змінному контенті (IDR, паузи кадрів) дає випадково
-	// низькі значення, і стеля 8M різалась до ~4 Мбіт/с (заміряно).
-	if float64(acked) < delayRecentAt*float64(sent) {
-		if r := t.acked.recentBps(ackedRecent); r > 0 && r < acked {
-			acked = r
-		}
-	}
-	return acked, sent, winStart, newOver
+	f := t.core.OnFeedback(fb)
+	return f.Acked, f.Sent, f.WinStart, f.Over
 }
 
 // probeQueued — чи виросла черга під час проби p (накопичена затримка
 // детектора, мс) більше ніж на probeDelayAbort від свого мінімуму від старту.
 func (t *twccLeg) probeQueued(p *legProbe, now time.Time) bool {
+	acc, ok := t.core.QueueAcc()
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	if now.Before(p.start) || !t.est.havePrev {
+	if now.Before(p.start) || !ok {
 		return false
 	}
 	if t.probeFor != p {
-		t.probeFor, t.probeMin = p, t.est.acc
+		t.probeFor, t.probeMin = p, acc
 		return false
 	}
-	if t.est.acc < t.probeMin {
-		t.probeMin = t.est.acc
+	if acc < t.probeMin {
+		t.probeMin = acc
 	}
-	return t.est.acc-t.probeMin > probeDelayAbort
+	return acc-t.probeMin > probeDelayAbort
 }
 
 // withDelay — ЧИСТА, на кожен TWCC-фідбек. Канал «впирається», коли
@@ -500,37 +161,23 @@ func (t *twccLeg) probeQueued(p *legProbe, now time.Time) bool {
 // Друга умова тримає зрізання, поки черга повна й пласка (градієнт нуль, а
 // дропи йдуть) — саме там чистий детектор тренду мовчить.
 func (c bitrateCtl) withDelay(over bool, acked, sent uint64, winStart, now time.Time) (bitrateCtl, bool) {
-	limited := acked > 0 && sent > 0 && float64(acked) < delayLimited*float64(sent)
-	if over && limited {
+	if over && bwe.Limited(acked, sent) {
 		c.delayOverAt = now
 	}
 	if now.Before(c.probeMuteUntil) || c.probing {
 		// Це наша проба налила чергу — ціль відео не чіпаємо (див. probe.go).
 		return c, false
 	}
-	severe := acked > 0 && sent > 0 && float64(acked) < delaySevere*float64(sent)
-	if !(over && limited) && !(severe && c.delayHeld(now)) {
-		return c, false
+	// Рішення — спільне з прямою ногою агента (internal/bwe.DelayCut).
+	next, congested, cut := bwe.DelayCut(bwe.DelayIn{
+		Over: over, Acked: acked, Sent: sent, WinStart: winStart, Now: now,
+		Target: c.target, LastSent: c.lastSent, LastWasDelay: c.reason == "delay",
+		Held: c.delayHeld(now), Floor: minBitrateBps,
+	})
+	if congested {
+		c.congAt = now
 	}
-	c.congAt = now
-	// Енкодер ще не догнав попередній зріз (шле помітно більше за ціль):
-	// надлишок — його запізнення, а не новий затор; різати глибше — лише
-	// недобір після того, як він догонить (заміряно на стенді: каскад 8 ->
-	// 4 -> 2 -> 1 Мбіт/с під стелею 2M).
-	if !c.lastSent.IsZero() && c.reason == "delay" && float64(sent) > delayLag*float64(c.target) {
-		return c, false
-	}
-	next := uint64(float64(acked) * delayBeta)
-	if lo := uint64(float64(c.target) * delayCutMin); next < lo {
-		next = lo
-	}
-	if next < minBitrateBps {
-		next = minBitrateBps
-	}
-	if next >= c.target {
-		return c, false
-	}
-	if !c.lastSent.IsZero() && (now.Sub(c.lastSent) < delayCutDebounce || !winStart.After(c.lastSent)) {
+	if !cut {
 		return c, false
 	}
 	c.cutFrom = c.target

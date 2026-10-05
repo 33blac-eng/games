@@ -355,8 +355,8 @@ func dialWebRTC(hubURL string, frameInterval time.Duration, onKeyframeRequest fu
 			_ = pc.Close()
 			return nil, fmt.Errorf("create cursor datachannel: %w", dcErr)
 		}
-		cur.OnOpen(func() { cursorPub.SetSink(cur) })
-		cur.OnClose(func() { cursorPub.ClearSink(cur) })
+		cur.OnOpen(func() { cursorSinks.add(cur) }) // N6: fan — ще й канали прямих ніг
+		cur.OnClose(func() { cursorSinks.remove(cur) })
 	}
 	track, err := webrtc.NewTrackLocalStaticSample(webrtc.RTPCodecCapability{
 		MimeType:    webrtc.MimeTypeH264,
@@ -940,8 +940,9 @@ func main() {
 	autoUpdateURL := flag.String("auto-update-url", "", "S6: URL підписаного (ed25519) маніфесту оновлень; порожньо = автооновлення вимкнено (дефолт). Потрібен ключ, зашитий при збірці (-X main.updatePubKey)")
 	autoUpdateEvery := flag.Duration("auto-update-interval", 6*time.Hour, "S6: як часто перевіряти маніфест")
 	autoUpdateHealth := flag.Duration("auto-update-health-window", 2*time.Minute, "S6: за скільки новий бінарь мусить достукатись до хаба, інакше автоматичний відкат")
-	p2pFlag := flag.Bool("p2p", false, "N6: пряма нога агент↔браузер (перекриває env OO_SCREEN_P2P=1; потрібен OO_SCREEN_P2P=1 на хабі і config.p2p у плеєрі). Типово вимкнено. Лише webrtc і з -node. Нога везе відео+ввід; звук/курсор/тайли/bitrate_target лишаються на relay. UNVERIFIED на реальних ПК/NAT")
+	p2pFlag := flag.Bool("p2p", false, "N6: пряма нога агент↔браузер (перекриває env OO_SCREEN_P2P=1; потрібен OO_SCREEN_P2P=1 на хабі і config.p2p у плеєрі). Типово вимкнено. Лише webrtc і з -node. Нога везе відео+ввід, звук (OO_SCREEN_AUDIO) і шар курсора (-cursor-layer); тайли й додаткові монітори лишаються на relay. UNVERIFIED на реальних ПК/NAT")
 	p2pStun := flag.String("p2p-stun", "", "N6: STUN-сервери через кому (перекриває OO_SCREEN_P2P_STUN)")
+	p2pBwe := flag.Bool("p2p-bwe", false, "N6: локальний контролер бітрейту прямої ноги (internal/bwe, RTCP самої ноги; з OO_SCREEN_DELAYBWE=1 — ще transport-cc і детектор затримки). Перекриває env OO_SCREEN_P2P_BWE=1. Типово вимкнено: енкодер тримає останню ціль хаба")
 	autoUpdateReport := flag.String("auto-update-report-url", "", "O4: куди POST-ити вердикт здоров'я нової версії (ok/fail/inconclusive) для поетапної викатки (oo-rollout serve); порожньо = не звітувати. Токен — env OO_ROLLOUT_REPORT_TOKEN")
 	flag.Parse()
 
@@ -1323,6 +1324,18 @@ func main() {
 				}
 			}
 			p2pAg.onKeyframe = onKeyframeRequest
+			// Звук і шар курсора — ті самі прапорці, що й на relay.
+			p2pAg.audio = audioEnabled
+			p2pAg.audioCap = audioCodec.Capability()
+			if cursorLayerEnabled {
+				p2pAg.cursor = cursorSinks
+			}
+			// Локальний контролер (дефолт вимкнено). Ціль іде тим самим шляхом,
+			// що й bitrate_target хаба (onBitrateTarget нижче -> кадровий цикл).
+			p2pAg.bwe = *p2pBwe || os.Getenv("OO_SCREEN_P2P_BWE") == "1"
+			p2pAg.delayBWE = os.Getenv("OO_SCREEN_DELAYBWE") == "1"
+			p2pAg.ceilBps = uint64(bitrateBps)
+			p2pAg.startBps = func() uint64 { return uint64(s.bitrateBps.Load()) }
 			p2pInj := newInputInjector()
 			p2pAg.onActive = func(n int) {
 				p2pLive.Store(int32(n))
@@ -1422,6 +1435,18 @@ func main() {
 		log.Printf("oo-agent: bitrate -> %d bps (застосує кадровий цикл)", bps)
 	}
 
+	// N6: ціль локального контролера прямої ноги — тим самим шляхом.
+	// Енкодер один, тож ціль хаба і цілі ніг ідуть через арбітраж p2pAg
+	// (мінімум): hubBitrateTarget — те, що отримує транспорт хаба.
+	hubBitrateTarget := onBitrateTarget
+	if p2pAg != nil && p2pAg.bwe {
+		p2pAg.onBitrate = func(bps uint64) {
+			log.Printf("oo-agent: p2p bwe (мін. ніг і хаба) -> %d bps", bps)
+			onBitrateTarget(bps)
+		}
+		hubBitrateTarget = p2pAg.setHubTarget
+	}
+
 	// onSelectOutput — hub попросив інший монітор (control §select_output; сам
 	// запит приходить із консолі ЕРП). Тут лише КЛАДЕМО намір: перемикання
 	// капчера робить кадровий цикл, бо capture.Capturer «NOT safe for concurrent
@@ -1460,7 +1485,7 @@ func main() {
 	}
 
 	tp, err := retryUntil(ctx, "initial dial "+*hubAddr, func() (transport, error) {
-		t, err := dial(*transportKind, hubSel.current(), frameInterval, onKeyframeRequest, onGate, onBitrateTarget, onSelectOutput, onDown)
+		t, err := dial(*transportKind, hubSel.current(), frameInterval, onKeyframeRequest, onGate, hubBitrateTarget, onSelectOutput, onDown)
 		if err != nil {
 			hubSel.failed(ctx)
 			return nil, err
@@ -1598,6 +1623,9 @@ func main() {
 	// Гейт — той самий gatePaused, що керує відео (див. runAudio).
 	if audioEnabled && *transportKind == "webrtc" {
 		go runAudio(ctx, &gatePaused, func(data []byte, dur time.Duration) error {
+			if p2pAg != nil {
+				p2pAg.writeAudio(data, dur) // N6: той самий кадр у прямі ноги
+			}
 			tpMu.Lock()
 			cur := tp
 			tpMu.Unlock()
@@ -1679,7 +1707,7 @@ func main() {
 			tp.close()
 			tpMu.Unlock()
 
-			newTp, err := dial(*transportKind, hubSel.current(), frameInterval, onKeyframeRequest, onGate, onBitrateTarget, onSelectOutput, onDown)
+			newTp, err := dial(*transportKind, hubSel.current(), frameInterval, onKeyframeRequest, onGate, hubBitrateTarget, onSelectOutput, onDown)
 			if err != nil {
 				if hubSel.failed(ctx) {
 					backoff = reconnectBackoffMin // новий хаб здоровий — пробуємо одразу з короткою витримкою

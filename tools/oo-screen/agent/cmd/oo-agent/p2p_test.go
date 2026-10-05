@@ -43,7 +43,7 @@ type p2pRig struct {
 	idr     atomic.Int32
 }
 
-func newP2PRig(t *testing.T, consentOK bool) *p2pRig {
+func newP2PRig(t *testing.T, consentOK bool, mods ...func(*p2pAgent)) *p2pRig {
 	r := &p2pRig{consent: &p2pTestConsent{}}
 	r.consent.ok.Store(consentOK)
 	cfg := p2p.DefaultConfig()
@@ -75,6 +75,9 @@ func newP2PRig(t *testing.T, consentOK bool) *p2pRig {
 	a.onInput = func(b []byte) { r.mu.Lock(); r.inputs = append(r.inputs, string(b)); r.mu.Unlock() }
 	a.onActive = func(n int) { r.active.Store(int32(n)) }
 	a.onKeyframe = func() { r.idr.Add(1) }
+	for _, m := range mods {
+		m(a)
+	}
 	r.agent = a
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
@@ -84,6 +87,7 @@ func newP2PRig(t *testing.T, consentOK bool) *p2pRig {
 	go func() {
 		for i := 0; ctx.Err() == nil; i++ {
 			a.writeVideo([]byte{0, 0, 0, 1, 0x65, 0x88, 0x84, byte(i)}, 33*time.Millisecond)
+			a.writeAudio([]byte{0xfc, 0xff, 0xfe, byte(i)}, 20*time.Millisecond)
 			time.Sleep(30 * time.Millisecond)
 		}
 	}()

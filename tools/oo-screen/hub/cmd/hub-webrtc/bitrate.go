@@ -48,6 +48,7 @@ import (
 
 	"github.com/pion/webrtc/v4"
 
+	"github.com/organicoils/oo-screen/internal/bwe"
 	"github.com/organicoils/oo-screen/internal/control"
 )
 
@@ -59,18 +60,18 @@ const (
 	// (agentlogic.go minBitrateBps), тож це вирівнювання, а не новий режим.
 	// Пастки jitter-а («ціль до підлоги при чистому каналі») це не повертає:
 	// jitter у рішенні не бере участі, а глибина ходу визначається сигналами.
-	minBitrateBps = 300_000
-	lossHighFrac  = 0.02  // >2% втрат — ріжемо
-	lossLowFrac   = 0.005 // <=0.5% — чисто, кандидат на підйом
-	downFactor    = 0.7   // крок вниз
-	upFactor      = 1.05  // крок вгору
+	minBitrateBps = bwe.MinBitrateBps // N6: спільні з прямою ногою агента (internal/bwe)
+	lossHighFrac  = bwe.LossHighFrac  // >2% втрат — ріжемо
+	lossLowFrac   = bwe.LossLowFrac   // <=0.5% — чисто, кандидат на підйом
+	downFactor    = bwe.DownFactor    // крок вниз
+	upFactor      = bwe.UpFactor      // крок вгору
 
 	// Асиметрія вниз/вгору. Симетричний дебаунс на типових для UDP коливаннях
 	// втрат 1-3% дає пилку: контролер хитається між 100% і 70% і безперервно
 	// смикає GOP. Тому вниз — швидко, вгору — повільно й лише після серії.
-	goodStreak    = 5 * time.Second  // скільки поспіль має бути чисто до підйому
-	downDebounce  = 2 * time.Second  // не частіше однієї зміни вниз
-	upDebounce    = 10 * time.Second // не частіше одного підйому
+	goodStreak    = bwe.GoodStreak   // скільки поспіль має бути чисто до підйому (5 с)
+	downDebounce  = bwe.DownDebounce // не частіше однієї зміни вниз (2 с)
+	upDebounce    = bwe.UpDebounce   // не частіше одного підйому (10 с)
 	keyframeDebnc = 500 * time.Millisecond
 
 	// H-26. Скільки стан адаптації лишається дійсним після того, як пішов

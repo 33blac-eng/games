@@ -32,7 +32,7 @@ func TestTrendlineNoOveruseBelowCapacity(t *testing.T) {
 	tr := newTrendline()
 	s, a := linkSim(time.Unix(1000, 0), 3000, 1.5e6, 2e6)
 	for i := range s {
-		if tr.add(s[i], a[i]); tr.fired {
+		if tr.Add(s[i], a[i]); tr.Fired() {
 			t.Fatalf("OVERUSE на %d пакеті при 1.5 Мбіт/с через 2 Мбіт/с", i)
 		}
 	}
@@ -42,7 +42,7 @@ func TestTrendlineOveruseAboveCapacity(t *testing.T) {
 	tr := newTrendline()
 	s, a := linkSim(time.Unix(1000, 0), 3000, 4e6, 2e6)
 	for i := range s {
-		if tr.add(s[i], a[i]); tr.fired {
+		if tr.Add(s[i], a[i]); tr.Fired() {
 			// Черга росте на 1 мс за 2 мс: детектор мусить побачити за ~0.5 с.
 			if d := s[i].Sub(s[0]); d > 600*time.Millisecond {
 				t.Fatalf("OVERUSE запізно: %v", d)
