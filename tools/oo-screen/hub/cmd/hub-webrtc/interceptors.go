@@ -61,8 +61,14 @@ func nackGeneratorOptions() []nack.GeneratorOption {
 // GetStats для діагностики) — з тим самим NACK-генератором.
 func registerHubInterceptors(m *webrtc.MediaEngine, i *interceptor.Registry) error {
 	if os.Getenv("OO_SCREEN_PION_STATS") == "1" {
-		return webrtc.RegisterDefaultInterceptorsWithOptions(m, i,
-			webrtc.WithNackGeneratorOptions(nackGeneratorOptions()...))
+		if err := webrtc.RegisterDefaultInterceptorsWithOptions(m, i,
+			webrtc.WithNackGeneratorOptions(nackGeneratorOptions()...)); err != nil {
+			return err
+		}
+		// Тут FEC зовні відносно TWCC: з узгодженим transport-cc розширенням
+		// захищені байти не збіглися б із мережевими — діагностичний режим.
+		addFECInterceptor(i)
+		return nil
 	}
 	if err := webrtc.ConfigureNackWithOptions(m, i, nackGeneratorOptions()); err != nil {
 		return err
@@ -70,6 +76,10 @@ func registerHubInterceptors(m *webrtc.MediaEngine, i *interceptor.Registry) err
 	if err := webrtc.ConfigureRTCPReports(i); err != nil {
 		return err
 	}
+	// FEC (fec.go, OO_SCREEN_FEC): ЗОВНІ від NACK responder-а (той кешує вже
+	// перенумеровані RED-пакети) і ВСЕРЕДИНІ від розширень заголовка (захищені
+	// байти = мережеві). Порядок Add визначає вкладеність: останній — зовнішній.
+	addFECInterceptor(i)
 	if err := webrtc.ConfigureSimulcastExtensionHeaders(m); err != nil {
 		return err
 	}

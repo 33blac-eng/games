@@ -744,6 +744,10 @@ func newAPI(profile string) (*webrtc.API, error) {
 	if err := registerAudioCodec(m); err != nil {
 		return nil, err
 	}
+	// red+ulpfec — лише під OO_SCREEN_FEC (fec.go).
+	if err := registerFECCodecs(m); err != nil {
+		return nil, err
+	}
 
 	i := &interceptor.Registry{}
 	if err := registerHubInterceptors(m, i); err != nil {
@@ -1052,6 +1056,9 @@ func handleOffer(leg string) http.HandlerFunc {
 			http.Error(w, "bad offer sdp", http.StatusBadRequest)
 			log.Printf("offer/%s: SetRemoteDescription: %v", leg, err)
 			return
+		}
+		if leg == "viewer" {
+			bindViewerFEC(pc)
 		}
 		answer, err := pc.CreateAnswer(nil)
 		if err != nil {

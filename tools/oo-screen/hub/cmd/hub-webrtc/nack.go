@@ -114,6 +114,9 @@ func onNack(ns *nodeSession, vl *viewerLeg, n *rtcp.TransportLayerNack, now time
 		return nackStats{}
 	}
 	highest := uint16(atomic.LoadUint32(&vl.lastSeq))
+	if h, ok := fecHighestSeq(n.MediaSSRC); ok {
+		highest = h // FEC (fec.go) зсунув вихідні seq уперед
+	}
 	window := nackWindowFor(sent)
 
 	var req, hit uint64
