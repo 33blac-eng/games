@@ -131,24 +131,33 @@ func TestSubscribeRevoke_UserKind(t *testing.T) {
 // таймер тікає по ~15,6 мс, і 60 мс сну давали лише один запит при справному
 // коді. Лічильник atomic — обробник httptest біжить у своїй горутині.
 func TestSubscribeRevoke_HTTPErrorDoesNotKillLoop(t *testing.T) {
+	// Лічильник атомарний: handler живе в горутинах httptest-сервера, а тест
+	// читає його зі своєї. Замість сну на «мабуть устигне» — чекаємо події:
+	// другий запит ПІСЛЯ 500 і є доказом, що цикл пережив помилку.
 	var hits atomic.Int32
+	second := make(chan struct{})
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		hits.Add(1)
+		if hits.Add(1) == 2 {
+			close(second)
+		}
 		http.Error(w, "boom", http.StatusInternalServerError)
 	}))
 	defer srv.Close()
 
 	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	go SubscribeRevoke(ctx, srv.URL, "secret-key", 5*time.Millisecond, func(kind, val string) {})
+	stopped := make(chan struct{})
+	go func() {
+		SubscribeRevoke(ctx, srv.URL, "secret-key", 5*time.Millisecond, func(kind, val string) {})
+		close(stopped)
+	}()
 
-	deadline := time.Now().Add(2 * time.Second)
-	for hits.Load() < 2 && time.Now().Before(deadline) {
-		time.Sleep(5 * time.Millisecond)
+	select {
+	case <-second:
+	case <-time.After(10 * time.Second):
+		t.Fatalf("expected loop to keep polling despite 500s, got %d hits", hits.Load())
 	}
-	if n := hits.Load(); n < 2 {
-		t.Fatalf("expected loop to keep polling despite 500s, got %d hits", n)
-	}
+	cancel()
+	<-stopped
 }
 
 // C5: запис черги відкликань розбирається в один із трьох наказів. Обидва поля

@@ -122,12 +122,19 @@ func onNack(ns *nodeSession, vl *viewerLeg, n *rtcp.TransportLayerNack, now time
 		return nackStats{}
 	}
 	highest := uint16(atomic.LoadUint32(&vl.lastSeq))
-	window := nackWindowFor(sent)
+	if h, ok := fecHighestSeq(n.MediaSSRC); ok {
+		highest = h // FEC (fec.go) зсунув вихідні seq уперед
+	}
+	// Вікно — у тому ж просторі seq, що й highest: з FEC буфер responder-а
+	// тримає і медіа, і FEC, тож міряємо вихідним лічильником, не vl.sent.
+	window := nackWindowFor(legOutSent(vl, n.MediaSSRC))
 
 	var req, hit uint64
+	var seqs []uint16
 	for i := range n.Nacks {
 		n.Nacks[i].Range(func(seq uint16) bool {
 			req++
+			seqs = append(seqs, seq)
 			if nackRecoverable(highest, seq, window) {
 				hit++
 			}
@@ -140,6 +147,11 @@ func onNack(ns *nodeSession, vl *viewerLeg, n *rtcp.TransportLayerNack, now time
 
 	ns.mu.Lock()
 	defer ns.mu.Unlock()
+	// P1: NACK під час проби — наслідок нашого ж навантаження (probe.go); у
+	// preLoss B4 він не йде, інакше невдала проба різала б ціль відео.
+	if !vl.noteProbeNack(len(seqs), now) {
+		vl.noteNackSeqs(seqs) // B4: втрати до ретрансмісії (legCongestion)
+	}
 	if vl.nackWinAt.IsZero() {
 		vl.nackWinAt = now
 	}

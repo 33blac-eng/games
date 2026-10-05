@@ -159,9 +159,10 @@ func judgeViewerInput(label string, data []byte, ticket, grant string, lim *rate
 	return v, ev, why
 }
 
-// attachViewerInput вішає канал вводу на viewer-ногу. Кличеться ЛИШЕ під
-// прапорцем і ЛИШЕ для ноги з тікетом (див. setupViewerLeg).
-func attachViewerInput(ns *nodeSession, vl *viewerLeg, pc *webrtc.PeerConnection, ticket, grant string) {
+// viewerInputHandler — обробник каналу вводу ноги. Кличеться ЛИШЕ під
+// прапорцем і ЛИШЕ для ноги з тікетом; setupViewerLeg кличе його
+// зі спільного OnDataChannel (pion тримає лише один такий колбек на PC).
+func viewerInputHandler(ns *nodeSession, vl *viewerLeg, ticket, grant string) func(*webrtc.DataChannel) {
 	lim := rate.NewLimiter(inputRatePerSec, inputBurst)
 	// Окремий обмежувач САМОГО ЛОГА: відкинуті події — це рівно той випадок,
 	// коли їх багато, і writeln на кожну перетворив би захист від флуду на
@@ -189,11 +190,8 @@ func attachViewerInput(ns *nodeSession, vl *viewerLeg, pc *webrtc.PeerConnection
 		}
 	}()
 
-	pc.OnDataChannel(func(dc *webrtc.DataChannel) {
+	return func(dc *webrtc.DataChannel) {
 		label := dc.Label()
-		if label != inputChannelLabel && label != inputMoveChannelLabel {
-			return
-		}
 		log.Printf("input: viewer channel %s open [node=%s]", label, ns.nodeID)
 		// lim — один на обидва канали: стеля подій на КЛІЄНТА, а не на канал,
 		// інакше другий канал подвоював би її.
@@ -202,6 +200,7 @@ func attachViewerInput(ns *nodeSession, vl *viewerLeg, pc *webrtc.PeerConnection
 			verdict, ev, why := judgeViewerInput(label, msg.Data, ticket, grant, lim, now)
 			switch verdict {
 			case inputAccept:
+				vl.audit.Count("input_accepted", 1)
 				// F-39: людина клацає — отже, дивиться. Знімаємо прихованість,
 				// навіть якщо її POST /viewer/visibility загубився або прийшов
 				// не в тому порядку. Це страховка в бік «слати», а не «різати».
@@ -212,15 +211,17 @@ func attachViewerInput(ns *nodeSession, vl *viewerLeg, pc *webrtc.PeerConnection
 						"події глядача летять у нікуди (ПК розкочено без -input?)", ns.nodeID)
 				}
 			case inputDrop:
+				vl.audit.Count("input_dropped", 1)
 				if logLim.AllowN(now, 1) {
 					log.Printf("input: подію відкинуто [node=%s]: %s", ns.nodeID, why)
 				}
 			case inputKill:
+				vl.audit.Count("input_killed", 1)
 				log.Printf("input: РВУ СЕСІЮ ГЛЯДАЧА [node=%s]: %s", ns.nodeID, why)
 				dropViewer(ns, vl, "input: "+why)
 			}
 		})
-	})
+	}
 }
 
 // releaseAllEvent — подія протоколу вводу агента (agent/input.KindReleaseAll).
@@ -257,3 +258,15 @@ func sendInputToAgent(ns *nodeSession, ev []byte) bool {
 // inputSendErrLim — тротлінг логу невдалих Send: одна подія миші = один рядок
 // давало 534 записи за 72 год на кожному реконекті агента (H-09).
 var inputSendErrLim = rate.NewLimiter(rate.Every(5*time.Second), 1)
+
+// attachViewerInput — самостійний OnDataChannel лише для каналів вводу. Прод
+// (setupViewerLeg) диспетчеризує зі спільного колбека через viewerInputHandler;
+// ця обгортка лишилась для тестів, що піднімають лише ввід на голому PC.
+func attachViewerInput(ns *nodeSession, vl *viewerLeg, pc *webrtc.PeerConnection, ticket, grant string) {
+	h := viewerInputHandler(ns, vl, ticket, grant)
+	pc.OnDataChannel(func(dc *webrtc.DataChannel) {
+		if l := dc.Label(); l == inputChannelLabel || l == inputMoveChannelLabel {
+			h(dc)
+		}
+	})
+}

@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"testing"
+	"time"
 
 	"github.com/pion/webrtc/v4"
 
@@ -39,19 +40,19 @@ func TestLockedAgentLeavesReadyNodes(t *testing.T) {
 	if !inReady() {
 		t.Fatalf("нода з агентом мусить бути в /nodes до будь-якого сигналу")
 	}
-	handleAgentCtl(ns, []byte("resume"))
-	handleAgentCtl(ns, []byte("{битий"))
+	handleAgentCtl(ns, []byte("resume"), time.Now())
+	handleAgentCtl(ns, []byte("{битий"), time.Now())
 	if !inReady() {
 		t.Fatalf("сміття в каналі прибрало ноду з /nodes")
 	}
-	handleAgentCtl(ns, ctlBytes(t, control.FallbackReason(1, "session-locked")))
+	handleAgentCtl(ns, ctlBytes(t, control.FallbackReason(1, "session-locked")), time.Now())
 	if inReady() {
 		t.Fatalf("агент сказав session-locked, а нода досі в /nodes")
 	}
 	if got := reg.unavailableNodes()["lock-ready"]; got != "session-locked" {
 		t.Fatalf("причина не дійшла в /nodes: %q", got)
 	}
-	handleAgentCtl(ns, ctlBytes(t, control.FallbackReason(2, "")))
+	handleAgentCtl(ns, ctlBytes(t, control.FallbackReason(2, "")), time.Now())
 	if !inReady() {
 		t.Fatalf("агент розблокувався, а нода не повернулась у /nodes")
 	}

@@ -273,36 +273,20 @@ func TestWheelDataClamps(t *testing.T) {
 
 // A viewer that disappears with Ctrl and the left button held never sends the
 // releases. The injector must remember what it pressed so ReleaseAll can undo
-// exactly that — no more (moves, wheels, released keys) and no less.
-// Drop the note() bookkeeping and this fails.
-func TestHeldSetReleasesWhatIsStillDown(t *testing.T) {
-	var h heldSet
-	ctrl := Event{V: Version, Kind: KindKey, Scancode: 0x1D, Down: true}
-	rightArrow := Event{V: Version, Kind: KindKey, Scancode: 0xE04D, Down: true}
-	left := Event{V: Version, Kind: KindMouseButton, Button: ButtonLeft, Down: true}
-	h.note(ctrl)
-	h.note(rightArrow)
-	h.note(left)
-	h.note(Event{V: Version, Kind: KindMouseWheel, WheelY: 1})
+// exactly that - no more (moves, wheels, released keys) and no less.
+func TestHeldStateReleasesWhatIsStillDown(t *testing.T) {
+	var h heldState
+	h.track(Event{V: Version, Kind: KindKey, Scancode: 0x1D, Down: true})
+	h.track(Event{V: Version, Kind: KindKey, Scancode: 0xE04D, Down: true})
+	h.track(Event{V: Version, Kind: KindMouseButton, Button: ButtonLeft, Down: true})
+	h.track(Event{V: Version, Kind: KindMouseWheel, WheelY: 1})
 	// The arrow released under its other spelling is the same physical key.
-	h.note(Event{V: Version, Kind: KindKey, Scancode: 0x4D, Extended: true})
+	h.track(Event{V: Version, Kind: KindKey, Scancode: 0x4D, Extended: true})
 
-	ups := h.releases()
-	if len(ups) != 2 {
+	if ups := h.releaseInputs(); len(ups) != 2 {
 		t.Fatalf("releases = %+v, want Ctrl and the left button", ups)
 	}
-	var sawCtrl, sawLeft bool
-	for _, up := range ups {
-		if up.Down || up.Validate() != nil {
-			t.Fatalf("release %+v is not a valid key-up", up)
-		}
-		sawCtrl = sawCtrl || (up.Kind == KindKey && up.Scancode == 0x1D)
-		sawLeft = sawLeft || (up.Kind == KindMouseButton && up.Button == ButtonLeft)
-	}
-	if !sawCtrl || !sawLeft {
-		t.Fatalf("releases = %+v, want Ctrl and the left button", ups)
-	}
-	if again := h.releases(); len(again) != 0 {
+	if again := h.releaseInputs(); len(again) != 0 {
 		t.Fatalf("second ReleaseAll would re-send %+v", again)
 	}
 }

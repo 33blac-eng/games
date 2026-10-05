@@ -70,6 +70,26 @@ typedef struct {
      * identical to the previous frame, but the composited cursor moved. */
     int32_t mouse_only;
     uint32_t accumulated_frames;
+
+    /* Gap #2 (RESEARCH-leaders.md): what DXGI says changed in this frame.
+     * rects_valid=0 means DXGI gave no metadata for a real present, so the
+     * whole output must be assumed dirty (dirty_area is then the full area).
+     * Move-rect area counts the DESTINATION rectangles. Areas are clipped to
+     * the output and summed (DXGI rects of one kind do not overlap). */
+    int32_t rects_valid;
+    int32_t dirty_count;
+    int32_t move_count;
+    int64_t dirty_area;
+    int64_t move_area;
+
+    /* 1 when nothing visible changed: zero dirty AND zero move rects (or no
+     * present at all) AND the pointer position/visibility/shape are the same
+     * as last frame. Such a frame is NOT converted: the NV12 texture still
+     * holds the previous image and y/uv are NULL. The consumer should skip it. */
+    int32_t no_change;
+
+    /* Cursor layer: bumps whenever DXGI delivered a new pointer shape. */
+    uint32_t cursor_shape_seq;
 } oos_frame;
 
 /* Creates the pipeline for output `output_idx` of adapter 0.
@@ -93,6 +113,12 @@ int oos_gdi_next(oos_cap *c, oos_frame *frame, char *err, int32_t err_len);
 
 void oos_close(oos_cap *c);
 
+/* Text tiles: one-shot CPU readback of the current BGRA desktop (pointer
+ * composited) into dst (dst_pitch >= width*4, height rows). Uses its own
+ * staging texture, released before returning. OOS_OK / OOS_ERROR /
+ * OOS_ACCESS_LOST. */
+int oos_read_bgra(oos_cap *c, uint8_t *dst, int32_t dst_pitch, char *err, int32_t err_len);
+
 /* Dimensions of the duplicated output (texture orientation, not rotated). */
 int32_t oos_width(oos_cap *c);
 int32_t oos_height(oos_cap *c);
@@ -113,6 +139,16 @@ void   *oos_device(oos_cap *c);
 void   *oos_nv12_texture(oos_cap *c);
 void oos_suspend(oos_cap *c);   /* A-17: drop only the duplication; oos_next re-duplicates lazily */
 void    oos_set_readback(oos_cap *c, int32_t enable);
+
+/* Cursor layer: enable=1 stops compositing the pointer into the image (both
+ * DXGI and GDI paths) and makes pointer-only updates no_change frames. */
+void    oos_set_cursor_layer(oos_cap *c, int32_t enable);
+/* Copies the cached raw DXGI pointer shape (BGRA / mono masks, `pitch` bytes
+ * per row; mono `h` counts both masks). OOS_ERROR: no shape yet.
+ * OOS_INVALID_CALL: `cap` too small, *len holds the size needed. */
+int     oos_cursor_shape(oos_cap *c, int32_t *type, int32_t *w, int32_t *h,
+                         int32_t *pitch, int32_t *hot_x, int32_t *hot_y,
+                         uint8_t *buf, uint32_t cap, uint32_t *len, uint32_t *seq);
 int64_t oos_cpu_maps(oos_cap *c);
 
 /* Number of outputs on adapter 0; <0 on failure. */
@@ -121,6 +157,10 @@ int32_t oos_output_count(void);
 /* Size (desktop coordinates) and primary-flag of output `idx` on adapter 0,
  * without opening a duplication. OOS_OK or OOS_ERROR. */
 int oos_output_info(int32_t idx, int32_t *width, int32_t *height, int32_t *primary);
+
+/* DesktopCoordinates of output `idx` on adapter 0 (virtual-desktop pixels),
+ * without opening a duplication. OOS_OK or OOS_ERROR. */
+int oos_output_rect(int32_t idx, int32_t *left, int32_t *top, int32_t *right, int32_t *bottom);
 
 #ifdef __cplusplus
 }

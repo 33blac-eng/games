@@ -18,6 +18,7 @@ import (
 	"bufio"
 	"bytes"
 	"log"
+	"time"
 
 	"github.com/organicoils/oo-screen/internal/control"
 )
@@ -39,9 +40,11 @@ func (ns *nodeSession) unavailableReason() string {
 	return ns.unavailable
 }
 
-// handleAgentCtl — одне повідомлення агента в "oosc-ctl". Нерозпізнане
-// ігнорується мовчки: канал спільний із гейтом і пульсом, рвати його нема за що.
-func handleAgentCtl(ns *nodeSession, data []byte) {
+// handleAgentCtl — одне повідомлення агента в "oosc-ctl": fallback_reason
+// (причина «нода недоступна») і content_mode (режим «Відео», videoboost.go).
+// Нерозпізнане ігнорується мовчки: канал спільний із гейтом і пульсом, рвати
+// його нема за що.
+func handleAgentCtl(ns *nodeSession, data []byte, now time.Time) {
 	if len(data) == 0 || data[0] != '{' {
 		return
 	}
@@ -49,8 +52,13 @@ func handleAgentCtl(ns *nodeSession, data []byte) {
 		data = append(bytes.Clone(data), '\n')
 	}
 	m, err := control.Read(bufio.NewReader(bytes.NewReader(data)))
-	if err != nil || m.Type != control.TypeFallbackReason {
+	if err != nil {
 		return
 	}
-	setAgentUnavailable(ns, m.Reason)
+	switch m.Type {
+	case control.TypeFallbackReason:
+		setAgentUnavailable(ns, m.Reason)
+	case control.TypeContentMode:
+		onContentMode(ns, m.Mode, now)
+	}
 }

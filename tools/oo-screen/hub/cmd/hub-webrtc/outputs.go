@@ -23,6 +23,7 @@ import (
 	"encoding/json"
 	"log"
 	"net/http"
+	"os"
 	"sync/atomic"
 
 	"github.com/organicoils/oo-screen/internal/control"
@@ -52,6 +53,9 @@ type controlResp struct {
 	Active        int          `json:"active"`
 	MaxBitrateBps *uint64      `json:"max_bitrate_bps"`
 	MaxFps        *int         `json:"max_fps"`
+	// Streams — F6: монітори, що публікуються одночасно (0 = основний потік).
+	// Порожнє без OO_SCREEN_MULTIMON — плеєр тоді не пропонує side-by-side.
+	Streams []int `json:"streams,omitempty"`
 }
 
 // maxFpsCeil — верх стелі кадрів/с (C1). Ним же знімається стеля в агента:
@@ -148,9 +152,20 @@ func handleControl(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	ns, _, status, msg := authorizeViewer(req.offerReq)
+	// select_output — команда ОСНОВНОМУ потоку ноди; потоки моніторів F6
+	// закріплені за своїм монітором і перемикати їх нема чого.
+	req.Monitor = 0
+	ns, claims, status, msg := authorizeViewer(req.offerReq)
 	if status != 0 {
 		http.Error(w, msg, status)
+		return
+	}
+	// SEC #26: перемикання монітора міняє картинку ВСІМ глядачам ноди. За
+	// OO_SCREEN_CONTROL_REQUIRES_INPUT=1 — лише квиток із grant=control (той
+	// самий, що відчиняє ввід). Дефолт — як було: ERP-консоль може слати сюди
+	// view-квитки.
+	if controlRequiresInput() && (claims == nil || claims.Grant != grantControl) {
+		http.Error(w, "control grant required", http.StatusForbidden)
 		return
 	}
 
@@ -174,6 +189,10 @@ func handleControl(w http.ResponseWriter, r *http.Request) {
 
 	if req.Output != nil {
 		idx := *req.Output
+		if hasMonitorStreams(ns.nodeID) {
+			http.Error(w, "multimon active: monitors are published as separate streams, select_output disabled", http.StatusConflict)
+			return
+		}
 		if !sendSelectOutput(ns, idx) {
 			http.Error(w, "agent control channel not open", http.StatusConflict)
 			return
@@ -190,6 +209,7 @@ func handleControl(w http.ResponseWriter, r *http.Request) {
 		ns.activeOutput = idx
 		ns.mu.Unlock()
 		log.Printf("select_output [node=%s]: -> %d", ns.nodeID, idx)
+		auditControl(ns, claims, "select_output", idx)
 	}
 
 	ns.mu.Lock()
@@ -241,5 +261,12 @@ func handleControl(w http.ResponseWriter, r *http.Request) {
 		sendMaxFps(ns, maxFpsCeil)
 	}
 
-	writeJSON(w, outputsSnapshot(ns))
+	resp := outputsSnapshot(ns)
+	resp.Streams = liveStreams(ns.nodeID)
+	writeJSON(w, resp)
+}
+
+// controlRequiresInput — SEC #26, env OO_SCREEN_CONTROL_REQUIRES_INPUT=1.
+func controlRequiresInput() bool {
+	return os.Getenv("OO_SCREEN_CONTROL_REQUIRES_INPUT") == "1"
 }

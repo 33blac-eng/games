@@ -1,0 +1,4 @@
+IDLE nodes=1 rssMB=19.6 goroutines=30 threads=8
+IDLE nodes=10 rssMB=29.5 goroutines=201 threads=8
+IDLE nodes=50 rssMB=83.4 goroutines=961 threads=8
+IDLE nodes=100 rssMB=191.2 goroutines=1911 threads=9

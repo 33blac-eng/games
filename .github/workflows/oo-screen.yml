@@ -1,0 +1,167 @@
+name: oo-screen
+
+on:
+  push:
+    paths:
+      - "tools/oo-screen/**"
+      - "total-erp-app/resources/js/remote/**"
+      - ".github/workflows/oo-screen.yml"
+  pull_request:
+    paths:
+      - "tools/oo-screen/**"
+      - "total-erp-app/resources/js/remote/**"
+      - ".github/workflows/oo-screen.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: oo-screen-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # go.mod pins `toolchain go1.26.8` (patched stdlib); auto lets go fetch it
+  # if setup-go installed an older 1.26.x.
+  GOTOOLCHAIN: auto
+
+defaults:
+  run:
+    shell: bash
+    working-directory: tools/oo-screen
+
+jobs:
+  linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: tools/oo-screen/go.mod
+          cache: true
+          cache-dependency-path: tools/oo-screen/go.sum
+      - name: go vet
+        run: go vet ./...
+      - name: go test -race
+        run: go test -race -count=1 ./...
+      - name: gofmt (CRLF-tolerant)
+        # Sources use CRLF; ci/gofmt-check.sh strips CR before gofmt -l so only
+        # real formatting issues fail.
+        run: ./ci/gofmt-check.sh
+
+  windows-cross:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: tools/oo-screen/go.mod
+          cache: true
+          cache-dependency-path: tools/oo-screen/go.sum
+      - name: Install mingw-w64
+        run: sudo apt-get update && sudo apt-get install -y gcc-mingw-w64-x86-64
+      - name: Cross build, vet agent, compile agent tests (windows/amd64, cgo)
+        run: ./ci/windows-cross.sh
+      - name: S6 sign agent update manifest (only when signing secret is set)
+        # Secrets cannot be used in `if:`; the guard is in the script. Forks
+        # and PRs without the secret skip signing and stay green.
+        env:
+          OO_UPDATE_SIGNING_KEY: ${{ secrets.OO_UPDATE_SIGNING_KEY }}
+          OO_UPDATE_PUBKEY: ${{ vars.OO_UPDATE_PUBKEY }}
+        run: |
+          if [ -z "${OO_UPDATE_SIGNING_KEY}" ]; then
+            echo "OO_UPDATE_SIGNING_KEY not set - skipping manifest signing"
+            exit 0
+          fi
+          ver="0.0.${GITHUB_RUN_NUMBER}"
+          mkdir -p dist
+          CGO_ENABLED=1 GOOS=windows GOARCH=amd64 CC=x86_64-w64-mingw32-gcc \
+            go build -trimpath -ldflags "-s -w -H windowsgui -X main.agentVersion=${ver} -X main.updatePubKey=${OO_UPDATE_PUBKEY}" \
+            -o dist/oo-agent-windows-amd64.exe ./agent/cmd/oo-agent
+          go run ./agent/cmd/oo-update-sign -exe dist/oo-agent-windows-amd64.exe -version "${ver}" \
+            -url "oo-agent-${ver}.exe" -rollout 0 -out dist/manifest.json
+          # rollout 0 + relative URL: CI never ships; a release operator re-signs
+          # with the real URL and widens the rollout.
+
+  windows-native:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: tools/oo-screen/go.mod
+          cache: true
+          cache-dependency-path: tools/oo-screen/go.sum
+      - name: go test ./agent/...
+        # Hosted runners have no GPU; DXGI/MFT probes skip on ErrNotAvailable.
+        env:
+          CGO_ENABLED: "1"
+        run: go test -count=1 ./agent/...
+
+  js:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: total-erp-app/resources/js/remote
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: node --check
+        run: for f in *.js; do echo "check $f"; node --check "$f"; done
+      - name: Run tests
+        run: for t in __tests__/*.mjs; do echo "== $t"; node "$t"; done
+
+  bench-python:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: tools/oo-screen/bench/quality
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install deps
+        run: |
+          sudo apt-get update && sudo apt-get install -y ffmpeg
+          python -m pip install numpy pillow
+      - name: unittest
+        run: python -m unittest discover -v
+
+  deploy-scripts:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: bash -n
+        run: for f in deploy/*.sh deploy/test/*.sh ci/*.sh; do bash -n "$f"; done
+      - name: shellcheck
+        run: shellcheck deploy/*.sh deploy/test/*.sh ci/*.sh
+      - name: hub-deploy test
+        run: bash deploy/test/hub-deploy-test.sh
+      - name: hub-deploy security test
+        run: bash deploy/test/hub-deploy-sec2-test.sh
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: tools/oo-screen/go.mod
+      - name: agent-rollout test
+        run: bash deploy/test/agent-rollout-test.sh
+
+  govulncheck:
+    # Blocking. Runs on the toolchain pinned in go.mod (go1.26.8), the same one
+    # release builds use, so stdlib advisories fixed by a patch bump show up as
+    # a red build until go.mod's toolchain line is raised.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: tools/oo-screen/go.mod
+          cache: true
+          cache-dependency-path: tools/oo-screen/go.sum
+      - name: govulncheck
+        run: |
+          go version
+          go install golang.org/x/vuln/cmd/govulncheck@latest
+          "$(go env GOPATH)/bin/govulncheck" ./...

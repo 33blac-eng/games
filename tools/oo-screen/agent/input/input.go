@@ -475,60 +475,8 @@ func wheelData(notches float64) uint32 {
 type Injector struct {
 	mu      sync.Mutex
 	surface Bounds
-	held    heldSet
-}
-
-// heldKey identifies one physical key or button, whatever form the sender used
-// to name it (0xE04D and 0x4D+extended are the same arrow key).
-type heldKey struct {
-	kind     Kind
-	button   Button
-	scancode uint16
-	extended bool
-	unicode  rune
-}
-
-// heldSet tracks what is currently pressed through this injector, so that
-// ReleaseAll can undo it. Pure bookkeeping, no Win32: tested on any OS.
-type heldSet map[heldKey]Event
-
-func keyOf(ev Event) heldKey {
-	k := heldKey{kind: ev.Kind, button: ev.Button}
-	if ev.Kind == KindKey {
-		if ev.Scancode != 0 {
-			k.scancode, k.extended = normalizeScancode(ev.Scancode, ev.Extended)
-		} else {
-			k.unicode = ev.Unicode
-		}
-	}
-	return k
-}
-
-// note records a press and forgets a release. Moves and wheels hold nothing.
-func (h *heldSet) note(ev Event) {
-	if ev.Kind != KindKey && ev.Kind != KindMouseButton {
-		return
-	}
-	k := keyOf(ev)
-	if !ev.Down {
-		delete(*h, k)
-		return
-	}
-	if *h == nil {
-		*h = heldSet{}
-	}
-	up := Event{V: Version, Kind: ev.Kind, Button: ev.Button, Scancode: ev.Scancode, Extended: ev.Extended, Unicode: ev.Unicode}
-	(*h)[k] = up
-}
-
-// releases returns the release event for everything held and forgets it all.
-func (h *heldSet) releases() []Event {
-	out := make([]Event, 0, len(*h))
-	for _, up := range *h {
-		out = append(out, up)
-	}
-	*h = nil
-	return out
+	held    heldState          // SEC #37: pressed and not yet released (held.go)
+	blocked map[keyID]struct{} // OO_AGENT_INPUT_BLOCK_KEYS
 }
 
 // New reports whether input injection is possible before the first event
@@ -538,7 +486,11 @@ func New() (*Injector, error) {
 	if err := checkAvailable(); err != nil {
 		return nil, err
 	}
-	return &Injector{}, nil
+	blocked, err := blockedKeysFromEnv()
+	if err != nil {
+		return nil, err
+	}
+	return &Injector{blocked: blocked}, nil
 }
 
 // SetSurface declares which rectangle of the virtual desktop the operator's
@@ -582,29 +534,16 @@ func (in *Injector) Inject(ev Event) error {
 	if ev.Kind == KindReleaseAll {
 		return in.ReleaseAll()
 	}
+	if in.isBlocked(ev) {
+		return ErrKeyBlocked
+	}
 	err := in.inject(ev)
 	// A press Windows refused is not held; a release is forgotten either way,
 	// or ReleaseAll would keep retrying a key that is already up.
 	if err == nil || !ev.Down {
 		in.mu.Lock()
-		in.held.note(ev)
+		in.held.track(ev)
 		in.mu.Unlock()
 	}
 	return err
-}
-
-// ReleaseAll sends a release for every key and button still held through this
-// injector. The agent calls it when the input channel closes; the hub asks for
-// it (KindReleaseAll) when a controlling viewer leaves.
-func (in *Injector) ReleaseAll() error {
-	in.mu.Lock()
-	ups := in.held.releases()
-	in.mu.Unlock()
-	var first error
-	for _, up := range ups {
-		if err := in.inject(up); err != nil && first == nil {
-			first = err
-		}
-	}
-	return first
 }

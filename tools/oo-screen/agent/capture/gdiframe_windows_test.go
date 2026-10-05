@@ -5,6 +5,8 @@ package capture
 import (
 	"context"
 	"errors"
+	"regexp"
+	"strconv"
 	"testing"
 	"time"
 )
@@ -26,7 +28,7 @@ func TestGDIFrameOnStaticScreen(t *testing.T) {
 
 	c, err := New(0)
 	if err != nil {
-		if errors.Is(err, ErrNotAvailable) {
+		if errors.Is(err, ErrNotAvailable) || isEnvironmentHR(err) {
 			t.Skipf("Desktop Duplication тут недоступний: %v", err)
 		}
 		t.Fatalf("New(0): %v", err)
@@ -90,4 +92,31 @@ func anyNonZero(b []byte) bool {
 		}
 	}
 	return false
+}
+
+// environmentHRs — HRESULT-и, якими DXGI відповідає, коли дублікації тут
+// фізично немає (GPU-less CI-раннер, Microsoft Basic Display Adapter, сесія без
+// виходів), а не коли наш код зламаний. Решта помилок New лишаються Fatalf.
+var environmentHRs = map[uint32]string{
+	0x887A0002: "DXGI_ERROR_NOT_FOUND",
+	0x887A0004: "DXGI_ERROR_UNSUPPORTED",
+	0x887A0022: "DXGI_ERROR_NOT_CURRENTLY_AVAILABLE",
+	0x887A0028: "DXGI_ERROR_SESSION_DISCONNECTED",
+}
+
+var hrPattern = regexp.MustCompile(`hr=0x([0-9A-Fa-f]{8})`)
+
+// isEnvironmentHR читає hr=0x... з повідомлення dxgi.c (set_err) і перевіряє,
+// чи це одна з відомих «середовищних» відмов.
+func isEnvironmentHR(err error) bool {
+	m := hrPattern.FindStringSubmatch(err.Error())
+	if m == nil {
+		return false
+	}
+	hr, perr := strconv.ParseUint(m[1], 16, 32)
+	if perr != nil {
+		return false
+	}
+	_, ok := environmentHRs[uint32(hr)]
+	return ok
 }

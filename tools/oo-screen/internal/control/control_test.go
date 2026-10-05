@@ -94,7 +94,7 @@ func TestReadKnownSkipsUnknownTypes(t *testing.T) {
 func TestIsKnownType(t *testing.T) {
 	for _, ty := range []string{
 		TypeHello, TypeDecoderReady, TypeKeyframeRequest, TypeEpochChange,
-		TypeHeartbeat, TypeBitrateTarget, TypeSelectOutput, TypeFallbackReason, TypeShutdown, TypeAck,
+		TypeHeartbeat, TypeBitrateTarget, TypeSelectOutput, TypeFallbackReason, TypeShutdown, TypeAck, TypeContentMode,
 	} {
 		if !IsKnownType(ty) {
 			t.Errorf("expected %q to be known", ty)

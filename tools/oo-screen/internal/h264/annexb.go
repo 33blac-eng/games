@@ -148,6 +148,23 @@ type SPS struct {
 	ConstraintFlags byte
 	LevelIDC        byte
 	Width, Height   int
+
+	// VUI (Annex E). VUIPresent=false -> решта полів нульові.
+	VUIPresent bool
+	// VideoSignalTypePresent — video_signal_type_present_flag.
+	VideoSignalTypePresent bool
+	VideoFormat            int  // 5 = unspecified (дефолт, коли поля нема)
+	FullRange              bool // video_full_range_flag
+	// ColourDescriptionPresent — colour_description_present_flag; без нього
+	// декодер/браузер вгадує колірний простір (часто BT.601).
+	ColourDescriptionPresent bool
+	ColourPrimaries          int // 1 = BT.709
+	TransferCharacteristics  int // 1 = BT.709
+	MatrixCoefficients       int // 1 = BT.709
+
+	// vuiFlagPos — бітова позиція vui_parameters_present_flag у RBSP
+	// (після nal-заголовка). Потрібна RewriteSPSColourBT709.
+	vuiFlagPos int
 }
 
 // ProfileLevelID — hex-рядок для SDP profile-level-id та avc1-кодек-стрінга.
@@ -246,6 +263,34 @@ func ParseSPS(nal []byte) (*SPS, error) {
 	cropL, cropR, cropT, cropB := 0, 0, 0, 0
 	if br.bits(1) == 1 { // frame_cropping_flag
 		cropL, cropR, cropT, cropB = br.ue(), br.ue(), br.ue(), br.ue()
+	}
+	s.vuiFlagPos = br.pos
+	if br.bits(1) == 1 { // vui_parameters_present_flag
+		s.VUIPresent = true
+		if br.bits(1) == 1 { // aspect_ratio_info_present_flag
+			if br.bits(8) == 255 { // Extended_SAR
+				br.bits(16)
+				br.bits(16)
+			}
+		}
+		if br.bits(1) == 1 { // overscan_info_present_flag
+			br.bits(1)
+		}
+		s.VideoFormat = 5
+		s.ColourPrimaries, s.TransferCharacteristics, s.MatrixCoefficients = 2, 2, 2
+		if br.bits(1) == 1 { // video_signal_type_present_flag
+			s.VideoSignalTypePresent = true
+			s.VideoFormat = br.bits(3)
+			s.FullRange = br.bits(1) == 1
+			if br.bits(1) == 1 { // colour_description_present_flag
+				s.ColourDescriptionPresent = true
+				s.ColourPrimaries = br.bits(8)
+				s.TransferCharacteristics = br.bits(8)
+				s.MatrixCoefficients = br.bits(8)
+			}
+		}
+		// решта VUI (chroma loc, timing, HRD, bitstream_restriction) нам не
+		// потрібна: переписувач копіює її біт-у-біт.
 	}
 	if br.err != nil {
 		return nil, br.err

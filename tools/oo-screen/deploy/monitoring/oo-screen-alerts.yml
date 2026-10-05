@@ -1,0 +1,99 @@
+# O1: Prometheus alert rules for hub-webrtc /metrics (OO_SCREEN_METRICS_ADDR).
+# Load via prometheus.yml `rule_files: [oo-screen-alerts.yml]`.
+# Validate: promtool check rules oo-screen-alerts.yml
+# Every metric name here is checked against metrics.go by
+# hub/cmd/hub-webrtc/monitoring_test.go, so a rename breaks CI, not on-call.
+# Thresholds follow TZ-GENERAL.md section 4 targets; they are starting points,
+# NOT tuned on production traffic yet.
+groups:
+  - name: oo-screen-hub
+    rules:
+      - alert: OoScreenHubDown
+        expr: up{job="oo-screen-hub"} == 0
+        for: 2m
+        labels: {severity: critical}
+        annotations:
+          summary: "oo-screen hub /metrics unreachable on {{ $labels.instance }}"
+
+      - alert: OoScreenAgentNoVideo
+        # Viewers are watching, the agent leg is up, but no frames arrive.
+        expr: oo_hub_viewers > 0 and oo_hub_node_agent_connected == 1 and oo_hub_agent_fps == 0
+        for: 30s
+        labels: {severity: warning}
+        annotations:
+          summary: "Node {{ $labels.node }}: viewers connected but agent sends 0 fps"
+
+      - alert: OoScreenViewerHighLoss
+        expr: oo_hub_viewer_loss_fraction_max > 0.05
+        for: 2m
+        labels: {severity: warning}
+        annotations:
+          summary: "Node {{ $labels.node }}: viewer packet loss {{ $value | humanizePercentage }} (>5% for 2m)"
+
+      - alert: OoScreenViewerHighRTT
+        expr: oo_hub_viewer_rtt_seconds_max > 0.25
+        for: 5m
+        labels: {severity: warning}
+        annotations:
+          summary: "Node {{ $labels.node }}: viewer RTT {{ $value | humanizeDuration }} (>250ms for 5m)"
+
+      - alert: OoScreenKeyframeStorm
+        # Many IDRs/min = loss recovery loop; costs bandwidth and quality.
+        expr: oo_hub_agent_keyframes_per_minute > 20
+        for: 5m
+        labels: {severity: warning}
+        annotations:
+          summary: "Node {{ $labels.node }}: {{ $value }} keyframes/min"
+
+      - alert: OoScreenNackUnanswered
+        expr: |
+          rate(oo_hub_nack_unanswered_total[5m])
+            / clamp_min(rate(oo_hub_nack_requested_total[5m]), 1) > 0.2
+        for: 10m
+        labels: {severity: warning}
+        annotations:
+          summary: "Node {{ $labels.node }}: >20% of NACKs fall outside the retransmit buffer"
+
+      - alert: OoScreenViewerQueueDrops
+        expr: rate(oo_hub_viewer_queue_drops_total[5m]) > 10
+        for: 5m
+        labels: {severity: warning}
+        annotations:
+          summary: "Node {{ $labels.node }}: viewer queue dropping {{ $value }} pkt/s"
+
+      - alert: OoScreenEgressQueueSaturated
+        expr: oo_hub_egress_queue_depth / clamp_min(oo_hub_egress_queue_capacity, 1) > 0.8 or rate(oo_hub_egress_queue_full_total[5m]) > 0
+        for: 2m
+        labels: {severity: critical}
+        annotations:
+          summary: "Hub egress writer queue saturated on {{ $labels.instance }}"
+
+      - alert: OoScreenEgressWriteErrors
+        expr: rate(oo_hub_egress_write_errors_total[5m]) > 1
+        for: 5m
+        labels: {severity: warning}
+        annotations:
+          summary: "Hub UDP write errors {{ $value }}/s"
+
+      - alert: OoScreenSlowFirstFrame
+        # p95 time-to-first-frame over 2 s (target: section 4 TTFF).
+        expr: histogram_quantile(0.95, sum by (le) (rate(oo_hub_viewer_ttff_seconds_bucket[15m]))) > 2
+        for: 15m
+        labels: {severity: warning}
+        annotations:
+          summary: "p95 viewer time-to-first-frame {{ $value }}s (>2s)"
+
+      - alert: OoScreenHubMemoryGrowth
+        # R5: memory must return to baseline; >1 GiB RSS or steady growth.
+        expr: oo_hub_process_resident_memory_bytes > 1073741824 or deriv(oo_hub_heap_alloc_bytes[6h]) > 5000
+        for: 30m
+        labels: {severity: warning}
+        annotations:
+          summary: "Hub memory {{ $value | humanize1024 }} / growing (R5 leak watch)"
+
+      - alert: OoScreenGoroutineLeak
+        expr: oo_hub_goroutines > 5000
+        for: 15m
+        labels: {severity: warning}
+        annotations:
+          summary: "Hub goroutines {{ $value }} (>5000)"

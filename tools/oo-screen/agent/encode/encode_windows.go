@@ -25,6 +25,8 @@ import (
 	"sync"
 	"time"
 	"unsafe"
+
+	"github.com/organicoils/oo-screen/internal/h264"
 )
 
 // Typed errors. Callers switch on these, never on strings.
@@ -361,10 +363,21 @@ func (e *Encoder) drainLocked(buf *C.char, timeoutMS int) ([]AU, error) {
 			C.oos_enc_headers(e.e, &hp, &hl)
 			if hl > 0 {
 				e.headers = C.GoBytes(unsafe.Pointer(hp), C.int(hl))
+				// ТЗ 1.3 / P3 — UNVERIFIED на залізі: явний BT.709 limited у
+				// VUI кешованого SPS. Профіль/рівень не змінюються.
+				if rw, err := h264.RewriteAnnexBSPSColourBT709(e.headers); err == nil {
+					e.headers = rw
+				}
 			}
 			var injected bool
 			if data, injected = withHeaders(data, e.headers); injected {
 				e.headersInjected++
+			} else if hasSPS(data) {
+				// Інбенд-SPS від MFT — той самий перепис (UNVERIFIED на залізі).
+				// Помилка розбору -> AU іде як є, потік не ламаємо.
+				if rw, err := h264.RewriteAnnexBSPSColourBT709(data); err == nil {
+					data = rw
+				}
 			}
 		}
 		out = append(out, AU{
@@ -407,6 +420,24 @@ func (e *Encoder) SetBitrate(bps int) error {
 		return fmt.Errorf("encode: set bitrate %d: %s", bps, C.GoString(buf))
 	}
 	e.cfg.BitrateBps = bps
+	return nil
+}
+
+// SetRefineQP switches the following Encode calls to static-screen refine
+// (ТЗ P4): qp>0 asks the MFT for that per-frame QP and caps MaxQP at it; 0
+// restores normal rate control. The per-sample QP is set even when the MFT
+// refuses MaxQP — that refusal is still returned, so the caller can log it.
+func (e *Encoder) SetRefineQP(qp int) error {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.closed {
+		return ErrClosed
+	}
+	buf := (*C.char)(C.calloc(256, 1))
+	defer C.free(unsafe.Pointer(buf))
+	if C.oos_enc_set_refine_qp(e.e, C.int32_t(qp), buf, 256) != C.OOS_ENC_OK {
+		return fmt.Errorf("encode: set refine qp %d: %s", qp, C.GoString(buf))
+	}
 	return nil
 }
 

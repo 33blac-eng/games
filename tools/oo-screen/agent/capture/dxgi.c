@@ -1,3 +1,5 @@
+//go:build windows
+
 /* dxgi.c — DXGI Desktop Duplication + cursor composite + GPU BGRA->NV12.
  *
  * Pipeline, created once and reused for every frame (Ф0 plan §4):
@@ -86,6 +88,21 @@ struct oos_cap {
      * convert_out must NOT composite the cached DXGI shape on top of it. Set by
      * oos_gdi_next, consumed and cleared by convert_out. */
     int32_t cursor_in_bgra;
+
+    /* Cursor layer (agent -cursor-layer): 1 -> the pointer is NOT composited
+     * into the image (neither DXGI shape nor GDI DrawIconEx); it travels as a
+     * separate shape+position stream. Pointer-only updates are then no-ops.
+     * shape_seq bumps on every new DXGI shape so the consumer knows when to
+     * pull it with oos_cursor_shape. */
+    int32_t cursor_layer;
+    uint32_t shape_seq;
+
+    /* Gap #2: scratch for GetFrameMoveRects/GetFrameDirtyRects, and whether
+     * c->bgra holds a real desktop image yet (a no-op frame is only a no-op
+     * relative to something we already converted). */
+    uint8_t *meta;
+    uint32_t meta_cap;
+    int32_t have_image;
 
     int32_t mapped;
     D3D11_MAPPED_SUBRESOURCE map;
@@ -224,6 +241,7 @@ static HRESULT make_dupl(oos_cap *c)
     HRESULT hr = c->out1->lpVtbl->DuplicateOutput(c->out1,
                                                   (IUnknown *)c->dev, &c->dupl);
     if (FAILED(hr)) return hr;
+    c->have_image = 0;  /* fresh duplication: never call its first frame a no-op */
     c->dupl->lpVtbl->GetDesc(c->dupl, &dd);
     c->width = (int32_t)dd.ModeDesc.Width;
     c->height = (int32_t)dd.ModeDesc.Height;
@@ -306,6 +324,29 @@ int oos_output_info(int32_t idx, int32_t *width, int32_t *height, int32_t *prima
     mi.cbSize = sizeof(mi);
     if (od.Monitor && GetMonitorInfoW(od.Monitor, &mi) && (mi.dwFlags & MONITORINFOF_PRIMARY))
         *primary = 1;
+    return OOS_OK;
+}
+
+/* DesktopCoordinates виходу idx — де він лежить на віртуальному робочому
+ * столі. Для шару курсора: GetCursorInfo дає позицію в координатах
+ * віртуального столу, а DXGI — відносно виходу. Як і oos_output_info, без
+ * дуплікації й без стану капчера — можна кликати з будь-якої горутини. */
+int oos_output_rect(int32_t idx, int32_t *left, int32_t *top, int32_t *right, int32_t *bottom)
+{
+    IDXGIAdapter1 *a = NULL;
+    IDXGIOutput *o = NULL;
+    DXGI_OUTPUT_DESC od;
+
+    if (!left || !top || !right || !bottom || idx < 0) return OOS_ERROR;
+    if (FAILED(default_adapter(&a))) return OOS_ERROR;
+    if (a->lpVtbl->EnumOutputs(a, (UINT)idx, &o) != S_OK) { SAFE_RELEASE(a); return OOS_ERROR; }
+    if (FAILED(o->lpVtbl->GetDesc(o, &od))) { SAFE_RELEASE(o); SAFE_RELEASE(a); return OOS_ERROR; }
+    SAFE_RELEASE(o);
+    SAFE_RELEASE(a);
+    *left = (int32_t)od.DesktopCoordinates.left;
+    *top = (int32_t)od.DesktopCoordinates.top;
+    *right = (int32_t)od.DesktopCoordinates.right;
+    *bottom = (int32_t)od.DesktopCoordinates.bottom;
     return OOS_OK;
 }
 
@@ -401,6 +442,7 @@ static HRESULT fetch_shape(oos_cap *c, uint32_t size)
                                                &c->shape_info);
     if (FAILED(hr)) return hr;
     c->have_shape = 1;
+    c->shape_seq++;
     return S_OK;
 }
 
@@ -558,6 +600,62 @@ static int composite_cursor(oos_cap *c)
 static int convert_out(oos_cap *c, oos_frame *frame, int32_t mouse_only,
                        uint32_t accumulated, char *err, int32_t err_len);
 
+typedef struct {
+    int32_t valid, dirty_count, move_count;
+    int64_t dirty_area, move_area;
+} oos_rects;
+
+static int64_t clipped_area(const RECT *r, int32_t w, int32_t h)
+{
+    LONG l = r->left < 0 ? 0 : r->left, t = r->top < 0 ? 0 : r->top;
+    LONG rr = r->right > w ? w : r->right, b = r->bottom > h ? h : r->bottom;
+    if (rr <= l || b <= t) return 0;
+    return (int64_t)(rr - l) * (int64_t)(b - t);
+}
+
+/* Reads move + dirty rects for the frame currently acquired (must run before
+ * ReleaseFrame). On any failure the frame is reported as fully dirty, which is
+ * always safe: the worst case is encoding a frame we could have skipped. */
+static void read_rects(oos_cap *c, const DXGI_OUTDUPL_FRAME_INFO *fi, oos_rects *r)
+{
+    UINT need = fi->TotalMetadataBufferSize, used = 0, used2 = 0;
+    int64_t full = (int64_t)c->width * (int64_t)c->height, sum = 0;
+    HRESULT hr;
+    UINT i;
+    memset(r, 0, sizeof(*r));
+    if (fi->LastPresentTime.QuadPart == 0) {  /* pointer-only update: no image change */
+        r->valid = 1;
+        return;
+    }
+    if (need == 0) goto unknown;
+    if (c->meta_cap < need) {
+        uint8_t *p = (uint8_t *)realloc(c->meta, need);
+        if (!p) goto unknown;
+        c->meta = p; c->meta_cap = need;
+    }
+    hr = c->dupl->lpVtbl->GetFrameMoveRects(c->dupl, need,
+            (DXGI_OUTDUPL_MOVE_RECT *)c->meta, &used);
+    if (FAILED(hr)) goto unknown;
+    r->move_count = (int32_t)(used / sizeof(DXGI_OUTDUPL_MOVE_RECT));
+    for (i = 0; i < (UINT)r->move_count; i++)
+        sum += clipped_area(&((DXGI_OUTDUPL_MOVE_RECT *)c->meta)[i].DestinationRect,
+                            c->width, c->height);
+    r->move_area = sum > full ? full : sum;
+    hr = c->dupl->lpVtbl->GetFrameDirtyRects(c->dupl, need - used,
+            (RECT *)(c->meta + used), &used2);
+    if (FAILED(hr)) goto unknown;
+    r->dirty_count = (int32_t)(used2 / sizeof(RECT));
+    sum = 0;
+    for (i = 0; i < (UINT)r->dirty_count; i++)
+        sum += clipped_area(&((RECT *)(c->meta + used))[i], c->width, c->height);
+    r->dirty_area = sum > full ? full : sum;
+    r->valid = 1;
+    return;
+unknown:
+    memset(r, 0, sizeof(*r));
+    r->dirty_area = full;
+}
+
 int oos_next(oos_cap *c, uint32_t timeout_ms, oos_frame *frame,
              char *err, int32_t err_len)
 {
@@ -565,6 +663,9 @@ int oos_next(oos_cap *c, uint32_t timeout_ms, oos_frame *frame,
     IDXGIResource *res = NULL;
     ID3D11Texture2D *tex = NULL;
     HRESULT hr;
+    oos_rects rects;
+    int32_t prev_visible, prev_x, prev_y, noop;
+    int st;
 
     if (!c) { set_err(err, err_len, "no capture", E_POINTER); return OOS_ERROR; }
     if (!c->dupl) {
@@ -584,6 +685,10 @@ int oos_next(oos_cap *c, uint32_t timeout_ms, oos_frame *frame,
         return classify(hr);
     }
 
+    /* Gap #2: dirty/move rects are only readable while the frame is held. */
+    read_rects(c, &fi, &rects);
+    prev_visible = c->cur_visible; prev_x = c->cur_x; prev_y = c->cur_y;
+
     /* Pointer position first: it is valid even on a mouse-only update. */
     if (fi.LastMouseUpdateTime.QuadPart != 0) {
         c->cur_visible = fi.PointerPosition.Visible ? 1 : 0;
@@ -593,6 +698,33 @@ int oos_next(oos_cap *c, uint32_t timeout_ms, oos_frame *frame,
     if (fi.PointerShapeBufferSize > 0) {
         HRESULT shr = fetch_shape(c, fi.PointerShapeBufferSize);
         if (FAILED(shr)) c->have_shape = 0;
+    }
+
+    /* The cursor is composited into the image, so a pointer move IS a pixel
+     * change. Only a frame with zero dirty AND zero move rects and an
+     * unchanged pointer (position, visibility, shape) is a real no-op. */
+    noop = c->have_image && rects.valid &&
+           rects.dirty_count == 0 && rects.move_count == 0 &&
+           (c->cursor_layer ||   /* pointer is not in the image: ignore it */
+            (fi.PointerShapeBufferSize == 0 &&
+             c->cur_visible == prev_visible &&
+             (!c->cur_visible || (c->cur_x == prev_x && c->cur_y == prev_y))));
+    if (noop) {
+        SAFE_RELEASE(res);
+        c->dupl->lpVtbl->ReleaseFrame(c->dupl);
+        memset(frame, 0, sizeof(*frame));
+        frame->width = c->width;
+        frame->height = c->height;
+        frame->cursor_visible = c->cur_visible;
+        frame->cursor_shape_type = c->have_shape ? (int32_t)c->shape_info.Type : OOS_CUR_NONE;
+        frame->cursor_x = c->cur_x;
+        frame->cursor_y = c->cur_y;
+        frame->mouse_only = (fi.LastPresentTime.QuadPart == 0) ? 1 : 0;
+        frame->accumulated_frames = fi.AccumulatedFrames;
+        frame->rects_valid = 1;
+        frame->no_change = 1;
+        frame->cursor_shape_seq = c->shape_seq;
+        return OOS_OK;
     }
 
     hr = res->lpVtbl->QueryInterface(res, &OOS_IID_ID3D11Texture2D, (void **)&tex);
@@ -610,9 +742,19 @@ int oos_next(oos_cap *c, uint32_t timeout_ms, oos_frame *frame,
     SAFE_RELEASE(tex);
     c->dupl->lpVtbl->ReleaseFrame(c->dupl);
 
-    return convert_out(c, frame,
-                       (fi.LastPresentTime.QuadPart == 0) ? 1 : 0,
-                       fi.AccumulatedFrames, err, err_len);
+    c->have_image = 1;
+
+    st = convert_out(c, frame,
+                     (fi.LastPresentTime.QuadPart == 0) ? 1 : 0,
+                     fi.AccumulatedFrames, err, err_len);
+    if (st == OOS_OK) {
+        frame->rects_valid = rects.valid;
+        frame->dirty_count = rects.dirty_count;
+        frame->move_count = rects.move_count;
+        frame->dirty_area = rects.dirty_area;
+        frame->move_area = rects.move_area;
+    }
+    return st;
 }
 
 /* Everything after a fresh desktop image lands in c->bgra: composite the
@@ -627,7 +769,10 @@ static int convert_out(oos_cap *c, oos_frame *frame, int32_t mouse_only,
     int composited;
 
     /* A-24: the pointer may already be in c->bgra (GDI path drew it). */
-    if (c->cursor_in_bgra) {
+    if (c->cursor_layer) {
+        composited = 0;          /* cursor layer: pointer travels separately */
+        c->cursor_in_bgra = 0;
+    } else if (c->cursor_in_bgra) {
         composited = 1;
         c->cursor_in_bgra = 0;
     } else {
@@ -683,6 +828,7 @@ static int convert_out(oos_cap *c, oos_frame *frame, int32_t mouse_only,
     frame->cursor_y = c->cur_y;
     frame->mouse_only = mouse_only;
     frame->accumulated_frames = accumulated;
+    frame->cursor_shape_seq = c->shape_seq;
     return OOS_OK;
 }
 
@@ -784,13 +930,18 @@ int oos_gdi_next(oos_cap *c, oos_frame *frame, char *err, int32_t err_len)
      * is the FIRST frame of a session on a still desktop, and a remote desktop
      * without a mouse pointer reads as "frozen". Draw it with the same GDI we
      * already hold the DC for. */
-    gdi_draw_cursor(c, mem, &od.DesktopCoordinates);
+    if (!c->cursor_layer) gdi_draw_cursor(c, mem, &od.DesktopCoordinates);
     GdiFlush();  /* the DIB bits are written by GDI asynchronously */
 
     c->ctx->lpVtbl->UpdateSubresource(c->ctx, (ID3D11Resource *)c->bgra, 0,
                                       NULL, bits, (UINT)(c->width * 4), 0);
     /* mouse_only=0: this is a full desktop image. */
     st = convert_out(c, frame, 0, 0, err, err_len);
+    if (st == OOS_OK) {
+        c->have_image = 1;
+        /* Full desktop image: everything counts as changed. */
+        frame->dirty_area = (int64_t)c->width * (int64_t)c->height;
+    }
 
 done:
     if (old) SelectObject(mem, old);
@@ -798,6 +949,50 @@ done:
     if (mem) DeleteDC(mem);
     ReleaseDC(NULL, screen);
     return st;
+}
+
+/* Text tiles (internal/tiles): copy the current BGRA desktop (pointer
+ * included, exactly what was last converted; with the cursor layer on the
+ * pointer is never composited, so tiles are cursor-free) into dst. A one-shot staging
+ * texture is created, mapped once and released: this runs at most once per
+ * static episode, so keeping 8-15 MB of staging memory alive is not worth it. */
+int oos_read_bgra(oos_cap *c, uint8_t *dst, int32_t dst_pitch, char *err, int32_t err_len)
+{
+    D3D11_TEXTURE2D_DESC d;
+    D3D11_MAPPED_SUBRESOURCE m;
+    ID3D11Texture2D *stage = NULL;
+    HRESULT hr;
+    int32_t y;
+
+    if (!c || !c->bgra || !c->have_image || !dst || dst_pitch < c->width * 4) {
+        set_err(err, err_len, "read_bgra: no image", E_POINTER);
+        return OOS_ERROR;
+    }
+    memset(&d, 0, sizeof(d));
+    d.Width = (UINT)c->width;
+    d.Height = (UINT)c->height;
+    d.MipLevels = 1;
+    d.ArraySize = 1;
+    d.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+    d.SampleDesc.Count = 1;
+    d.Usage = D3D11_USAGE_STAGING;
+    d.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+    hr = c->dev->lpVtbl->CreateTexture2D(c->dev, &d, NULL, &stage);
+    if (FAILED(hr)) { c->last_hr = hr; set_err(err, err_len, "read_bgra: CreateTexture2D", hr); return classify(hr); }
+    c->ctx->lpVtbl->CopyResource(c->ctx, (ID3D11Resource *)stage, (ID3D11Resource *)c->bgra);
+    hr = c->ctx->lpVtbl->Map(c->ctx, (ID3D11Resource *)stage, 0, D3D11_MAP_READ, 0, &m);
+    if (FAILED(hr)) {
+        c->last_hr = hr;
+        SAFE_RELEASE(stage);
+        set_err(err, err_len, "read_bgra: Map", hr);
+        return classify(hr);
+    }
+    for (y = 0; y < c->height; y++)
+        memcpy(dst + (size_t)y * (size_t)dst_pitch,
+               (const uint8_t *)m.pData + (size_t)y * m.RowPitch, (size_t)c->width * 4);
+    c->ctx->lpVtbl->Unmap(c->ctx, (ID3D11Resource *)stage, 0);
+    SAFE_RELEASE(stage);
+    return OOS_OK;
 }
 
 void oos_release(oos_cap *c)
@@ -828,6 +1023,7 @@ void oos_close(oos_cap *c)
     SAFE_RELEASE(c->dev);
     if (c->shape) free(c->shape);
     free(c->cur_tmp);
+    if (c->meta) free(c->meta);
     free(c);
 }
 
@@ -848,6 +1044,28 @@ void oos_suspend(oos_cap *c)
 }
 void *oos_nv12_texture(oos_cap *c) { return c ? (void *)c->nv12 : NULL; }
 void oos_set_readback(oos_cap *c, int32_t enable) { if (c) c->no_readback = !enable; }
+void oos_set_cursor_layer(oos_cap *c, int32_t enable) { if (c) c->cursor_layer = enable ? 1 : 0; }
+
+int oos_cursor_shape(oos_cap *c, int32_t *type, int32_t *w, int32_t *h,
+                     int32_t *pitch, int32_t *hot_x, int32_t *hot_y,
+                     uint8_t *buf, uint32_t cap, uint32_t *len, uint32_t *seq)
+{
+    uint32_t need;
+    if (!c || !c->have_shape || !c->shape) return OOS_ERROR;
+    need = c->shape_info.Pitch * c->shape_info.Height;
+    if (need > c->shape_cap) need = c->shape_cap;
+    *type = (int32_t)c->shape_info.Type;
+    *w = (int32_t)c->shape_info.Width;
+    *h = (int32_t)c->shape_info.Height;
+    *pitch = (int32_t)c->shape_info.Pitch;
+    *hot_x = (int32_t)c->shape_info.HotSpot.x;
+    *hot_y = (int32_t)c->shape_info.HotSpot.y;
+    *seq = c->shape_seq;
+    *len = need;
+    if (!buf || cap < need) return OOS_INVALID_CALL;  /* *len says how much */
+    memcpy(buf, c->shape, need);
+    return OOS_OK;
+}
 int64_t oos_cpu_maps(oos_cap *c)   { return c ? c->cpu_maps : 0; }
 
 int32_t oos_width(oos_cap *c)  { return c ? c->width : 0; }

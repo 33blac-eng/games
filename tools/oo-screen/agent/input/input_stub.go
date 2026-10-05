@@ -17,3 +17,7 @@ func VirtualScreen() (Bounds, error) {
 func (in *Injector) inject(Event) error {
 	return fmt.Errorf("%w: requires Windows", ErrNotAvailable)
 }
+
+func sendInputs([]rawInput) error {
+	return fmt.Errorf("%w: requires Windows", ErrNotAvailable)
+}

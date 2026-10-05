@@ -23,6 +23,7 @@ import (
 	"log/slog"
 	"runtime"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 	"unsafe"
@@ -127,6 +128,25 @@ type NV12Frame struct {
 	// AccumulatedFrames is how many presents DXGI coalesced into this one.
 	AccumulatedFrames uint32
 
+	// Gap #2 (RESEARCH-leaders.md): DXGI dirty/move-rect metadata.
+	// RectsValid=false means DXGI gave no metadata for a real present, so the
+	// whole output counts as dirty (DirtyArea is then the full area). Areas are
+	// in pixels, clipped to the output; MoveArea counts destination rects.
+	RectsValid bool
+	DirtyRects int
+	MoveRects  int
+	DirtyArea  int64
+	MoveArea   int64
+	// NoChange: zero dirty and move rects AND the pointer did not move or
+	// change shape — the composited image is identical to the previous one.
+	// Such a frame carries no planes and no texture; skip it (and do not
+	// treat it as motion).
+	NoChange bool
+
+	// CursorShapeSeq bumps whenever DXGI delivered a new pointer shape; with
+	// the cursor layer on, a change means "pull CursorShape() and resend".
+	CursorShapeSeq uint32
+
 	// Captured is when NextFrame started the acquire that produced this frame.
 	Captured time.Time
 	// AcquireConvert is AcquireNextFrame + cursor composite + Blt + readback.
@@ -212,6 +232,9 @@ type Capturer struct {
 
 	// readback mirrors oos_set_readback so a reinit restores the choice.
 	readback bool
+	// layerApplied — the cursor-layer state this handle currently has
+	// (NextFrame follows the process-wide switch live, F9 negotiation).
+	layerApplied bool
 
 	// scratch reused across frames so a steady capture loop allocates nothing.
 	y  []byte
@@ -250,6 +273,17 @@ type OutputInfo struct {
 	Width   int  `json:"width"`
 	Height  int  `json:"height"`
 	Primary bool `json:"primary"`
+}
+
+// OutputRect returns output idx's DesktopCoordinates (left, top, width,
+// height) on the virtual desktop. Like Outputs it touches no Capturer state,
+// so it is safe from any goroutine (the cursor poller uses it).
+func OutputRect(idx int) (left, top, w, h int, err error) {
+	var l, t, r, b C.int32_t
+	if C.oos_output_rect(C.int32_t(idx), &l, &t, &r, &b) != C.OOS_OK {
+		return 0, 0, 0, 0, fmt.Errorf("capture: output %d: cannot read DXGI_OUTPUT_DESC", idx)
+	}
+	return int(l), int(t), int(r - l), int(b - t), nil
 }
 
 // Outputs enumerates adapter 0's outputs. Nothing is duplicated and no D3D11
@@ -299,6 +333,10 @@ func (c *Capturer) open() error {
 	if !c.readback {
 		C.oos_set_readback(handle, 0)
 	}
+	c.layerApplied = cursorLayer.Load()
+	if c.layerApplied {
+		C.oos_set_cursor_layer(handle, 1)
+	}
 	c.width = int(C.oos_width(handle))
 	c.height = int(C.oos_height(handle))
 	c.gen++ // A-06
@@ -340,6 +378,55 @@ func (c *Capturer) SetCPUReadback(on bool) {
 		C.oos_set_readback(c.c, v)
 	}
 	c.readback = on
+}
+
+// cursorLayer is the process-wide cursor-layer switch (agent -cursor-layer).
+var cursorLayer atomic.Bool
+
+// SetCursorLayer turns the cursor layer on/off for every capturer opened (or
+// reopened after ACCESS_LOST) from now on: the pointer is no longer composited
+// into the image and pointer-only updates come back as NoChange frames; the
+// caller ships the pointer separately (CursorShape + frame Cursor* fields).
+// It may be flipped at any time (F9: the hub grants/revokes the layer as
+// viewers come and go): the next NextFrame applies it and re-duplicates the
+// output so the first frame after the flip is a full image with (or without)
+// the pointer drawn, instead of waiting for the desktop to change.
+func SetCursorLayer(on bool) { cursorLayer.Store(on) }
+
+// RawCursorShape is DXGI's pointer shape as-is (see oos_cursor_shape).
+type RawCursorShape struct {
+	Type       CursorShapeType
+	W, H       int // H counts both masks for monochrome
+	Pitch      int
+	HotX, HotY int
+	Data       []byte
+	Seq        uint32
+}
+
+// CursorShape copies the cached pointer shape. ok=false when DXGI has not
+// delivered one yet. Same goroutine as NextFrame.
+func (c *Capturer) CursorShape() (RawCursorShape, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.c == nil {
+		return RawCursorShape{}, false
+	}
+	var typ, w, h, pitch, hx, hy C.int32_t
+	var n, seq C.uint32_t
+	st := C.oos_cursor_shape(c.c, &typ, &w, &h, &pitch, &hx, &hy, nil, 0, &n, &seq)
+	if st == C.OOS_ERROR || n == 0 || n > 4<<20 {
+		return RawCursorShape{}, false
+	}
+	buf := make([]byte, int(n))
+	st = C.oos_cursor_shape(c.c, &typ, &w, &h, &pitch, &hx, &hy,
+		(*C.uint8_t)(unsafe.Pointer(&buf[0])), n, &n, &seq)
+	if st != C.OOS_OK {
+		return RawCursorShape{}, false
+	}
+	return RawCursorShape{
+		Type: CursorShapeType(typ), W: int(w), H: int(h), Pitch: int(pitch),
+		HotX: int(hx), HotY: int(hy), Data: buf[:int(n)], Seq: uint32(seq),
+	}, true
 }
 
 // Device is the ID3D11Device* behind this capturer, for an encoder that wants
@@ -476,6 +563,32 @@ func (c *Capturer) GDIFrame() (*NV12Frame, error) {
 	return frame, nil
 }
 
+// ReadBGRA copies the current desktop image (the one last converted, pointer
+// included) into a fresh BGRA buffer: w*4 bytes per row, h rows. One GPU
+// staging copy + Map; meant for the text-tile pass on a static screen, not
+// per frame. Must be called from the capture loop (like NextFrame).
+func (c *Capturer) ReadBGRA() (pix []byte, w, h int, err error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.closed {
+		return nil, 0, 0, ErrClosed
+	}
+	if c.c == nil {
+		return nil, 0, 0, fmt.Errorf("%w: pipeline not open", ErrAccessLost)
+	}
+	w, h = int(C.oos_width(c.c)), int(C.oos_height(c.c))
+	if w <= 0 || h <= 0 {
+		return nil, 0, 0, fmt.Errorf("capture: read_bgra: bad size %dx%d", w, h)
+	}
+	pix = make([]byte, w*4*h)
+	buf := (*C.char)(C.calloc(256, 1))
+	defer C.free(unsafe.Pointer(buf))
+	if st := C.oos_read_bgra(c.c, (*C.uint8_t)(unsafe.Pointer(&pix[0])), C.int32_t(w*4), buf, 256); st != C.OOS_OK {
+		return nil, 0, 0, fmt.Errorf("capture: output %d: %s", c.output, C.GoString(buf))
+	}
+	return pix, w, h, nil
+}
+
 // NextFrame blocks until a frame is available, ctx is done, or capture fails.
 //
 // A DXGI_ERROR_WAIT_TIMEOUT is neither a frame nor an error: NextFrame simply
@@ -499,6 +612,15 @@ func (c *Capturer) NextFrame(ctx context.Context) (*NV12Frame, error) {
 			if err := c.reinit(ctx); err != nil {
 				return nil, err
 			}
+		}
+		if want := cursorLayer.Load(); want != c.layerApplied {
+			v := C.int32_t(0)
+			if want {
+				v = 1
+			}
+			C.oos_set_cursor_layer(c.c, v)
+			c.layerApplied = want
+			C.oos_suspend(c.c) // A-17 resume path: next oos_next re-duplicates
 		}
 
 		var f C.oos_frame
@@ -563,23 +685,23 @@ func (c *Capturer) copyOut(f *C.oos_frame, start time.Time) *NV12Frame {
 	alignedH := (h + 1) &^ 1
 	chromaRows := alignedH / 2
 
+	if f.no_change != 0 {
+		// Nothing to show: the NV12 texture still holds the previous image.
+		fr := &NV12Frame{Width: w, Height: h, TextureGen: c.gen}
+		fillMeta(fr, f, start)
+		return fr
+	}
+
 	if f.y == nil {
 		// Zero-copy mode: nothing was read back, the NV12 lives on the GPU.
-		return &NV12Frame{
-			Width:             w,
-			Height:            h,
-			Texture:           uintptr(C.oos_nv12_texture(c.c)),
-			TextureGen:        c.gen,
-			CursorVisible:     f.cursor_visible != 0,
-			CursorComposited:  f.cursor_composited != 0,
-			CursorShape:       CursorShapeType(f.cursor_shape_type),
-			CursorX:           int(f.cursor_x),
-			CursorY:           int(f.cursor_y),
-			MouseOnly:         f.mouse_only != 0,
-			AccumulatedFrames: uint32(f.accumulated_frames),
-			Captured:          start,
-			AcquireConvert:    time.Since(start),
+		fr := &NV12Frame{
+			Width:      w,
+			Height:     h,
+			Texture:    uintptr(C.oos_nv12_texture(c.c)),
+			TextureGen: c.gen,
 		}
+		fillMeta(fr, f, start)
+		return fr
 	}
 
 	ySize := yPitch * h
@@ -596,23 +718,36 @@ func (c *Capturer) copyOut(f *C.oos_frame, start time.Time) *NV12Frame {
 	copy(c.y, unsafe.Slice((*byte)(unsafe.Pointer(f.y)), ySize))
 	copy(c.uv, unsafe.Slice((*byte)(unsafe.Pointer(f.uv)), uvSize))
 
-	return &NV12Frame{
-		Width:             w,
-		Height:            h,
-		Y:                 c.y,
-		UV:                c.uv,
-		YStride:           yPitch,
-		UVStride:          uvPitch,
-		CursorVisible:     f.cursor_visible != 0,
-		CursorComposited:  f.cursor_composited != 0,
-		CursorShape:       CursorShapeType(f.cursor_shape_type),
-		CursorX:           int(f.cursor_x),
-		CursorY:           int(f.cursor_y),
-		MouseOnly:         f.mouse_only != 0,
-		AccumulatedFrames: uint32(f.accumulated_frames),
-		Captured:          start,
-		AcquireConvert:    time.Since(start),
+	fr := &NV12Frame{
+		Width:    w,
+		Height:   h,
+		Y:        c.y,
+		UV:       c.uv,
+		YStride:  yPitch,
+		UVStride: uvPitch,
 	}
+	fillMeta(fr, f, start)
+	return fr
+}
+
+// fillMeta copies the cursor/DXGI metadata shared by every copyOut branch.
+func fillMeta(fr *NV12Frame, f *C.oos_frame, start time.Time) {
+	fr.CursorVisible = f.cursor_visible != 0
+	fr.CursorComposited = f.cursor_composited != 0
+	fr.CursorShape = CursorShapeType(f.cursor_shape_type)
+	fr.CursorX = int(f.cursor_x)
+	fr.CursorY = int(f.cursor_y)
+	fr.MouseOnly = f.mouse_only != 0
+	fr.AccumulatedFrames = uint32(f.accumulated_frames)
+	fr.RectsValid = f.rects_valid != 0
+	fr.DirtyRects = int(f.dirty_count)
+	fr.MoveRects = int(f.move_count)
+	fr.DirtyArea = int64(f.dirty_area)
+	fr.MoveArea = int64(f.move_area)
+	fr.NoChange = f.no_change != 0
+	fr.CursorShapeSeq = uint32(f.cursor_shape_seq)
+	fr.Captured = start
+	fr.AcquireConvert = time.Since(start)
 }
 
 // Close releases the duplication, the pipeline and the D3D11 device.

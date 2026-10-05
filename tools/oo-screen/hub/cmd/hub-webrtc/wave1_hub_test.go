@@ -25,13 +25,21 @@ import (
 // вивід прогону й ще й псують рахунок алокацій.
 func quietNDJSON(t *testing.T, w *bytes.Buffer) {
 	t.Helper()
+	// Під ndjsonMu: таймери проби (OO_SCREEN_PROBE=1) пишуть NDJSON уже
+	// після кінця тесту, що їх запустив.
+	ndjsonMu.Lock()
 	prev := ndjsonOut
 	if w == nil {
 		ndjsonOut = discardWriter{}
 	} else {
 		ndjsonOut = w
 	}
-	t.Cleanup(func() { ndjsonOut = prev })
+	ndjsonMu.Unlock()
+	t.Cleanup(func() {
+		ndjsonMu.Lock()
+		ndjsonOut = prev
+		ndjsonMu.Unlock()
+	})
 }
 
 // ── H-26 ────────────────────────────────────────────────────────────────────
@@ -233,7 +241,7 @@ func TestH264KeyPart(t *testing.T) {
 func keyPacket(i int) *rtp.Packet {
 	return &rtp.Packet{
 		Header:  rtp.Header{SequenceNumber: uint16(i), Timestamp: uint32(i) * 3000},
-		Payload: []byte{0x67, 0x42}, // SPS
+		Payload: []byte{0x78, 0, 2, 0x67, 0x42, 0, 2, 0x68, 0xCE, 0, 2, 0x65, 0x88}, // STAP-A: SPS+PPS+IDR
 	}
 }
 

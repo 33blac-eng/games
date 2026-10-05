@@ -61,7 +61,7 @@ func dialAgentLegWith(t *testing.T, node string, withAudio bool) (*webrtc.PeerCo
 
 	var atrk *webrtc.TrackLocalStaticSample
 	if withAudio {
-		if atrk, err = webrtc.NewTrackLocalStaticSample(audioCap, "audio", "oo-screen"); err != nil {
+		if atrk, err = webrtc.NewTrackLocalStaticSample(audioCap(), "audio", "oo-screen"); err != nil {
 			t.Fatalf("agent audio track: %v", err)
 		}
 		if _, err := remote.AddTrack(atrk); err != nil {
@@ -91,6 +91,17 @@ func dialAgentLegWith(t *testing.T, node string, withAudio bool) (*webrtc.PeerCo
 	if err := json.Unmarshal(w.Body.Bytes(), &ans); err != nil {
 		t.Fatalf("answer json: %v", err)
 	}
+	// Як справжній агент (agent dialWebRTC): відхилений хабом m=audio — зняти
+	// доріжку до SetRemoteDescription.
+	if atrk != nil && strings.Contains(ans.SDP, "m=audio 0 ") {
+		for _, tr := range remote.GetTransceivers() {
+			if s := tr.Sender(); s != nil && s.Track() == atrk {
+				if err := remote.RemoveTrack(s); err != nil {
+					t.Fatalf("RemoveTrack(audio): %v", err)
+				}
+			}
+		}
+	}
 	if err := remote.SetRemoteDescription(webrtc.SessionDescription{
 		Type: webrtc.SDPTypeAnswer, SDP: ans.SDP,
 	}); err != nil {
@@ -109,6 +120,18 @@ const eventGuard = 3 * time.Minute
 // Перевіряємо ФАКТ переходу, а не його швидкість.
 func waitFor(cond func() bool) bool {
 	deadline := time.Now().Add(eventGuard)
+	for time.Now().Before(deadline) {
+		if cond() {
+			return true
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	return cond()
+}
+
+// waitForD — як waitFor, але з власним дедлайном (тести PR: курсор, плитки, GOP).
+func waitForD(d time.Duration, cond func() bool) bool {
+	deadline := time.Now().Add(d)
 	for time.Now().Before(deadline) {
 		if cond() {
 			return true
@@ -190,12 +213,10 @@ func agentAPI(t *testing.T) *webrtc.API {
 	}, webrtc.RTPCodecTypeVideo); err != nil {
 		t.Fatalf("RegisterCodec(video): %v", err)
 	}
-	// PCMU реєструємо ЗАВЖДИ: прапорець звуку в агента свій, і тест
+	// Кодек звуку (hubAudioCodec()) реєструємо ЗАВЖДИ: прапорець звуку в агента свій, і тест
 	// «агент шле звук, а хаб із вимкненим прапорцем його не бере» мусить
 	// мати чим слати.
-	if err := m.RegisterCodec(webrtc.RTPCodecParameters{
-		RTPCodecCapability: audioCap, PayloadType: 0,
-	}, webrtc.RTPCodecTypeAudio); err != nil {
+	if err := m.RegisterCodec(hubAudioCodec().Parameters(), webrtc.RTPCodecTypeAudio); err != nil {
 		t.Fatalf("RegisterCodec(audio): %v", err)
 	}
 	return webrtc.NewAPI(webrtc.WithMediaEngine(m))

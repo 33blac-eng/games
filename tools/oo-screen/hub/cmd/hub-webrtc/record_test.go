@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -14,6 +15,7 @@ import (
 	"github.com/pion/webrtc/v4"
 
 	"github.com/organicoils/oo-screen/internal/h264"
+	"github.com/organicoils/oo-screen/internal/opusenc"
 	"github.com/organicoils/oo-screen/internal/pcmu"
 )
 
@@ -23,9 +25,10 @@ import (
 func withRecordFlag(t *testing.T, on bool) string {
 	t.Helper()
 	dir := t.TempDir()
-	prevOn, prevDir := recordEnabled, recordDir
-	recordEnabled, recordDir = on, dir
-	t.Cleanup(func() { recordEnabled, recordDir = prevOn, prevDir })
+	prevOn, prevDir := recordEnabled.Load(), recordDir.Load()
+	recordEnabled.Store(on)
+	recordDir.Store(&dir)
+	t.Cleanup(func() { recordEnabled.Store(prevOn); recordDir.Store(prevDir) })
 	return dir
 }
 
@@ -58,9 +61,9 @@ func TestRecordFlagOffChangesNothing(t *testing.T) {
 	// Дефолт перевіряємо ДО підміни: інакше тест доводив би лише те, що
 	// перемикач працює, а не те, що ТИПОВО він вимкнений — а прод захищає саме
 	// друге. Перевернутий дефолт падає тут.
-	if recordEnabled != (os.Getenv("OO_SCREEN_RECORD") == "1") {
+	if recordEnabled.Load() != (os.Getenv("OO_SCREEN_RECORD") == "1") {
 		t.Fatalf("recordEnabled=%v при OO_SCREEN_RECORD=%q — типово запис мусить бути ВИМКНЕНИЙ",
-			recordEnabled, os.Getenv("OO_SCREEN_RECORD"))
+			recordEnabled.Load(), os.Getenv("OO_SCREEN_RECORD"))
 	}
 
 	dir := withRecordFlag(t, false)
@@ -124,8 +127,15 @@ func TestRecordFlagOffChangesNothing(t *testing.T) {
 // до останнього байта й падає, щойно якийсь елемент заявив більше, ніж лишилось
 // — тобто рівно на обрізаному хвості, який плеєр і не відкриє.
 func TestRecordWritesClosedMKVWithBothTracks(t *testing.T) {
+	for _, c := range []opusenc.Codec{opusenc.CodecOpus, opusenc.CodecPCMU} {
+		t.Run(string(c), func(t *testing.T) { recordBothTracks(t, c) })
+	}
+}
+
+func recordBothTracks(t *testing.T, codec opusenc.Codec) {
 	dir := withRecordFlag(t, true)
 	withAudioFlag(t, true) // друга доріжка існує лише разом зі своїм прапорцем
+	withHubAudioCodec(t, codec)
 
 	aus := corpusAUs(t)
 	tone := toneFrames(t)
@@ -171,8 +181,12 @@ func TestRecordWritesClosedMKVWithBothTracks(t *testing.T) {
 	s.blocks = map[byte]int{}
 	ebmlWalk(t, blob, &s, "")
 
-	if len(s.codecIDs) != 2 || s.codecIDs[0] != codecIDH264 || s.codecIDs[1] != codecIDPCM {
-		t.Fatalf("доріжки = %v, want [%s %s]", s.codecIDs, codecIDH264, codecIDPCM)
+	wantAudio := codecIDPCM
+	if codec == opusenc.CodecOpus {
+		wantAudio = codecIDOpus
+	}
+	if len(s.codecIDs) != 2 || s.codecIDs[0] != codecIDH264 || s.codecIDs[1] != wantAudio {
+		t.Fatalf("доріжки = %v, want [%s %s]", s.codecIDs, codecIDH264, wantAudio)
 	}
 	if s.width != 1920 || s.height != 1080 {
 		t.Fatalf("розмір у файлі %dx%d, want 1920x1080 (SPS корпусу)", s.width, s.height)
@@ -305,8 +319,11 @@ func toneFrames(t *testing.T) [][]byte {
 	out := make([][]byte, 24)
 	for i := range out {
 		out[i] = tone.next()
-		if len(out[i]) != pcmu.FrameSamples {
+		if hubAudioCodec() == opusenc.CodecPCMU && len(out[i]) != pcmu.FrameSamples {
 			t.Fatalf("кадр тону %d байт, want %d", len(out[i]), pcmu.FrameSamples)
+		}
+		if hubAudioCodec() == opusenc.CodecOpus && opusenc.PacketDuration(out[i]) != 20*time.Millisecond {
+			t.Fatalf("Opus-кадр тону %d: тривалість %v", i, opusenc.PacketDuration(out[i]))
 		}
 	}
 	return out
@@ -486,9 +503,20 @@ func ffprobeMKV(t *testing.T, path string) {
 	}
 	got := string(out)
 	t.Logf("ffprobe:\n%s", got)
-	for _, want := range []string{"codec_name=h264", "codec_name=pcm_s16le", "width=1920", "height=1080"} {
+	audioName := "codec_name=pcm_s16le"
+	if hubAudioCodec() == opusenc.CodecOpus {
+		audioName = "codec_name=opus"
+	}
+	for _, want := range []string{"codec_name=h264", audioName, "width=1920", "height=1080"} {
 		if !strings.Contains(got, want) {
 			t.Fatalf("ffprobe не побачив %q:\n%s", want, got)
+		}
+	}
+	// Звук мусить не лише оголошуватись, а й ДЕКОДУВАТИСЬ без помилок.
+	if ff, err := exec.LookPath("ffmpeg"); err == nil {
+		out, err := exec.Command(ff, "-v", "error", "-i", path, "-map", "0:a", "-f", "null", "-").CombinedOutput()
+		if err != nil || len(bytes.TrimSpace(out)) != 0 {
+			t.Fatalf("ffmpeg не декодував звук %s: %v\n%s", path, err, out)
 		}
 	}
 }
@@ -523,5 +551,52 @@ func TestMKVReadableWithoutClose(t *testing.T) {
 	}
 	if s.width != 640 || s.height != 480 {
 		t.Fatalf("заголовок недописаного файлу нечитабельний: %dx%d", s.width, s.height)
+	}
+}
+
+// Каталог, створений колись як 0755, звужується до 0700 при наступному записі.
+func TestRecordDirTightensExistingPerms(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "rec")
+	if err := os.Mkdir(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(dir, 0o755); err != nil { // umask не має вплинути на вихідний стан
+		t.Fatal(err)
+	}
+	if err := ensureRecordDir(dir); err != nil {
+		t.Fatal(err)
+	}
+	fi, err := os.Stat(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if runtime.GOOS != "windows" && fi.Mode().Perm() != recordDirPerm {
+		t.Fatalf("права каталогу %v, хочу %o", fi.Mode().Perm(), recordDirPerm)
+	}
+}
+
+// Дві (і більше) сесії однієї ноди в ту саму секунду дають РІЗНІ файли, і
+// жоден не обнулює інший; імена лишаються .mkv з префіксом ноди.
+func TestRecordFileUniqueWithinSameSecond(t *testing.T) {
+	dir := t.TempDir()
+	now := time.Date(2026, 10, 3, 12, 0, 0, 0, time.UTC)
+	seen := map[string]bool{}
+	for i := 0; i < 5; i++ {
+		f, err := createRecordFile(dir, "PC-1", now)
+		if err != nil {
+			t.Fatalf("спроба %d: %v", i, err)
+		}
+		name := filepath.Base(f.Name())
+		f.Close()
+		if seen[name] {
+			t.Fatalf("імʼя %s повторилось", name)
+		}
+		seen[name] = true
+		if !strings.HasPrefix(name, "PC-1-20261003-120000") || filepath.Ext(name) != ".mkv" {
+			t.Fatalf("неочікуване імʼя %s", name)
+		}
+	}
+	if !seen["PC-1-20261003-120000.mkv"] || !seen["PC-1-20261003-120000-2.mkv"] {
+		t.Fatalf("очікувані імена відсутні: %v", seen)
 	}
 }

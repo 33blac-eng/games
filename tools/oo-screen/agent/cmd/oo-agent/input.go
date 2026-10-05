@@ -15,6 +15,7 @@
 package main
 
 import (
+	"errors"
 	"log"
 	"os"
 	"sync/atomic"
@@ -23,7 +24,14 @@ import (
 	"github.com/pion/webrtc/v4"
 
 	"github.com/organicoils/oo-screen/agent/input"
+	"github.com/organicoils/oo-screen/internal/consent"
 )
+
+// consentGate — S3 (internal/consent). nil = політика off, ввід як раніше.
+// Ставить main до першого dial; читає канал вводу.
+var consentGate *consent.Gate
+
+var errNoConsent = errors.New("input dropped: no local consent (S3)")
 
 // inputChannelLabel — та сама мітка, що в хабі. Один канал, одна назва.
 const inputChannelLabel = "oosc-input"
@@ -61,6 +69,10 @@ func attachInputChannel(dc *webrtc.DataChannel, inj eventInjector) {
 // логує: викликач глушить лог від флуду (logInputProblem), і робити це двічі
 // не треба.
 func handleInputMessage(data []byte, inj eventInjector) error {
+	// S3: без локальної згоди ввід не інʼєктується, що б не прислав хаб.
+	if !consentGate.Allowed() {
+		return errNoConsent
+	}
 	ev, err := input.ParseEvent(data)
 	if err != nil {
 		return err
@@ -117,5 +129,37 @@ func applyFeatureFlags(audio, input bool) {
 	}
 	if input {
 		inputEnabled = true
+	}
+}
+
+// releaseHeldInput — SEC #37: відпустити все, що інʼєктор затиснув і не
+// відпустив (обрив сесії посеред Ctrl+перетягування). nil — нічого не робить.
+func releaseHeldInput(inj *input.Injector, why string) {
+	if inj == nil {
+		return
+	}
+	k, b := inj.Held()
+	if k == 0 && b == 0 {
+		return
+	}
+	if err := inj.ReleaseAll(); err != nil {
+		log.Printf("oo-agent: відпускання затиснутих (%s): %v", why, err)
+		return
+	}
+	log.Printf("oo-agent: відпущено %d клавіш і %d кнопок миші (%s)", k, b, why)
+}
+
+// releaseOnPause загортає onGate: пауза (жодного видимого глядача) відпускає
+// затиснуте. Канал вводу живе між агентом і хабом і переживає відхід
+// глядача, тож одного OnClose каналу мало.
+func releaseOnPause(inj *input.Injector, onGate func(bool)) func(bool) {
+	if inj == nil || onGate == nil {
+		return onGate
+	}
+	return func(resume bool) {
+		if !resume {
+			releaseHeldInput(inj, "no viewers")
+		}
+		onGate(resume)
 	}
 }

@@ -36,7 +36,10 @@ package main
 import (
 	"bytes"
 	"encoding/binary"
+	"errors"
 	"fmt"
+	"io"
+	"io/fs"
 	"log"
 	"os"
 	"path/filepath"
@@ -48,16 +51,30 @@ import (
 	"github.com/pion/rtp/codecs"
 
 	"github.com/organicoils/oo-screen/internal/h264"
+	"github.com/organicoils/oo-screen/internal/reccrypt"
 )
 
 // recordEnabled — прапорець. Змінна, а не os.Getenv на місці: тести перемикають
 // її напряму (той самий прийом, що audioEnabled в audio.go).
-var recordEnabled = os.Getenv("OO_SCREEN_RECORD") == "1"
+//
+// Атомарна, як і recordDir та recordIdleClose нижче: їх читають горутини, яких
+// тест не контролює — колбек стану PeerConnection (dropViewer ->
+// scheduleRecordClose) нерідко спрацьовує вже ПІСЛЯ кінця тесту, що цю ногу
+// завів, і гонить із наступним тестом, який перемикає прапорець (race detector
+// під навантаженням: TestRecordSurvivesQuickReconnect / ClosesAfterLastViewerLeaves).
+var recordEnabled atomic.Bool
 
 // recordDir — куди складати записи. Дефолт відносний: хаб на проді запускається
 // зі свого каталогу, і "recordings" поруч із бінарем — це те, що адміністратор
 // знайде без документації. Каталог створюється при першому записі.
-var recordDir = envOr("OO_SCREEN_RECORD_DIR", "recordings")
+var recordDir atomic.Pointer[string]
+
+func init() {
+	recordEnabled.Store(os.Getenv("OO_SCREEN_RECORD") == "1")
+	d := envOr("OO_SCREEN_RECORD_DIR", "recordings")
+	recordDir.Store(&d)
+	recordIdleClose.Store(int64(30 * time.Second))
+}
 
 // recordQueueDepth — глибина черги до писаря. ~830 пакетів/с на 8 Мбіт/с, тож
 // 2048 ≈ 2.5 с запасу: звичайне «диск задумався» переживається без втрат.
@@ -153,13 +170,17 @@ type recordCfg struct {
 }
 
 func currentRecordCfg() recordCfg {
-	return recordCfg{on: recordEnabled, dir: recordDir, idle: recordIdleClose}
+	return recordCfg{on: recordEnabled.Load(), dir: *recordDir.Load(), idle: time.Duration(recordIdleClose.Load())}
 }
 
 // startRecording піднімає писаря сесії. nil (і жодного сліду на диску), поки
 // OO_SCREEN_RECORD не заданий — це і є «без прапорця нічого не змінилось».
 func startRecording(nodeID string, c recordCfg) *recorder {
 	if !c.on {
+		return nil
+	}
+	// S5: шифрування просили, а ключ битий — відкритим текстом не пишемо.
+	if !recordAllowedByKey() {
 		return nil
 	}
 	// Запобіжник місця (recordprune.go). Прибирає застаріле й відмовляється
@@ -405,7 +426,7 @@ func (r *recorder) handleAudio(it recItem) {
 	}
 	// Звук, що прийшов трохи раніше за перший кадр файлу, — на нуль: мітка
 	// кластера від'ємною бути не може.
-	r.mkv.block(mkvAudioTrack, max(r.aPTS-r.fileBase, 0).Milliseconds(), true, pcmBlock(it.aud))
+	r.mkv.block(mkvAudioTrack, max(r.aPTS-r.fileBase, 0).Milliseconds(), true, audioBlock(it.aud))
 	r.aPTS += it.dur
 	r.aFrames++
 }
@@ -420,27 +441,47 @@ func (r *recorder) open() bool {
 		r.mkv = newMKVWriter(discardWriter{})
 		return false
 	}
-	if err := os.MkdirAll(r.dir, 0o755); err != nil {
+	// SEC: запис — це кадри чужого екрана (паролі, листування). Каталог і
+	// файл — лише для власника процесу хаба, а не 0755/0644 для всіх на VPS.
+	if err := ensureRecordDir(r.dir); err != nil {
 		log.Printf("record: каталог %s не створився: %v", r.dir, err)
 		r.started = true
 		r.mkv = newMKVWriter(discardWriter{})
 		return false
 	}
 	r.part++
-	name := fmt.Sprintf("%s-%s.mkv", safeNodeID(r.nodeID), time.Now().UTC().Format("20060102-150405"))
-	if r.part > 1 {
-		// Та сама секунда, що й попередній файл сесії, — os.Create його затер би.
-		name = fmt.Sprintf("%s-%s-%d.mkv", safeNodeID(r.nodeID), time.Now().UTC().Format("20060102-150405"), r.part)
+	// O_EXCL: дві сесії однієї ноди в ту саму секунду не обнуляють запис
+	// одна одній (os.Create робив O_TRUNC), і підкладений симлінк не відкриваємо;
+	// зайняте імʼя — не відмова, а наступний суфікс.
+	key := currentRecordKey()
+	ext := ".mkv"
+	if key != nil {
+		ext = reccrypt.Ext
 	}
-	f, err := os.Create(filepath.Join(r.dir, name))
+	f, err := createRecordFileExt(r.dir, r.nodeID, time.Now(), ext)
 	if err != nil {
-		log.Printf("record: файл %s не створився: %v", name, err)
+		log.Printf("record: файл сесії ноди %s не створився: %v", r.nodeID, err)
 		r.started = true
 		r.mkv = newMKVWriter(discardWriter{})
 		return false
 	}
 	r.f, r.path = f, f.Name()
-	r.mkv = newMKVWriter(f)
+	var sink io.Writer = f
+	if key != nil {
+		ew, err := reccrypt.NewWriter(f, key)
+		if err != nil {
+			// Заголовок не ліг — файл без сенсу; прибираємо, щоб не лишити сміття.
+			log.Printf("record: шифрування %s не стартувало: %v — сесія не пишеться", r.path, err)
+			f.Close()
+			os.Remove(r.path)
+			r.f = nil
+			r.started = true
+			r.mkv = newMKVWriter(discardWriter{})
+			return false
+		}
+		sink = ew
+	}
+	r.mkv = newMKVWriter(sink)
 	r.fileBase = r.curPTS // open кличе flushAU на першому IDR файлу
 	if err := r.mkv.writeHeader(sps.Width, sps.Height, avcC(r.sps, r.pps), audioEnabled); err != nil {
 		log.Printf("record: заголовок %s не записався: %v", r.path, err)
@@ -493,6 +534,66 @@ func avcC(sps, pps []byte) []byte {
 	return append(b, pps...)
 }
 
+// recordDirPerm / recordFilePerm — права на записи сесій (SEC-аудит).
+const (
+	recordDirPerm  = 0o700
+	recordFilePerm = 0o600
+)
+
+// recordNameAttempts — скільки суфіксів пробуємо, коли імʼя вже зайняте (O_EXCL).
+const recordNameAttempts = 100
+
+// recordDirChmodWarned — щоб невдалий Chmod каталогу журналювався один раз.
+var recordDirChmodWarned atomic.Bool
+
+// ensureRecordDir створює каталог записів і ЗВУЖУЄ права вже наявного: MkdirAll
+// не чіпає каталог, створений колись як 0755, а в ньому лежать кадри чужих екранів.
+func ensureRecordDir(dir string) error {
+	if err := os.MkdirAll(dir, recordDirPerm); err != nil {
+		return err
+	}
+	fi, err := os.Stat(dir)
+	if err != nil {
+		return err
+	}
+	if fi.Mode().Perm()&^recordDirPerm != 0 {
+		if err := os.Chmod(dir, recordDirPerm); err != nil && recordDirChmodWarned.CompareAndSwap(false, true) {
+			log.Printf("record: права каталогу %s (%v) не звузились до %o: %v", dir, fi.Mode().Perm(), recordDirPerm, err)
+		}
+	}
+	return nil
+}
+
+// createRecordFile відкриває новий файл сесії з O_EXCL. Перша спроба —
+// "<node>-<UTC>.mkv"; якщо зайнято (друга сесія тієї ж ноди в ту саму секунду),
+// далі "<node>-<UTC>-2.mkv", "-3"... Розширення лишається .mkv, а лексикографічний
+// порядок у межах секунди — порядком створення до "-9" (прибирання все одно
+// сортує за mtime, див. recordprune.go).
+func createRecordFile(dir, node string, now time.Time) (*os.File, error) {
+	return createRecordFileExt(dir, node, now, ".mkv")
+}
+
+// createRecordFileExt — те саме з довільним суфіксом (S5: ".mkv.enc").
+func createRecordFileExt(dir, node string, now time.Time, ext string) (*os.File, error) {
+	base := fmt.Sprintf("%s-%s", safeNodeID(node), now.UTC().Format("20060102-150405"))
+	var err error
+	for i := 1; i <= recordNameAttempts; i++ {
+		name := base + ext
+		if i > 1 {
+			name = fmt.Sprintf("%s-%d%s", base, i, ext)
+		}
+		var f *os.File
+		f, err = os.OpenFile(filepath.Join(dir, name), os.O_WRONLY|os.O_CREATE|os.O_EXCL, recordFilePerm)
+		if err == nil {
+			return f, nil
+		}
+		if !errors.Is(err, fs.ErrExist) {
+			return nil, err
+		}
+	}
+	return nil, err
+}
+
 // safeNodeID — node_id приходить ВІД АГЕНТА, тобто ззовні, а ми робимо з нього
 // імʼя файлу. Лишаємо тільки [A-Za-z0-9._-]: інакше "../../etc/passwd" як node
 // став би шляхом, а не назвою.
@@ -516,7 +617,7 @@ func safeNodeID(id string) string {
 // recordIdleClose — скільки чекаємо після ОСТАННЬОГО глядача, перш ніж закрити
 // файл. Перепідключення після обриву (оновили сторінку, мигнула мережа) лишається
 // в тому самому файлі, а сеанс наступного дня — вже в новому.
-var recordIdleClose = 30 * time.Second
+var recordIdleClose atomic.Int64 // time.Duration; типово 30 с (init вище)
 
 // scheduleRecordClose закриває поточний файл ноди, якщо за recCfg.idle так і
 // не зʼявився жоден глядач. Close() чекає на писаря, тому поза таймерною горутиною.

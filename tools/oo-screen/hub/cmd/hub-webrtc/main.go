@@ -23,6 +23,7 @@ import (
 	"crypto/subtle"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -32,6 +33,7 @@ import (
 	"net/url"
 	"os"
 	"os/signal"
+	"runtime"
 	"sort"
 	"strconv"
 	"strings"
@@ -46,6 +48,8 @@ import (
 	"github.com/pion/webrtc/v4"
 
 	"github.com/organicoils/oo-screen/hub"
+	"github.com/organicoils/oo-screen/internal/cursorproto"
+	"github.com/organicoils/oo-screen/internal/p2p"
 )
 
 const (
@@ -90,6 +94,19 @@ func envOr(k, def string) string {
 
 const defaultToken = "t1-dev-token"
 
+// srtpReplayWindow — вікно SRTP/SRTCP replay protection (B6). Змінна, а не
+// константа, лише щоб bench міг зняти «до» тим самим бінарем
+// (OO_SCREEN_SRTP_REPLAY_WINDOW=64); у проді env не задається.
+// iceSockBuf — SO_RCVBUF/SO_SNDBUF спільного ICE UDP mux (B7).
+const iceSockBuf = 8 << 20
+
+var srtpReplayWindow = func() uint {
+	if v, err := strconv.Atoi(os.Getenv("OO_SCREEN_SRTP_REPLAY_WINDOW")); err == nil && v > 0 {
+		return uint(v)
+	}
+	return 1024
+}()
+
 var token = envOr("OO_SCREEN_T1_TOKEN", defaultToken)
 
 // listenAddr — адреса HTTP-сигналінгу. Дефолт той самий :4470, тож ні бенчі, ні
@@ -133,6 +150,13 @@ var (
 	// OO_SCREEN_ICE_TCP_PORT — порт ICE-TCP. 0 (дефолт) = TCP не слухаємо
 	// зовсім і NetworkTypes лишаються суто UDP.
 	iceTCPPort = envPort("OO_SCREEN_ICE_TCP_PORT", 0)
+	// N5: OO_SCREEN_ICE_TCP_ADVERTISE_PORT — порт, який хаб ОГОЛОШУЄ в
+	// TCP-кандидатах, якщо він відрізняється від порту, який слухає. Типовий
+	// прод: nginx `stream` тримає 443 і за ssl_preread віддає не-TLS потоки
+	// (ICE-TCP, RFC 4571) на 127.0.0.1:OO_SCREEN_ICE_TCP_PORT, а TLS — на
+	// HTTPS. Тоді глядач мусить стукати в 443, а не в внутрішній порт.
+	// 0 (дефолт) = оголошувати той, що слухаємо (поведінка як до N5).
+	iceTCPAdvertisePort = envPort("OO_SCREEN_ICE_TCP_ADVERTISE_PORT", 0)
 	// OO_SCREEN_STUN_URLS — список через кому ("stun:host:3478,stun:...").
 	stunURLs = envOr("OO_SCREEN_STUN_URLS", "")
 	// TURN — усі три змінні мають сенс лише разом; будь-яка порожня вимикає.
@@ -206,6 +230,9 @@ type offerReq struct {
 	// не заходив перший глядач. Відсутнє поле = старий агент без звуку, і
 	// тоді глядач отримує запасний тон (audio.go).
 	Audio bool `json:"audio,omitempty"`
+	// Monitor — F6 (multimon.go, лише viewer//control): який монітор ноди
+	// дивитись. 0/відсутнє = як раніше. Нода — з квитка, монітор лише звужує.
+	Monitor int `json:"monitor,omitempty"`
 }
 
 // outputInfo — монітор ПК агента. Форма 1-в-1 з capture.OutputInfo, але
@@ -238,6 +265,11 @@ type nodeSession struct {
 	nodeID string    // незмінний ключ у реєстрі
 	recCfg recordCfg // знімок налаштувань запису на момент створення; лише читання
 
+	// touched — UnixNano останнього getOrCreate цієї ноди (R5, nodereap.go):
+	// жнець не прибирає ноду, до якої щойно прийшов offer і агент ще
+	// домовляється (agentPC == nil до Connected).
+	touched atomic.Int64
+
 	mu      sync.Mutex
 	agentPC *webrtc.PeerConnection
 	// viewers — УСІ глядачі цієї ноди (fanout, див. fanout.go). Ключ — їхній
@@ -264,6 +296,10 @@ type nodeSession struct {
 	// на Failed/Closed канали обнуляються лише якщо вони ще його.
 	agentChanPC *webrtc.PeerConnection
 
+	// tiles — кеш текстових тайлів поточного епізоду (tiles.go). Порожній
+	// і невживаний без OO_SCREEN_TILES.
+	tiles tilesCache
+
 	// generation — покоління агентської ноги ЦІЄЇ ноди; гейтить старий read
 	// loop при replace. Доступ лише атомарно (&ns.generation).
 	generation uint64
@@ -276,9 +312,14 @@ type nodeSession struct {
 	// startBps — фактичний стартовий -bitrate агента з offer (стеля адаптації),
 	// 0 = агент поля не прислав -> фолбек startBitrateBps; lastKeyframeReq —
 	// дебаунс keyframe_request. Усі три під ns.mu.
-	bitrate         bitrateCtl
-	startBps        uint64
+	bitrate  bitrateCtl
+	startBps uint64
+	// videoMode — агент повідомив content_mode "video" (videoboost.go).
+	videoMode       bool
 	lastKeyframeReq time.Time
+	// kfTrailing — у дебаунс-вікні вже заплановано ОДИН відкладений
+	// keyframe-запит (requestKeyframe). Під ns.mu.
+	kfTrailing bool
 
 	// capBps / maxFps — стелі «Якості» і «Швидкості» з тулбара глядача (C1,
 	// outputs.go). 0 = стелі немає. Живуть, поки є хоч один глядач
@@ -313,6 +354,9 @@ type nodeSession struct {
 	// viewerCount — скільки глядачів зараз у мапі; атомарно, бо читається на
 	// кожному пакеті агентської ноги без ns.mu.
 	viewerCount atomic.Int32
+
+	// m — лічильники /metrics цієї ноди (metrics.go).
+	m nodeMetrics
 
 	// egress seq/ts — МОНОТОННІ на весь час життя ноди, ніколи не скидаються
 	// при заміні агента (generation): для кожного вхідного пакета egress =
@@ -449,15 +493,40 @@ func newRegistry() *registry {
 // getOrCreate повертає nodeSession для node, створюючи його за відсутності.
 // Використовує agent-нога (publisher реєструється) та viewer-нога у НЕ
 // ticket-режимі (T1: viewer може прийти раніше за агента й чекати).
+// nil — досягнуто стелі maxNodes (SEC #21).
 func (r *registry) getOrCreate(nodeID string) *nodeSession {
+	ns, _ := r.getOrCreateNew(nodeID)
+	return ns
+}
+
+// getOrCreateNew — як getOrCreate, але ще й каже, чи нода створена саме зараз
+// (SEC #17: невдалий offer мусить прибрати те, що сам створив).
+func (r *registry) getOrCreateNew(nodeID string) (*nodeSession, bool) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	ns := r.nodes[nodeID]
-	if ns == nil {
-		ns = &nodeSession{nodeID: nodeID, recCfg: currentRecordCfg()}
-		r.nodes[nodeID] = ns
+	if ns != nil {
+		ns.touched.Store(time.Now().UnixNano())
+		return ns, false
 	}
-	return ns
+	if len(r.nodes) >= maxNodes {
+		return nil, false
+	}
+	ns = &nodeSession{nodeID: nodeID, recCfg: currentRecordCfg()}
+	ns.touched.Store(time.Now().UnixNano())
+	r.nodes[nodeID] = ns
+	return ns, true
+}
+
+// removeIfIdle прибирає ноду, якщо в неї немає ні агента, ні глядачів (SEC #17:
+// невдалий agent-offer не лишає порожніх нод — інакше реєстр росте без меж).
+func (r *registry) removeIfIdle(ns *nodeSession) {
+	ns.mu.Lock()
+	idle := ns.agentPC == nil && len(ns.viewers) == 0
+	ns.mu.Unlock()
+	if idle {
+		r.remove(ns.nodeID, ns)
+	}
 }
 
 // get повертає nodeSession для node або nil. Використовує viewer-нога у
@@ -538,6 +607,7 @@ func closeNode(ns *nodeSession) {
 	}
 
 	reg.remove(ns.nodeID, ns)
+	forgetRelays(ns)
 	log.Printf("runtime-revoke: node=%s closed (%d viewer leg(s))", ns.nodeID, len(viewerPCs))
 }
 
@@ -589,7 +659,23 @@ func applyICEUDPMux(se *webrtc.SettingEngine) error {
 			iceMux.err = fmt.Errorf("ICE UDP mux :%d: %w", icePort, err)
 			return
 		}
-		mux := webrtc.NewICEUDPMux(nil, conn)
+		// B7: буфери сокета. Через цей ОДИН сокет іде весь вхід процесу:
+		// медіа КОЖНОГО агента плюс RTCP усіх глядачів. Дефолт ядра
+		// (rmem_default ≈ 208 КБ) менший за одну IDR-пачку 8 Мбіт/с, тож
+		// ядро мовчки викидало пакети агента (замір: +161 drop на сокеті
+		// mux за 20 с на 1×16) — далі NACK, ретрансмісія через ~100 мс і
+		// хвіст p99 у ВСІХ глядачів ноди. Ядро обріже запит до rmem_max/
+		// wmem_max; помилка тут не фатальна — це лише запас.
+		_ = conn.SetReadBuffer(iceSockBuf)
+		_ = conn.SetWriteBuffer(iceSockBuf)
+		// B7: один писар (+ GSO на Linux) замість N pump-ів, що б'ються за
+		// fdMutex цього сокета, — див. egress.go. OO_SCREEN_EGRESS=direct
+		// повертає прямий запис (порівняльний замір, аварійний відкат).
+		var pc net.PacketConn = conn
+		if os.Getenv("OO_SCREEN_EGRESS") != "direct" {
+			pc = newEgressConn(conn)
+		}
+		mux := webrtc.NewICEUDPMux(nil, pc)
 		iceMux.apply = func(se *webrtc.SettingEngine) { se.SetICEUDPMux(mux) }
 		log.Printf("ICE UDP mux слухає :%d (один сокет на всі ноги)", icePort)
 	})
@@ -606,6 +692,7 @@ var iceTCPMux struct {
 	once  sync.Once
 	apply func(*webrtc.SettingEngine)
 	err   error
+	ln    net.Listener // для тестів: закрити слухача між прогонами
 }
 
 // iceTCPReadBuffer — скільки пакетів тримати в буфері одного TCP-стріму до
@@ -627,6 +714,7 @@ func applyICETCPMux(se *webrtc.SettingEngine) error {
 			iceTCPMux.err = fmt.Errorf("ICE TCP mux :%d: %w", iceTCPPort, err)
 			return
 		}
+		iceTCPMux.ln = ln
 		mux := webrtc.NewICETCPMux(nil, ln, iceTCPReadBuffer)
 		iceTCPMux.apply = func(se *webrtc.SettingEngine) { se.SetICETCPMux(mux) }
 		log.Printf("ICE TCP mux слухає :%d (запасний шлях для глядача за firewall-ом)", iceTCPPort)
@@ -636,6 +724,36 @@ func applyICETCPMux(se *webrtc.SettingEngine) error {
 	}
 	iceTCPMux.apply(se)
 	return nil
+}
+
+// advertiseICETCPPort (N5) переписує порт у TCP-кандидатах answer-а з того,
+// який хаб слухає (OO_SCREEN_ICE_TCP_PORT), на той, у який має стукати глядач
+// (OO_SCREEN_ICE_TCP_ADVERTISE_PORT, напр. 443 за nginx stream). pion не вміє
+// «NAT 1:1 для порту», тому правимо SDP: кандидати в answer-і повні (ми чекаємо
+// GatheringComplete), trickle немає. UDP-кандидати не чіпаються.
+//
+// Формат рядка (RFC 8839): a=candidate:<f> <comp> <transport> <prio> <addr>
+// <port> typ <type> [...]. Міняємо поле port, лише якщо transport=tcp і
+// port == порт слухача — так активні (port 9) і чужі кандидати лишаються.
+func advertiseICETCPPort(sdp string) string {
+	if iceTCPPort == 0 || iceTCPAdvertisePort == 0 || iceTCPAdvertisePort == iceTCPPort {
+		return sdp
+	}
+	from := strconv.Itoa(int(iceTCPPort))
+	to := strconv.Itoa(int(iceTCPAdvertisePort))
+	lines := strings.Split(sdp, "\n")
+	for i, ln := range lines {
+		if !strings.HasPrefix(ln, "a=candidate:") {
+			continue
+		}
+		f := strings.Split(ln, " ")
+		if len(f) < 6 || !strings.EqualFold(f[2], "tcp") || strings.TrimRight(f[5], "\r") != from {
+			continue
+		}
+		f[5] = strings.Replace(f[5], from, to, 1)
+		lines[i] = strings.Join(f, " ")
+	}
+	return strings.Join(lines, "\n")
 }
 
 // newAPI будує API для ОДНІЄЇ ноги. profile — profile-level-id, який ця нога
@@ -664,11 +782,7 @@ func newAPI(profile string) (*webrtc.API, error) {
 			// натомість потік зворотного звʼязку, який нікуди не йде.
 			// Апгрейд робиться на місці: зʼявиться оцінювач — додається
 			// {Type: "transport-cc"} і ConfigureTWCCSender.
-			RTCPFeedback: []webrtc.RTCPFeedback{
-				{Type: "nack"},
-				{Type: "nack", Parameter: "pli"},
-				{Type: "goog-remb"},
-			},
+			RTCPFeedback: videoFeedback(),
 		},
 		PayloadType: 102,
 	}, webrtc.RTPCodecTypeVideo); err != nil {
@@ -680,13 +794,25 @@ func newAPI(profile string) (*webrtc.API, error) {
 	if err := registerAudioCodec(m); err != nil {
 		return nil, err
 	}
+	// red+ulpfec — лише під OO_SCREEN_FEC (fec.go).
+	if err := registerFECCodecs(m); err != nil {
+		return nil, err
+	}
 
 	i := &interceptor.Registry{}
-	if err := webrtc.RegisterDefaultInterceptors(m, i); err != nil {
+	if err := registerHubInterceptors(m, i); err != nil {
 		return nil, err
 	}
 
 	se := webrtc.SettingEngine{}
+	// B6: вікно захисту від повтору SRTP/SRTCP — 1024 (як у libwebrtc) на ОБОХ
+	// ногах: newAPI спільний для агента і глядачів. Дефолт pion — 64 пакети:
+	// на нозі агент->хаб NACK-ретрансмісія приходить через RTT + опит NACK
+	// (100 мс у pion), тобто через сотні пакетів IDR-пачки, і SRTP-шар хаба
+	// мовчки її відкидав як «повтор» — кадр лишався дірявим для ВСІХ глядачів
+	// ноди. Замір: bench/RESULTS-hub.md, «### B6–B7».
+	se.SetSRTPReplayProtectionWindow(srtpReplayWindow)
+	se.SetSRTCPReplayProtectionWindow(srtpReplayWindow)
 	// Базово — host-кандидати по UDP, як і було. H-19: TCP додається лише тоді,
 	// коли для нього ЯВНО задано порт (див. applyICETCPMux нижче); порожній env
 	// лишає рівно колишню поведінку.
@@ -774,7 +900,15 @@ func authorizeViewer(req offerReq) (*nodeSession, *hub.TicketClaims, int, string
 		if !tokenMatches(req.Token) {
 			return nil, nil, http.StatusUnauthorized, "bad token"
 		}
-		return reg.getOrCreate(agentNodeIDEnv), nil, 0, ""
+		node, ok := viewerStreamNode(agentNodeIDEnv, req.Monitor)
+		if !ok {
+			return nil, nil, http.StatusBadRequest, "bad monitor"
+		}
+		ns := reg.getOrCreate(node)
+		if ns == nil {
+			return nil, nil, http.StatusServiceUnavailable, "too many nodes"
+		}
+		return ns, nil, 0, ""
 	}
 
 	// hardening (blocker-2): static-token гілка для viewer у проді
@@ -782,7 +916,7 @@ func authorizeViewer(req offerReq) (*nodeSession, *hub.TicketClaims, int, string
 	if req.Ticket == "" {
 		return nil, nil, http.StatusForbidden, "ticket required"
 	}
-	claims, err := hub.ConsumeTicket(erpBase, hubKey, req.Ticket)
+	claims, err := consumeViewerTicket(req.Ticket)
 	if err != nil {
 		log.Printf("viewer ticket consume failed: %v", err)
 		return nil, nil, http.StatusForbidden, "ticket consume failed"
@@ -794,6 +928,10 @@ func authorizeViewer(req offerReq) (*nodeSession, *hub.TicketClaims, int, string
 	if node == "" {
 		log.Printf("viewer ticket has empty node_id, fail-closed")
 		return nil, nil, http.StatusForbidden, "node required"
+	}
+	node, ok := viewerStreamNode(node, req.Monitor)
+	if !ok {
+		return nil, nil, http.StatusBadRequest, "bad monitor"
 	}
 	ns := reg.get(node)
 	if ns == nil || !ns.hasAgent() {
@@ -843,7 +981,16 @@ func handleOffer(leg string) http.HandlerFunc {
 			// legProfile — profile-level-id, який ця нога оголошує. Agent-нога
 			// бере його зі свого ж offer-а, viewer-нога — з ноди.
 			legProfile string
+			// agentCreated — agent-offer створив ноду сам (SEC #17); answered —
+			// дійшли до answer. Невдалий offer прибирає створену ним ноду.
+			agentCreated bool
+			answered     bool
 		)
+		defer func() {
+			if agentCreated && !answered {
+				reg.removeIfIdle(ns)
+			}
+		}()
 
 		switch {
 		case leg == "viewer":
@@ -853,6 +1000,12 @@ func handleOffer(leg string) http.HandlerFunc {
 			viewerTicket = req.Ticket
 			if status != 0 {
 				http.Error(w, msg, status)
+				return
+			}
+			// SEC: стеля глядачів на ноду. Без неї кожна viewer-нога = PeerConnection,
+			// черга й дві горутини без жодної межі (DoS памʼяттю/CPU хаба).
+			if viewerCapReached(ns) {
+				http.Error(w, "too many viewers for node", http.StatusTooManyRequests)
 				return
 			}
 			legProfile = ns.videoProfile()
@@ -872,17 +1025,22 @@ func handleOffer(leg string) http.HandlerFunc {
 				return
 			}
 		default:
-			// Agent-нога: статичний token завжди. Node з offer (поле "node"),
-			// фолбек — env OO_SCREEN_AGENT_NODE_ID (один T1-агент без -node).
-			if !tokenMatches(req.Token) {
-				http.Error(w, "bad token", http.StatusUnauthorized)
-				return
-			}
+			// Agent-нога: токен НОДИ (SEC #17, agentauth.go) або легасі-спільний.
+			// Node з offer (поле "node"), фолбек — env OO_SCREEN_AGENT_NODE_ID.
 			node := req.Node
 			if node == "" {
 				node = agentNodeIDEnv
 			}
-			ns = reg.getOrCreate(node)
+			if !validAgentNodeID(node) || !agentAuthorized(agentAuthNode(node), req.Token) {
+				http.Error(w, "bad token", http.StatusUnauthorized)
+				return
+			}
+			ns, agentCreated = reg.getOrCreateNew(node)
+			if ns == nil {
+				log.Printf("offer/agent [node=%s]: стеля нод %d (OO_SCREEN_MAX_NODES) — відмова", node, maxNodes)
+				http.Error(w, "too many nodes", http.StatusServiceUnavailable)
+				return
+			}
 			// Стартовий бітрейт агента = стеля адаптації (bitrate.go). Старий
 			// агент поля не шле — лишається фолбек startBitrateBps.
 			if req.Bitrate > 0 {
@@ -927,7 +1085,6 @@ func handleOffer(leg string) http.HandlerFunc {
 		}
 		// H-04: кожен error-path нижче раніше лишав PeerConnection (ICE-агент,
 		// UDP-сокети, горутини) жити назавжди. Закриваємо, якщо не дійшли до answer.
-		answered := false
 		defer func() {
 			if !answered {
 				_ = pc.Close()
@@ -943,6 +1100,10 @@ func handleOffer(leg string) http.HandlerFunc {
 		case "viewer":
 			var err error
 			if sessionID, err = setupViewerLeg(ns, pc, viewerClaims, viewerTicket, legProfile); err != nil {
+				if errors.Is(err, errViewerCap) {
+					http.Error(w, "too many viewers for node", http.StatusTooManyRequests)
+					return
+				}
 				http.Error(w, err.Error(), http.StatusInternalServerError)
 				return
 			}
@@ -954,6 +1115,9 @@ func handleOffer(leg string) http.HandlerFunc {
 			http.Error(w, "bad offer sdp", http.StatusBadRequest)
 			log.Printf("offer/%s: SetRemoteDescription: %v", leg, err)
 			return
+		}
+		if leg == "viewer" {
+			bindViewerFEC(pc)
 		}
 		answer, err := pc.CreateAnswer(nil)
 		if err != nil {
@@ -1011,7 +1175,7 @@ func handleOffer(leg string) http.HandlerFunc {
 		}
 
 		answered = true
-		writeJSON(w, answerResp{SDP: pc.LocalDescription().SDP, SessionID: sessionID, Leg: sessionID, Type: "answer"})
+		writeJSON(w, answerResp{SDP: advertiseICETCPPort(pc.LocalDescription().SDP), SessionID: sessionID, Leg: sessionID, Type: "answer"})
 	}
 }
 
@@ -1028,6 +1192,27 @@ var (
 func internalError(w http.ResponseWriter, where string, err error) {
 	log.Printf("offer: %s: %v", where, err)
 	http.Error(w, "internal error", http.StatusInternalServerError)
+}
+
+// maxViewersPerNode — стеля одночасних viewer-ніг однієї ноди (SEC-аудит).
+// Env OO_SCREEN_MAX_VIEWERS перекриває; невалідне/нульове — дефолт 16.
+var maxViewersPerNode = func() int {
+	if v, err := strconv.Atoi(os.Getenv("OO_SCREEN_MAX_VIEWERS")); err == nil && v > 0 {
+		return v
+	}
+	return 16
+}()
+
+// errViewerCap — стелю досягнуто вже під час реєстрації ноги (гонка
+// паралельних /offer повз ранню перевірку viewerCapReached).
+var errViewerCap = errors.New("too many viewers for node")
+
+// viewerCapReached — чи вже досягнуто стелі глядачів ноди.
+func viewerCapReached(ns *nodeSession) bool {
+	ns.mu.Lock()
+	n := len(ns.viewers)
+	ns.mu.Unlock()
+	return n >= maxViewersPerNode
 }
 
 // maxOfferBody — стеля тіла /offer/* і /control (SDP ~ 3–10 КБ; 256 КБ = запас).
@@ -1090,6 +1275,7 @@ func setupAgentLeg(ns *nodeSession, pc *webrtc.PeerConnection) error {
 	// Control-DataChannel від агента (on-demand гейтинг). Коли відкриється —
 	// одразу шлемо поточний стан присутності глядача, щоб агент, який щойно
 	// (пере)підключився, миттєво знав: кодувати чи простоювати.
+	tilesOn := tilesEnabled // знімок прапорця: колбеки живуть довше за виклик
 	pc.OnDataChannel(func(dc *webrtc.DataChannel) {
 		switch dc.Label() {
 		case "oosc-ctl":
@@ -1097,7 +1283,7 @@ func setupAgentLeg(ns *nodeSession, pc *webrtc.PeerConnection) error {
 			ns.agentCtrl, ns.agentChanPC = dc, pc
 			ns.mu.Unlock()
 			setAgentUnavailable(ns, "") // нова нога — агент повторить причину сам
-			dc.OnMessage(func(msg webrtc.DataChannelMessage) { handleAgentCtl(ns, msg.Data) })
+			dc.OnMessage(func(msg webrtc.DataChannelMessage) { handleAgentCtl(ns, msg.Data, time.Now()) })
 			// Пульс заводиться разом із гейтом і живе рівно стільки, скільки
 			// цей канал (heartbeat.go). Без нього агент на паузі не має ЖОДНОЇ
 			// ознаки, що хаб іще живий.
@@ -1125,6 +1311,21 @@ func setupAgentLeg(ns *nodeSession, pc *webrtc.PeerConnection) error {
 			ns.agentInput, ns.agentChanPC = dc, pc
 			ns.mu.Unlock()
 			log.Printf("input: agent channel open [node=%s]", ns.nodeID)
+		case tilesLabel:
+			// Текстові тайли (tiles.go) — лише під OO_SCREEN_TILES.
+			if !tilesOn {
+				return
+			}
+			log.Printf("tiles: agent channel open [node=%s]", ns.nodeID)
+			dc.OnMessage(func(msg webrtc.DataChannelMessage) {
+				if msg.IsString {
+					return
+				}
+				onAgentTiles(ns, msg.Data)
+			})
+		case cursorproto.ChannelLabel:
+			// Шар курсора (cursor.go): агент із -cursor-layer.
+			attachAgentRelay(ns, dc, cursorRelayConfig())
 		}
 	})
 
@@ -1142,6 +1343,9 @@ func setupAgentLeg(ns *nodeSession, pc *webrtc.PeerConnection) error {
 		ns.mu.Lock()
 		prevPC := ns.agentPC
 		ns.agentPC = pc
+		if prevPC != pc {
+			ns.gop.reset() // B2: кеш попереднього кодера новому треку чужий
+		}
 		ns.agentSSRC = webrtc.SSRC(track.SSRC())
 		ns.mu.Unlock()
 		myGen := atomic.AddUint64(&ns.generation, 1)
@@ -1207,6 +1411,7 @@ func setupAgentLeg(ns *nodeSession, pc *webrtc.PeerConnection) error {
 						ns.rec.Store(rec)
 					}
 				}
+				metricsAgentPacket(ns, pkt, time.Now())
 				rec.offer(pkt)
 				forwardToViewers(ns, myGen, pkt)
 			}
@@ -1234,6 +1439,11 @@ func setupAgentLeg(ns *nodeSession, pc *webrtc.PeerConnection) error {
 			ns.mu.Lock()
 			prev := ns.agentPC
 			ns.agentPC = pc
+			if prev != pc {
+				// B2: новий publisher починає з порожнього кешу GOP — кадри
+				// попереднього кодера цьому потоку чужі.
+				ns.gop.reset()
+			}
 			ns.mu.Unlock()
 			if prev != pc {
 				if prev != nil {
@@ -1257,8 +1467,20 @@ func setupAgentLeg(ns *nodeSession, pc *webrtc.PeerConnection) error {
 			gone := ns.agentPC == pc
 			if gone {
 				ns.agentPC = nil
+				// B2/B3: кеш GOP мертвого кодера — геть ОДРАЗУ, під тим самим
+				// локом, що й «агента немає». Інакше новий агент отримує глядачів
+				// зі старим кадром (recomputeBinding праймить їх раніше, ніж
+				// genSwitched у forwardToViewers встигне скинути кеш), а нода без
+				// агента до кінця життя тримає до gopMaxBytes чужих payload-ів.
+				ns.gop.reset()
 			}
 			ns.mu.Unlock()
+			if gone && tilesOn {
+				agentTilesGone(ns)
+			}
+			if gone {
+				agentRelaysGone(ns)
+			}
 			if gone {
 				// Логуємо ОБОВ'ЯЗКОВО: це єдиний слід втрати публікатора.
 				// OnICEConnectionStateChange нижче пише лише стан ICE, а це
@@ -1343,7 +1565,13 @@ func setupViewerLeg(ns *nodeSession, pc *webrtc.PeerConnection, claims *hub.Tick
 	// Нога стає в ряд до наявних; ще НЕ live — forwardToViewers форвардить лише
 	// у ноги з vl.live, а це вмикає тільки recomputeBinding() після Connected ТА
 	// наявного publisher-а цієї ноди (на failure/close знімаємо назад).
-	vl := addViewer(ns, pc, trk, viewerUserID)
+	vl := addViewerLimit(ns, pc, trk, viewerUserID, maxViewersPerNode)
+	if vl == nil {
+		return "", errViewerCap
+	}
+	if delayBWEEnabled {
+		vl.tcc.Store(newTwccLeg(sender))
+	}
 	// Профіль глядач прочитав у handleOffer ДО реєстрації. Offer агента зі
 	// зрослим рівнем між тим читанням і addViewer рве лише ноги, що вже були в
 	// ns.viewers, — цю він не побачив. Перевіряємо після реєстрації: або
@@ -1367,6 +1595,7 @@ func setupViewerLeg(ns *nodeSession, pc *webrtc.PeerConnection, claims *hub.Tick
 	ns.mu.Lock()
 	vl.sessionID = sessionID
 	ns.mu.Unlock()
+	auditViewerStart(ns, vl, claims)
 	if atrk != nil {
 		go vl.audioPump(ns, atrk)
 	}
@@ -1374,6 +1603,9 @@ func setupViewerLeg(ns *nodeSession, pc *webrtc.PeerConnection, claims *hub.Tick
 	// Канал вводу (input.go) — ЛИШЕ під прапорцем І ЛИШЕ для ноги з квитком.
 	// Без прапорця OnDataChannel не ставиться взагалі: канал, який відкриє
 	// браузер, лишиться без обробника, і жодна подія нікуди не поїде.
+	// Канали глядача. pion тримає ОДИН OnDataChannel на PeerConnection,
+	// тож обробники збираються тут і диспетчеризуються за міткою.
+	var onInput func(*webrtc.DataChannel)
 	if inputEnabled && ticket != "" {
 		// grant із квитка — рівень дозволу, який визначив ЕРП. Порожній
 		// claims (T1-режим) дає порожній grant, і канал вводу такій нозі не
@@ -1382,14 +1614,29 @@ func setupViewerLeg(ns *nodeSession, pc *webrtc.PeerConnection, claims *hub.Tick
 		if claims != nil {
 			grant = claims.Grant
 		}
-		attachViewerInput(ns, vl, pc, ticket, grant)
+		onInput = viewerInputHandler(ns, vl, ticket, grant)
 	}
+	tilesOn := tilesEnabled
+	// Канал курсора (cursor.go) приймається завжди: його відкриває лише плеєр
+	// з config.cursorLayer, а дані в нього йдуть лише від агента з
+	// -cursor-layer. Без каналу від браузера обробник просто не спрацьовує.
+	pc.OnDataChannel(func(dc *webrtc.DataChannel) {
+		switch {
+		case (dc.Label() == inputChannelLabel || dc.Label() == inputMoveChannelLabel) && onInput != nil:
+			onInput(dc)
+		case dc.Label() == tilesLabel && tilesOn:
+			viewerTilesHandler(ns, vl, dc)
+		case dc.Label() == cursorproto.ChannelLabel:
+			viewerRelayHandler(ns, pc, dc, cursorRelayConfig())
+		}
+	})
 
 	pc.OnConnectionStateChange(func(s webrtc.PeerConnectionState) {
 		log.Printf("viewer leg PC state [node=%s]: %s", ns.nodeID, s)
 		switch s {
 		case webrtc.PeerConnectionStateConnected:
 			first := markViewerReady(ns, vl)
+			sendViewerJoin(ns, vl) // S3: агент перепитує згоду на КОЖНОГО нового глядача
 			recomputeBinding(ns)
 			sendGate(ns) // зʼявився глядач → агент кодує (resume — вже на ПЕРШОМУ)
 			if first {
@@ -1399,6 +1646,7 @@ func setupViewerLeg(ns *nodeSession, pc *webrtc.PeerConnection, claims *hub.Tick
 				// яку веде найгірша нога (worstViewerRR). resetBitrate сам шле
 				// і ціль, і keyframe.
 				resetBitrate(ns)
+				metricsNoteBitrate(ns, 0, "reset", 0)
 			} else if !viewerPrimed(ns, vl) {
 				// Новий глядач посеред потоку не має чекати природного IDR
 				// (GOP 2с) — просимо keyframe (дебаунс усередині). Пункт 41:
@@ -1435,6 +1683,8 @@ func setupViewerLeg(ns *nodeSession, pc *webrtc.PeerConnection, claims *hub.Tick
 			for _, p := range pkts {
 				switch pkt := p.(type) {
 				case *rtcp.PictureLossIndication:
+					ns.m.pliFromViewers.Add(1)
+					notePLI(ns, vl) // B4: keyframe-request rate ноги
 					propagatePLI(ns)
 				case *rtcp.TransportLayerNack:
 					// NACK responder pion відповідає на цей же пакет сам
@@ -1444,16 +1694,22 @@ func setupViewerLeg(ns *nodeSession, pc *webrtc.PeerConnection, claims *hub.Tick
 					// нозі більше не рятує, переходимо на keyframe (nack.go).
 					st := onNack(ns, vl, pkt, time.Now())
 					logNackWindow(ns.nodeID, st)
+					metricsNack(ns, pkt, st)
 					if st.escalate {
 						propagatePLI(ns)
 					}
+				case *rtcp.TransportLayerCC:
+					// N3: transport-cc фідбек -> детектор затримки (delaybwe.go).
+					onTWCC(ns, vl, pkt, time.Now())
 				case *rtcp.ReceiverEstimatedMaximumBitrate:
 					// Пункт 40. REMB — це ПРЯМА оцінка смуги hub->глядач від
 					// самого приймача, і вона приходить раніше за втрати в RR:
 					// браузер бачить, що черга наливається, ще до першого
 					// втраченого пакета. Ціль = min(REMB, рішення по втратах),
 					// див. bitrateCtl.withRemb.
+					prev := bitrateTarget(ns)
 					onRembEstimate(ns, uint64(pkt.Bitrate), time.Now())
+					metricsNoteBitrate(ns, prev, "remb", 0)
 				case *rtcp.ReceiverReport:
 					// На цій нозі рівно один відеотрек, тож і reception report
 					// один; цикл — на випадок, коли їх складено кілька в пакет.
@@ -1467,7 +1723,11 @@ func setupViewerLeg(ns *nodeSession, pc *webrtc.PeerConnection, claims *hub.Tick
 						// контролер веде НАЙГІРША нога, а не та, чий RR
 						// щойно прийшов (див. worstViewerRR).
 						loss, jitter, rttExcess := worstViewerRR(ns, vl, float64(rr.FractionLost)/256, rr.Jitter, rtt, now)
-						onReceiverReport(ns, loss, jitter, rttExcess, now)
+						prev := bitrateTarget(ns)
+						// B4: втрати до ретрансмісії та PLI — RR їх не бачить.
+						sig := legCongestion(ns, vl, rr.SSRC, now)
+						onReceiverReportSig(ns, loss, jitter, rttExcess, sig, now)
+						metricsNoteBitrate(ns, prev, bitrateReason(ns), loss)
 					}
 				}
 			}
@@ -1568,7 +1828,7 @@ func renegotiateViewer(w http.ResponseWriter, req offerReq) {
 		return
 	}
 	log.Printf("renegotiate [node=%s]: viewer leg ICE restarted", ns.nodeID)
-	writeJSON(w, answerResp{SDP: pc.LocalDescription().SDP, SessionID: req.SessionID, Type: "answer"})
+	writeJSON(w, answerResp{SDP: advertiseICETCPPort(pc.LocalDescription().SDP), SessionID: req.SessionID, Type: "answer"})
 }
 
 // restartReq — тіло POST /offer/viewer/restart (контракт C3).
@@ -1622,6 +1882,7 @@ func drainRTCP(read func([]byte) (int, interceptor.Attributes, error)) {
 // переповнить, і рвемо саме його ногу.
 func forwardToViewers(ns *nodeSession, gen uint64, pkt *rtp.Packet) {
 	ns.mu.Lock()
+	metricsObserveKeyframeReqLocked(ns)
 	if !hasLiveViewerLocked(ns) {
 		ns.mu.Unlock()
 		return
@@ -1679,10 +1940,17 @@ func forwardToViewers(ns *nodeSession, gen uint64, pkt *rtp.Packet) {
 	out := &rtp.Packet{Header: pkt.Header, Payload: pkt.Payload}
 	out.SequenceNumber = outSeq
 	out.Timestamp = outTS
+	fanoutLatMark(outSeq, time.Now())
 
 	// Пункт 41: той самий вказівник осідає в кеші GOP — нова нога отримає його
 	// звідти, а не чекатиме наступного IDR.
-	ns.gop.note(out)
+	// Бюджет у байтах — від СТЕЛІ ноди, а не поточної цілі: кодер сходить до
+	// нової цілі лише за GOP, і хвіст, набраний на старому бітрейті, не має
+	// рватися через те, що ціль щойно впала.
+	ns.gop.setBitrate(ns.ceilingBps())
+	// B1: «ключовий» для drop-to-IDR — це ПОЧАТОК ключового AU, а не будь-який
+	// пакет із NAL 5: старт FU-A другого слайса IDR без SPS/PPS не декодується.
+	isKey := ns.gop.note(out)
 
 	// send неблокуючий: черга повна => ця нога відстає від джерела.
 	//
@@ -1691,7 +1959,6 @@ func forwardToViewers(ns *nodeSession, gen uint64, pkt *rtp.Packet) {
 	// наступного ключового пакета, і саме ця пауза дає її pump-у розібрати
 	// чергу. Рвемо лише того, кому це не допомогло viewerOverflowStreakMax разів
 	// поспіль — і, як і раніше, ПОЗА локом (dropViewer смикає колбеки pion).
-	isKey := h264KeyPart(out.Payload)
 	var slow []*viewerLeg
 	overflowed := false
 	for _, vl := range ns.viewers {
@@ -1700,14 +1967,30 @@ func forwardToViewers(ns *nodeSession, gen uint64, pkt *rtp.Packet) {
 		}
 		if vl.discarding {
 			if !isKey {
+				ns.m.viewerDrops.Add(1)
 				continue // кадр у смітник: нога зараз наздоганяє
 			}
 			// Ключовий набір — точка, з якої декодер уміє почати заново.
 			vl.discarding = false
 		}
-		select {
-		case vl.out <- out:
-		default:
+		// Нога, якій щойно віддали кеш GOP, має в черзі ще й той хвіст: йому
+		// дозволено лежати ПОНАД viewerQueueDepth (ємність каналу це вміщає),
+		// а поріг відставання повертається до звичного, щойно pump його розібрав.
+		limit := viewerQueueDepth + vl.primeSlack
+		if vl.primeSlack > 0 && len(vl.out) < viewerQueueDepth {
+			vl.primeSlack = 0
+			limit = viewerQueueDepth
+		}
+		var sent bool
+		if len(vl.out) < limit {
+			select {
+			case vl.out <- out:
+				sent = true
+			default:
+			}
+		}
+		if !sent {
+			ns.m.viewerDrops.Add(1)
 			now := time.Now()
 			if vl.overflowAt.IsZero() || now.Sub(vl.overflowAt) > viewerOverflowWindow {
 				vl.overflowStreak = 1 // попереднє переповнення було давно — це новий епізод
@@ -1780,29 +2063,46 @@ func recomputeBinding(ns *nodeSession) {
 			vl.primed = primeViewerLocked(ns, vl)
 		}
 	}
+	// B3: кеш наповнює лише forwardToViewers, а той без живого глядача (чи без
+	// агента) нічого не пише. Тобто кеш ноди, на яку зараз ніхто не дивиться,
+	// — це вже застарілий хвіст: віддати його наступному глядачеві означало б
+	// показати давній кадр, а тримати — до gopMaxBytes пам'яті на кожну таку
+	// ноду (88 % залишкової купи в soak). Відпускаємо одразу.
+	if !hasLiveViewerLocked(ns) {
+		ns.gop.reset()
+	}
 }
 
 // primeViewerLocked віддає новій нозі кеш GOP ноди. true = картинка в неї
 // поїде одразу, тобто позачерговий IDR у агента просити не треба.
 // Кликати ЛИШЕ під ns.mu.
 //
-// Черга свіжої ноги порожня, а кеш обмежений тією ж стелею gopMaxPackets =
-// viewerQueueDepth, тож у нормі влазить цілком; якщо ні — це вже не наш
-// випадок «глядач щойно зайшов», і ногу лікує звичайний requestKeyframe.
+// Черга свіжої ноги порожня, а її ємність — viewerQueueDepth + gopMaxPackets,
+// тож кеш у нормі влазить цілком; якщо ні — це вже не наш випадок «глядач
+// щойно зайшов», і ногу лікує звичайний requestKeyframe. Скільки з цього —
+// хвіст кешу, пам'ятає vl.primeSlack (поріг відставання у forwardToViewers).
 func primeViewerLocked(ns *nodeSession, vl *viewerLeg) bool {
-	pkts := ns.gop.replay()
+	pkts, nbytes, tooBig := ns.gop.replayFor()
+	if tooBig {
+		log.Printf("gop skip [node=%s]: хвіст %d Б > бюджету відтворення %d Б — keyframe_request замість кешу", ns.nodeID, nbytes, gopReplayBudget(ns.gop.bps))
+		return false
+	}
 	if len(pkts) == 0 {
 		return false
 	}
-	for _, p := range pkts {
-		select {
-		case vl.out <- p:
-		default:
-			log.Printf("gop prime [node=%s]: черга глядача не вмістила кеш — лишаємо keyframe_request", ns.nodeID)
-			return false
-		}
+	// Все-або-нічого: частково вкладений кеш при primeSlack=0 дав би
+	// неперервний лише до розриву потік — живі пакети різались би як
+	// відставання. Під ns.mu черга лише спорожнюється (читач — writer-горутина),
+	// тож вільне місце, виміряне тут, не зменшиться до кінця циклу.
+	if cap(vl.out)-len(vl.out) < len(pkts) {
+		log.Printf("gop prime [node=%s]: черга глядача не вмістить кеш (%d пакетів) — лишаємо keyframe_request", ns.nodeID, len(pkts))
+		return false
 	}
-	log.Printf("gop prime [node=%s]: віддано %d кешованих пакетів від останнього IDR", ns.nodeID, len(pkts))
+	for _, p := range pkts {
+		vl.out <- p
+	}
+	vl.primeSlack = len(pkts)
+	log.Printf("gop prime [node=%s]: віддано %d кешованих пакетів (%d Б) від останнього IDR", ns.nodeID, len(pkts), nbytes)
 	return true
 }
 
@@ -2062,6 +2362,7 @@ func sendPLIToAgent(ns *nodeSession) bool {
 		log.Printf("PLI агенту [node=%s]: %v", ns.nodeID, err)
 		return false
 	}
+	ns.m.agentPLISent.Add(1)
 	return true
 }
 
@@ -2113,23 +2414,31 @@ func startRevokeSubscription(ctx context.Context) {
 func applyRevoke(kind, val string) {
 	switch kind {
 	case "node":
+		p2pRevoke(func(g p2p.Grant) bool { return g.Node == val })
 		if ns := reg.get(val); ns != nil {
+			closeNode(ns)
+		}
+		// F6: потоки додаткових моніторів — та сама нода.
+		for _, ns := range monitorStreamSessions(val) {
 			closeNode(ns)
 		}
 	case "user":
 		for _, ns := range reg.nodesForUser(val) {
 			dropUserViewers(ns, val)
 		}
+		p2pRevoke(func(g p2p.Grant) bool { return g.User == val })
 	case hub.RevokeKindNodeUser:
 		nodeID, userID := hub.SplitNodeUser(val)
 		if ns := reg.get(nodeID); ns != nil {
 			dropUserViewers(ns, userID)
 		}
+		p2pRevoke(func(g p2p.Grant) bool { return g.Node == nodeID && g.User == userID })
 	case hub.RevokeKindStale:
 		// ERP мовчить довше за поріг — жоден дозвіл більше не підтверджений,
 		// тож знімаємо ВСІХ глядачів (агенти лишаються: вони дозволу не
 		// потребують). Причина й тривалість уже в журналі (revoke.go,
 		// staleGate.observe); тут — лише скільки нод це зачепило.
+		p2pRevoke(func(p2p.Grant) bool { return true })
 		all := reg.all()
 		dropped := 0
 		for _, ns := range all {
@@ -2147,23 +2456,41 @@ func main() {
 	if token == defaultToken {
 		log.Fatal("hub-webrtc: OO_SCREEN_T1_TOKEN не задано (дефолт заборонено) — задай у EnvironmentFile сервісу")
 	}
+	// S1: strict, у якому не пройде жоден агент, — помилка конфігурації, а
+	// не тихе відхилення всього парку.
+	if err := agentAuthConfigError(); err != nil {
+		log.Fatal("hub-webrtc: ", err)
+	}
+	log.Print(agentAuthModeSummary())
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	startRevokeSubscription(ctx)
+	// R5: ноди без агента й глядачів не живуть вічно (nodereap.go).
+	go reapIdleNodesLoop(ctx)
 
 	// pprof — ОКРЕМИЙ слухач і лише за явним OO_SCREEN_PPROF_ADDR. Не на mux
 	// сигналінгу: /debug/pprof віддає дампи горутин і профілі, і на проді він
 	// не має бути досяжний з того ж порту, що й /offer/*. Порожній env = вимкнено.
 	if addr := os.Getenv("OO_SCREEN_PPROF_ADDR"); addr != "" {
+		// B7: профілі мʼютексів і блокувань — лише разом із pprof і за явним
+		// OO_SCREEN_PPROF_CONTENTION=1 (вони мають ціну на кожен Lock/park).
+		if os.Getenv("OO_SCREEN_PPROF_CONTENTION") == "1" {
+			runtime.SetMutexProfileFraction(5)
+			runtime.SetBlockProfileRate(int(10 * time.Microsecond))
+		}
 		go func() {
 			log.Printf("pprof on %s (діагностика; НЕ вмикати на публічному інтерфейсі)", addr)
 			log.Printf("pprof exited: %v", http.ListenAndServe(addr, nil))
 		}()
 	}
 
+	// /metrics — окремий слухач, лише за OO_SCREEN_METRICS_ADDR (metrics.go).
+	startMetricsServer(os.Getenv("OO_SCREEN_METRICS_ADDR"))
+
 	mux := http.NewServeMux()
-	mux.HandleFunc("/offer/agent", handleOffer("agent"))
-	mux.HandleFunc("/offer/viewer", handleOffer("viewer"))
+	// SEC #21: per-IP rate-limit (ratelimit.go) — кожен viewer-offer це виклик ERP.
+	mux.HandleFunc("/offer/agent", rateLimited(offerLimiter, handleOffer("agent")))
+	mux.HandleFunc("/offer/viewer", rateLimited(offerLimiter, handleOffer("viewer")))
 	mux.HandleFunc("/offer/viewer/restart", handleViewerRestart)
 	mux.HandleFunc("/control", handleControl)
 	// F-39: глядач каже «моя вкладка прихована/знову видима» — хаб на цей час
@@ -2175,12 +2502,15 @@ func main() {
 	mux.HandleFunc("/nodes", handleNodes)
 	// H-16: здоровʼя для моніторингу: скільки нод, чи свіжий пол ревокацій.
 	mux.HandleFunc("/healthz", handleHealthz)
+	startAudit(mux) // S4: лише за OO_SCREEN_AUDIT_LOG
 
 	if ticketModeEnabled() {
 		// H-01: токен у журнал НЕ пишемо — journald читає будь-хто з групи adm.
+		log.Printf("hub-webrtc: bitrate probe=%v pace=%v (x%.2f)", probeEnabled, paceEnabled, paceMul)
 		log.Printf("hub-webrtc listening on %s (ticket-mode: erp=%s, agent token=…%s, multi-publisher; env fallback node=%q)", listenAddr, erpBase, tokenTail(), agentNodeIDEnv)
 	} else {
 		log.Printf("WARNING: static-token mode, not for prod (OO_SCREEN_ERP_BASE not set — viewer offers accept a static OO_SCREEN_T1_TOKEN, default is public/predictable)")
+		log.Printf("hub-webrtc: bitrate probe=%v pace=%v (x%.2f)", probeEnabled, paceEnabled, paceMul)
 		log.Printf("hub-webrtc listening on %s (T1 static-token mode, token=…%s, multi-publisher; env fallback node=%q)", listenAddr, tokenTail(), agentNodeIDEnv)
 	}
 	// H-03: голий ListenAndServe = без жодного таймауту на публічному порту

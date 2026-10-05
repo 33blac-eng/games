@@ -1,0 +1,97 @@
+### old-g2-1s-pli
+TTFF n=30 ok=30 timeouts=0 pli_honored=true agent_PLIs=0
+offer->answer          p50=    3.6 p90=    5.8 max=   16.1 mean=    4.3 ms
+offer->connected       p50=  207.2 p90=  211.1 max=  219.3 mean=  208.2 ms
+offer->first RTP       p50=  208.0 p90=  211.9 max=  219.8 mean=  208.8 ms
+offer->first full IDR  p50=  209.1 p90= 1532.7 max= 2140.3 mean=  462.4 ms
+gop_prime_lines=30
+keyframe_lines=0
+### new-g2-1s-pli
+TTFF n=30 ok=30 timeouts=0 pli_honored=true agent_PLIs=0
+offer->answer          p50=    3.3 p90=    4.2 max=    4.6 mean=    3.5 ms
+offer->connected       p50=  207.0 p90=  208.9 max=  210.4 mean=  207.3 ms
+offer->first RTP       p50=  207.5 p90=  209.3 max=  210.8 mean=  207.8 ms
+offer->first full IDR  p50=  208.3 p90=  210.3 max= 3647.4 mean=  343.4 ms
+gop_prime_lines=30
+keyframe_lines=0
+### new-g2-1s-nopli
+TTFF n=30 ok=30 timeouts=0 pli_honored=false agent_PLIs=0
+offer->answer          p50=    3.4 p90=    4.5 max=    6.4 mean=    3.6 ms
+offer->connected       p50=  207.1 p90=  208.9 max=  210.3 mean=  207.3 ms
+offer->first RTP       p50=  207.6 p90=  209.5 max=  210.7 mean=  207.8 ms
+offer->first full IDR  p50=  208.4 p90=  211.1 max=  211.9 mean=  208.7 ms
+gop_prime_lines=30
+keyframe_lines=0
+### old-g2-1s-sei-pli
+TTFF n=30 ok=30 timeouts=0 pli_honored=true agent_PLIs=0
+offer->answer          p50=    3.3 p90=    4.0 max=    5.7 mean=    3.5 ms
+offer->connected       p50=  207.0 p90=  208.6 max=  210.4 mean=  207.3 ms
+offer->first RTP       p50=  207.6 p90=  209.2 max=  211.4 mean=  208.0 ms
+offer->first full IDR  p50=  906.2 p90= 1901.3 max= 2141.6 mean= 1062.7 ms
+gop_prime_lines=30
+keyframe_lines=0
+### new-g2-1s-sei-pli
+TTFF n=30 ok=30 timeouts=0 pli_honored=true agent_PLIs=0
+offer->answer          p50=    3.6 p90=    4.3 max=    5.9 mean=    3.7 ms
+offer->connected       p50=  207.0 p90=  208.7 max=  209.8 mean=  207.2 ms
+offer->first RTP       p50=  207.6 p90=  209.2 max=  210.2 mean=  207.8 ms
+offer->first full IDR  p50=  208.6 p90=  210.1 max=  218.0 mean=  208.9 ms
+gop_prime_lines=30
+keyframe_lines=0
+### new-g2-1s-sei-nopli
+TTFF n=30 ok=30 timeouts=0 pli_honored=false agent_PLIs=0
+offer->answer          p50=    3.4 p90=    4.5 max=    5.4 mean=    3.6 ms
+offer->connected       p50=  207.1 p90=  208.1 max=  209.9 mean=  200.5 ms
+offer->first RTP       p50=  207.5 p90=  208.8 max=  210.9 mean=  201.1 ms
+offer->first full IDR  p50=  208.5 p90=  211.0 max=  213.8 mean=  202.3 ms
+gop_prime_lines=30
+keyframe_lines=0
+### old-g2-4s-pli
+TTFF n=30 ok=30 timeouts=0 pli_honored=true agent_PLIs=0
+offer->answer          p50=    3.3 p90=    4.0 max=    6.4 mean=    3.5 ms
+offer->connected       p50=  207.1 p90=  208.6 max=  211.4 mean=  207.4 ms
+offer->first RTP       p50=  207.7 p90=  209.6 max=  212.0 mean=  208.0 ms
+offer->first full IDR  p50= 1375.8 p90= 2108.2 max= 2167.2 mean= 1299.3 ms
+gop_prime_lines=30
+keyframe_lines=0
+### new-g2-4s-pli
+TTFF n=30 ok=30 timeouts=0 pli_honored=true agent_PLIs=0
+offer->answer          p50=    3.2 p90=    4.3 max=    7.9 mean=    3.5 ms
+offer->connected       p50=  206.8 p90=  208.2 max=  212.7 mean=  207.2 ms
+offer->first RTP       p50=  207.5 p90=  208.9 max=  213.4 mean=  207.9 ms
+offer->first full IDR  p50=  208.6 p90=  211.4 max=  214.1 mean=  209.0 ms
+gop_prime_lines=30
+keyframe_lines=0
+### new-g2-4s-nopli
+TTFF n=30 ok=30 timeouts=0 pli_honored=false agent_PLIs=0
+offer->answer          p50=    3.5 p90=    4.9 max=    6.4 mean=    3.8 ms
+offer->connected       p50=  207.5 p90=  210.8 max= 1013.3 mean=  234.8 ms
+offer->first RTP       p50=  208.1 p90=  211.4 max= 1013.6 mean=  235.5 ms
+offer->first full IDR  p50=  209.7 p90=  213.0 max= 1014.1 mean=  237.4 ms
+gop_prime_lines=30
+keyframe_lines=0
+### old-g2-4s-sei-pli
+TTFF n=30 ok=30 timeouts=0 pli_honored=true agent_PLIs=0
+offer->answer          p50=    3.3 p90=    4.9 max=    5.7 mean=    3.6 ms
+offer->connected       p50=  206.9 p90=  209.2 max=  227.3 mean=  201.3 ms
+offer->first RTP       p50=  207.6 p90=  209.7 max=  227.8 mean=  201.9 ms
+offer->first full IDR  p50= 1257.5 p90= 1935.8 max= 2132.9 mean= 1194.0 ms
+gop_prime_lines=30
+keyframe_lines=0
+### new-g2-4s-sei-pli
+TTFF n=30 ok=30 timeouts=0 pli_honored=true agent_PLIs=0
+offer->answer          p50=    3.6 p90=    5.2 max=    7.9 mean=    4.0 ms
+offer->connected       p50=  207.5 p90=  209.9 max= 1015.5 mean=  228.0 ms
+offer->first RTP       p50=  208.2 p90=  212.3 max= 1015.9 mean=  229.1 ms
+offer->first full IDR  p50=  208.9 p90=  213.5 max= 1017.5 mean=  230.2 ms
+gop_prime_lines=30
+keyframe_lines=0
+### new-g2-4s-sei-nopli
+TTFF n=30 ok=30 timeouts=0 pli_honored=false agent_PLIs=0
+offer->answer          p50=    3.8 p90=    5.9 max=    8.8 mean=    4.2 ms
+offer->connected       p50=  207.5 p90=  210.2 max=  213.0 mean=  201.4 ms
+offer->first RTP       p50=  208.2 p90=  210.9 max=  213.5 mean=  202.0 ms
+offer->first full IDR  p50=  209.2 p90=  213.0 max=  214.7 mean=  203.3 ms
+gop_prime_lines=30
+keyframe_lines=0
+DONE

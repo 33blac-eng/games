@@ -1,22 +1,22 @@
 //go:build windows && wt
 
 // Легасі-транспорт WebTransport (кандидат B, T1/T2-бенч): envelope-кадри по
-// QUIC-стріму до hub-wt. У прод-бінар НЕ входить — він вимикає перевірку TLS
-// (самопідписаний сертифікат стенду), а прод ходить лише WebRTC. Бенч
-// збирає агента з -tags wt.
+// QUIC-стріму до hub-wt. У прод-бінар НЕ входить: прод ходить лише WebRTC. Бенч збирає агента
+// з -tags wt; TLS перевіряється (SEC #32), самопідписаний hub-wt — через
+// -wt-cert-sha256 або -wt-insecure.
 package main
 
 import (
 	"bufio"
 	"bytes"
 	"context"
-	"crypto/tls"
 	"fmt"
 	"time"
 
 	"github.com/quic-go/quic-go"
 
 	"github.com/organicoils/oo-screen/agent/encode"
+	"github.com/organicoils/oo-screen/internal/agentcred"
 	"github.com/organicoils/oo-screen/internal/control"
 	"github.com/organicoils/oo-screen/internal/envelope"
 )
@@ -41,10 +41,9 @@ type wtTransport struct {
 }
 
 func dialWT(hubAddr string, onKeyframeRequest func(), onBitrateTarget func(uint64), onSelectOutput func(int)) (transport, error) {
-	tlsConf := &tls.Config{
-		InsecureSkipVerify: true, // T1/T2: самопідписаний сертифікат hub-wt
-		NextProtos:         []string{agentALPN},
-	}
+	// SEC #32: перевірка сертифіката за замовчуванням; самопідписаний hub-wt —
+	// через пінінг -wt-cert-sha256 (його CERT_HASH=), -wt-insecure — лише стенд.
+	tlsConf := agentcred.WTTLSConfig(hubAddr, []string{agentALPN}, wtCertPin, wtInsecure)
 	dialCtx, cancel := context.WithTimeout(context.Background(), dialTimeout)
 	defer cancel()
 	conn, err := quic.DialAddr(dialCtx, hubAddr, tlsConf, &quic.Config{})

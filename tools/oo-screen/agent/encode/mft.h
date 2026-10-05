@@ -106,6 +106,13 @@ int oos_enc_force_idr(oos_enc *e, char *err, int32_t err_len);
  * The HRESULT from ICodecAPI is reported through err, never swallowed. */
 int oos_enc_set_bitrate(oos_enc *e, int32_t bps, char *err, int32_t err_len);
 
+/* Static-screen refine (ТЗ P4). qp>0: following submits carry
+ * MFSampleExtension_VideoEncodeQP=qp and CODECAPI_AVEncVideoMaxQP is clamped
+ * to qp. qp==0 restores normal rate control (MaxQP 51, no sample QP).
+ * The sample QP is applied even when ICodecAPI refuses MaxQP; that refusal is
+ * still reported through err. */
+int oos_enc_set_refine_qp(oos_enc *e, int32_t qp, char *err, int32_t err_len);
+
 /* Drain + MFT_MESSAGE_COMMAND_FLUSH + restart streaming; next frame is an IDR. */
 int oos_enc_flush(oos_enc *e, char *err, int32_t err_len);
 

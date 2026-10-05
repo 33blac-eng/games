@@ -15,8 +15,11 @@
 // трансивера в агентській нозі немає. Прод працює — ламати його заради
 // недоробленої фічі не можна.
 //
-// ЧОМУ μ-law, А НЕ OPUS — див. пакет internal/pcmu: там і жива перевірка
-// можливостей браузера, і ціна кожного варіанта, і шлях апгрейду.
+// F1: КОДЕК — Opus 48 кГц стерео (internal/opusenc, чистий Go). μ-law 8 кГц
+// моно лишився запасним: OO_SCREEN_AUDIO_CODEC=pcmu — ТОЙ САМИЙ env, що в
+// агента. Хаб реєструє ОБИДВА кодеки, щоб прийняти будь-якого агента, але
+// глядачу віддає лише свій (hubAudioCodec()); звук агента з іншим кодеком не
+// транскодується, а відкидається з рядком у лозі (readAgentAudio).
 //
 // Стиль — той самий, що у fanout.go: доріжка НАЛЕЖИТЬ viewerLeg, живе рівно
 // стільки, скільки нога, і зупиняється тим самим vl.done. Жодного паралельного
@@ -33,6 +36,7 @@ import (
 	"github.com/pion/webrtc/v4"
 	"github.com/pion/webrtc/v4/pkg/media"
 
+	"github.com/organicoils/oo-screen/internal/opusenc"
 	"github.com/organicoils/oo-screen/internal/pcmu"
 )
 
@@ -67,24 +71,41 @@ var audioEnabled = os.Getenv("OO_SCREEN_AUDIO") == "1"
 // audioCap — те, чим і доріжка, і кодек описуються в обох напрямках. Одна
 // змінна на всі чотири місця (MediaEngine, доріжка глядача, трансивер агента,
 // тест) — щоб codec mismatch не міг зʼявитись через розбіжність літералів.
-var audioCap = webrtc.RTPCodecCapability{
-	MimeType:  webrtc.MimeTypePCMU,
-	ClockRate: pcmu.Rate,
-	Channels:  1,
+func audioCap() webrtc.RTPCodecCapability { return hubAudioCodec().Capability() }
+
+// hubAudioCodec — кодек звуку цього хаба (OO_SCREEN_AUDIO_CODEC, типово opus).
+// atomic.Value, бо тести міняють його (withHubAudioCodec), поки горутини ніг
+// попередніх тестів ще дожовують свої кадри.
+var hubCodecV atomic.Value
+
+func init() {
+	c, err := opusenc.FromEnv()
+	if err != nil {
+		log.Printf("hub: %v", err)
+	}
+	hubCodecV.Store(c)
 }
 
-// registerAudioCodec додає PCMU у MediaEngine — ЛИШЕ під прапорцем. Це перша з
-// двох засувок: без зареєстрованого кодека хаб не зміг би відповісти на
-// аудіо-m-рядок, навіть якби доріжку хтось додав. Payload type 0 — не наш
-// вибір, а статичне призначення RFC 3551.
+func hubAudioCodec() opusenc.Codec { return hubCodecV.Load().(opusenc.Codec) }
+
+// registerAudioCodec додає кодеки звуку в MediaEngine — ЛИШЕ під прапорцем. Це
+// перша з двох засувок: без зареєстрованого кодека хаб не зміг би відповісти
+// на аудіо-m-рядок, навіть якби доріжку хтось додав. PT: 111 Opus, 0 PCMU
+// (статичне призначення RFC 3551).
 func registerAudioCodec(m *webrtc.MediaEngine) error {
 	if !audioEnabled {
 		return nil
 	}
-	return m.RegisterCodec(webrtc.RTPCodecParameters{
-		RTPCodecCapability: audioCap,
-		PayloadType:        0,
-	}, webrtc.RTPCodecTypeAudio)
+	// Свій кодек першим — його pion і обере для глядача; другий лише щоб
+	// агент з іншим кодеком не ламав переговори (його звук відкидається).
+	other := opusenc.CodecPCMU
+	if hubAudioCodec() == opusenc.CodecPCMU {
+		other = opusenc.CodecOpus
+	}
+	if err := m.RegisterCodec(webrtc.RTPCodecParameters{RTPCodecCapability: audioCap(), PayloadType: hubAudioCodec().Parameters().PayloadType}, webrtc.RTPCodecTypeAudio); err != nil {
+		return err
+	}
+	return m.RegisterCodec(other.Parameters(), webrtc.RTPCodecTypeAudio)
 }
 
 // addAudioTrack вішає аудіо-доріжку на viewer-ногу. Той самий stream id, що й у
@@ -99,7 +120,7 @@ func registerAudioCodec(m *webrtc.MediaEngine) error {
 // seq/ts однією монотонною шкалою на всю ногу, і перемикання джерела
 // (агент <-> тон) не робить у ній жодного розриву.
 func addAudioTrack(pc *webrtc.PeerConnection) (*webrtc.TrackLocalStaticSample, error) {
-	trk, err := webrtc.NewTrackLocalStaticSample(audioCap, "audio", "oo-screen-hub")
+	trk, err := webrtc.NewTrackLocalStaticSample(audioCap(), "audio", "oo-screen-hub")
 	if err != nil {
 		return nil, err
 	}
@@ -138,10 +159,18 @@ func forwardAudioToViewers(ns *nodeSession, payload []byte) {
 }
 
 // audioTone — запасне джерело: 440 Гц, фаза неперервна між кадрами (розрив
-// фази чути як клац на кожні 20 мс).
-type audioTone struct{ phase float64 }
+// фази чути як клац на кожні 20 мс). Кодек — hubAudioCodec(); для Opus енкодер
+// створюється ліниво, по одному на ногу (стан Opus-енкодера не ділиться).
+type audioTone struct {
+	phase float64
+	enc   *opusenc.Encoder
+	pcm   []float32
+}
 
 func (t *audioTone) next() []byte {
+	if hubAudioCodec() == opusenc.CodecOpus {
+		return t.nextOpus()
+	}
 	const step = 2 * math.Pi * toneHz / pcmu.Rate
 	buf := make([]byte, pcmu.FrameSamples)
 	for i := range buf {
@@ -151,6 +180,30 @@ func (t *audioTone) next() []byte {
 		}
 	}
 	return buf
+}
+
+func (t *audioTone) nextOpus() []byte {
+	if t.enc == nil {
+		enc, err := opusenc.NewEncoder(64000)
+		if err != nil {
+			return nil
+		}
+		t.enc = enc
+		t.pcm = make([]float32, opusenc.FrameSamples*opusenc.Channels)
+	}
+	const step = 2 * math.Pi * toneHz / opusenc.Rate
+	for i := 0; i < opusenc.FrameSamples; i++ {
+		v := float32(math.Sin(t.phase) * toneAmp / math.MaxInt16)
+		t.pcm[2*i], t.pcm[2*i+1] = v, v
+		if t.phase += step; t.phase > 2*math.Pi {
+			t.phase -= 2 * math.Pi
+		}
+	}
+	pkt, err := t.enc.Encode(t.pcm)
+	if err != nil {
+		return nil
+	}
+	return pkt
 }
 
 // audioPump — писар аудіо-доріжки ОДНІЄЇ ноги, брат-близнюк vl.pump з fanout.go:
@@ -232,7 +285,7 @@ func (vl *viewerLeg) audioPump(ns *nodeSession, trk *webrtc.TrackLocalStaticSamp
 		if !vl.writeAudio(ns, trk, &rec, tone.next()) {
 			return
 		}
-		armTick(pcmu.Duration(pcmu.FrameSamples))
+		armTick(opusenc.FrameDuration) // і μ-law, і Opus-кадр тону — 20 мс
 		select {
 		case <-vl.done:
 			return
@@ -247,7 +300,7 @@ func (vl *viewerLeg) writeAudio(ns *nodeSession, trk *webrtc.TrackLocalStaticSam
 	if len(data) == 0 {
 		return true
 	}
-	dur := pcmu.Duration(len(data))
+	dur := hubAudioCodec().FrameDur(data)
 	if err := trk.WriteSample(media.Sample{Data: data, Duration: dur}); err != nil {
 		return false
 	}
@@ -274,6 +327,17 @@ func (vl *viewerLeg) writeAudio(ns *nodeSession, trk *webrtc.TrackLocalStaticSam
 // зайвий кадр у 20 мс. Для відео така ж дрібниця означала б склейку двох
 // потоків в одному GOP, тому там гейт і потрібен.
 func readAgentAudio(ns *nodeSession, track *webrtc.TrackRemote) {
+	if mime := track.Codec().MimeType; !hubAudioCodec().Matches(mime) {
+		// Транскодування немає навмисно: це CPU хаба на кожну ноду. Агент і
+		// хаб мусять мати однаковий OO_SCREEN_AUDIO_CODEC.
+		log.Printf("agent audio [node=%s]: кодек агента %s != кодек хаба %s — звук агента відкидається (вирівняйте OO_SCREEN_AUDIO_CODEC)",
+			ns.nodeID, mime, hubAudioCodec())
+		for {
+			if _, _, err := track.ReadRTP(); err != nil {
+				return
+			}
+		}
+	}
 	for {
 		pkt, _, err := track.ReadRTP()
 		if err != nil {

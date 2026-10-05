@@ -1,7 +1,5 @@
-//go:build windows
-
 // Звук ПК на агентській стороні: agent/audio (WASAPI loopback, 48 кГц) ->
-// моно -> 8 кГц -> G.711 μ-law -> ДРУГА доріжка того самого WebRTC-зʼєднання,
+// Opus 48 кГц стерео (або запасний μ-law 8 кГц моно) -> ДРУГА доріжка того самого WebRTC-зʼєднання,
 // що везе відео. Жодного паралельного механізму: доріжка додається в тому ж
 // dialWebRTC, живе рівно стільки, скільки транспорт, і вмирає разом із ним.
 //
@@ -10,8 +8,10 @@
 // не додається, offer бітово той самий, горутина не стартує, WASAPI не
 // відкривається взагалі.
 //
-// ЧОМУ μ-law, А НЕ OPUS — див. пакет internal/pcmu: там і жива перевірка
-// можливостей браузера, і ціна кожного варіанта.
+// F1: КОДЕК — Opus 48 кГц стерео (internal/opusenc, чистий Go, без cgo).
+// Старий μ-law 8 кГц моно лишився запасним: OO_SCREEN_AUDIO_CODEC=pcmu. Хаб
+// мусить мати ТОЙ САМИЙ кодек (той самий env), інакше він звук агента не
+// форвардить і пише про це в лог.
 package main
 
 import (
@@ -21,6 +21,7 @@ import (
 	"log"
 	"math"
 	"os"
+	"strings"
 	"sync/atomic"
 	"time"
 
@@ -28,8 +29,19 @@ import (
 	"github.com/pion/webrtc/v4/pkg/media"
 
 	"github.com/organicoils/oo-screen/agent/audio"
+	"github.com/organicoils/oo-screen/internal/opusenc"
 	"github.com/organicoils/oo-screen/internal/pcmu"
 )
+
+// audioCodec — кодек звукової доріжки (OO_SCREEN_AUDIO_CODEC, типово opus).
+// Змінна: тести перемикають її напряму.
+var audioCodec = func() opusenc.Codec {
+	c, err := opusenc.FromEnv()
+	if err != nil {
+		log.Printf("oo-agent: %v", err)
+	}
+	return c
+}()
 
 // audioEnabled — той самий прапорець, що в хабі. Змінна, а не os.Getenv на
 // місці: тести перемикають її напряму.
@@ -54,37 +66,26 @@ const (
 	audioReopenAfter = 5 * time.Second
 )
 
-// registerAudioCodec додає PCMU у MediaEngine — ЛИШЕ під прапорцем. Payload
-// type 0 не наш вибір, а статичне призначення RFC 3551 для PCMU/8000.
+// registerAudioCodec додає кодек звуку (audioCodec) у MediaEngine — ЛИШЕ під
+// прапорцем. PT: 111 для Opus (як у Chrome), 0 для PCMU (RFC 3551).
 func registerAudioCodec(m *webrtc.MediaEngine) error {
 	if !audioEnabled {
 		return nil
 	}
-	return m.RegisterCodec(webrtc.RTPCodecParameters{
-		RTPCodecCapability: webrtc.RTPCodecCapability{
-			MimeType:  webrtc.MimeTypePCMU,
-			ClockRate: pcmu.Rate,
-			Channels:  1,
-		},
-		PayloadType: 0,
-	}, webrtc.RTPCodecTypeAudio)
+	return m.RegisterCodec(audioCodec.Parameters(), webrtc.RTPCodecTypeAudio)
 }
 
 // addAudioTrack вішає звукову доріжку на зʼєднання агента. nil, nil без
 // прапорця — і саме на цьому nil тримається вся інваріантність вимкненого
 // режиму: немає доріжки -> немає m=audio в offer -> хаб бачить старого агента.
 //
-// TrackLocalStaticSample, а не StaticRTP: пакетизувати μ-law нема з чого —
-// джерело віддає семпли, а не RTP, тож цю роботу робить pion.
+// TrackLocalStaticSample, а не StaticRTP: і μ-law, і Opus-кадр 20 мс — це
+// рівно один RTP-пакет, тож пакетизацію робить pion.
 func addAudioTrack(pc *webrtc.PeerConnection) (*webrtc.TrackLocalStaticSample, error) {
 	if !audioEnabled {
 		return nil, nil
 	}
-	trk, err := webrtc.NewTrackLocalStaticSample(webrtc.RTPCodecCapability{
-		MimeType:  webrtc.MimeTypePCMU,
-		ClockRate: pcmu.Rate,
-		Channels:  1,
-	}, "audio", "oo-screen-agent")
+	trk, err := webrtc.NewTrackLocalStaticSample(audioCodec.Capability(), "audio", "oo-screen-agent")
 	if err != nil {
 		return nil, err
 	}
@@ -103,6 +104,29 @@ func addAudioTrack(pc *webrtc.PeerConnection) (*webrtc.TrackLocalStaticSample, e
 		}
 	}()
 	return trk, nil
+}
+
+// audioRejected — чи хаб відхилив m=audio (порт 0). Так відповідає хаб із
+// вимкненим OO_SCREEN_AUDIO. Рядок формату в такому m-рядку pion пише "0", а це
+// статичний PT PCMU: з μ-law-доріжкою це випадково «збігалось», з Opus —
+// SetRemoteDescription падає, тому відхилену доріжку знімаємо самі.
+func audioRejected(sdp string) bool {
+	for _, line := range strings.Split(sdp, "\n") {
+		if strings.HasPrefix(strings.TrimSpace(line), "m=audio 0 ") {
+			return true
+		}
+	}
+	return false
+}
+
+// detachAudioTrack знімає звукову доріжку з ще не домовленого зʼєднання.
+func detachAudioTrack(pc *webrtc.PeerConnection, trk webrtc.TrackLocal) error {
+	for _, tr := range pc.GetTransceivers() {
+		if s := tr.Sender(); s != nil && s.Track() == trk {
+			return pc.RemoveTrack(s)
+		}
+	}
+	return nil
 }
 
 // ---------------------------------------------------------------------------
@@ -176,7 +200,7 @@ func (e *audioEncoder) take() []byte {
 // encode перетворює один WASAPI-пакет на готові кадри PCMU. Порожній результат
 // — нормальний стан: у пакеті просто менше 20 мс звуку.
 func (e *audioEncoder) encode(data []byte, f audio.Format) [][]byte {
-	factor, step, ok := audioLayout(f)
+	factor, step, ok := audioLayout(f, pcmu.Rate)
 	if !ok {
 		return nil
 	}
@@ -196,11 +220,11 @@ func (e *audioEncoder) encode(data []byte, f audio.Format) [][]byte {
 // audioLayout розкладає формат на «у скільки разів проріджуємо» і «скільки
 // байтів займає один кадр усіх каналів». ok=false — формат, у якому ми не
 // беремось за звук; викликач мусить його ЗГАСИТИ, а не подати сміття далі.
-func audioLayout(f audio.Format) (factor, step int, ok bool) {
+func audioLayout(f audio.Format, outRate int) (factor, step int, ok bool) {
 	if f.Channels <= 0 || f.BitsPerSample <= 0 || f.BitsPerSample%8 != 0 {
 		return 0, 0, false
 	}
-	if f.SampleRate <= 0 || f.SampleRate%pcmu.Rate != 0 {
+	if outRate <= 0 || f.SampleRate <= 0 || f.SampleRate%outRate != 0 {
 		return 0, 0, false // 44.1 кГц дробовим кроком не проріджується
 	}
 	switch {
@@ -217,10 +241,10 @@ func audioLayout(f audio.Format) (factor, step int, ok bool) {
 	if step < f.Channels*f.BitsPerSample/8 {
 		return 0, 0, false
 	}
-	return f.SampleRate / pcmu.Rate, step, true
+	return f.SampleRate / outRate, step, true
 }
 
-// audioGap — скільки семплів 8 кГц треба долити тишею, щоб доріжка наздогнала
+// audioGap — скільки семплів (частоти rate) треба долити тишею, щоб доріжка наздогнала
 // спільний годинник.
 //
 // 🚨 ЄДИНИЙ МОНОТОННИЙ ГОДИННИК. elapsed — це різниця audio.Frame.Timestamp
@@ -232,12 +256,13 @@ func audioLayout(f audio.Format) (factor, step int, ok bool) {
 // Розрив у loopback — це не тиша (тиша приходить нулями), а факт: пристрій
 // перезапустили, потік застряг, ми стояли на паузі. Без доливання доріжка
 // назавжди лишилась би на ту паузу позаду відео.
-func audioGap(elapsed time.Duration, emitted int64, tol time.Duration) int64 {
-	if elapsed <= 0 {
+func audioGap(elapsed time.Duration, emitted int64, tol time.Duration, rate int) int64 {
+	if elapsed <= 0 || rate <= 0 {
 		return 0
 	}
-	gap := int64(elapsed*pcmu.Rate/time.Second) - emitted
-	if gap < int64(tol*pcmu.Rate/time.Second) {
+	r := time.Duration(rate)
+	gap := int64(elapsed*r/time.Second) - emitted
+	if gap < int64(tol*r/time.Second) {
 		return 0
 	}
 	return gap
@@ -281,7 +306,7 @@ func runAudio(ctx context.Context, paused *atomic.Bool, send audioSend) {
 		// першому ж пакеті, і цикл open/close крутився гарячим, по три рядки логу
 		// на пакет.
 		if err == nil {
-			if _, _, ok := audioLayout(c.Format()); !ok {
+			if _, _, ok := audioLayout(c.Format(), audioClockRate()); !ok {
 				err = fmt.Errorf("формат звуку не підтримано (%+v) — доріжка лишиться тихою", c.Format())
 				_ = c.Close()
 			}
@@ -303,11 +328,20 @@ func runAudio(ctx context.Context, paused *atomic.Bool, send audioSend) {
 			log.Printf("oo-agent: аудіо-джерело відкрито після %d невдалих спроб", fails)
 			fails = 0
 		}
-		log.Printf("oo-agent: аудіо-захоплення почалось (%+v -> PCMU 8кГц моно)", c.Format())
+		log.Printf("oo-agent: аудіо-захоплення почалось (%+v -> %s)", c.Format(), audioCodecLabel())
 		audioCapture(ctx, paused, c, send)
 		_ = c.Close()
 		log.Printf("oo-agent: аудіо-захоплення зупинено (глядача немає або джерело впало)")
 	}
+}
+
+// audioClockRate — частота годинника доріжки поточного кодека (до створення
+// енкодера: перевірка mix format при відкритті джерела).
+func audioClockRate() int {
+	if audioCodec == opusenc.CodecPCMU {
+		return pcmu.Rate
+	}
+	return opusenc.Rate
 }
 
 // audioWait тримає горутину, поки немає глядача. false = час іти.
@@ -334,8 +368,12 @@ func audioSleep(ctx context.Context, d time.Duration) bool {
 // audioCapture — цикл одного відкритого пристрою. Повертається, коли зник
 // глядач, помер ctx або джерело віддало помилку.
 func audioCapture(ctx context.Context, paused *atomic.Bool, c audioCapturer, send audioSend) {
+	enc, err := newFrameEncoder(audioCodec)
+	if err != nil {
+		log.Printf("oo-agent: енкодер звуку (%s): %v — доріжка лишиться тихою", audioCodec, err)
+		return
+	}
 	var (
-		enc     audioEncoder
 		first   time.Time
 		lastLog = time.Now()
 		peak    float64
@@ -360,7 +398,7 @@ func audioCapture(ctx context.Context, paused *atomic.Bool, c audioCapturer, sen
 			return
 		}
 
-		if _, _, ok := audioLayout(f.Format); !ok {
+		if _, _, ok := audioLayout(f.Format, enc.rate()); !ok {
 			// Мовчки крутити цей цикл далі означало б «звуку немає і невідомо
 			// чому». Пристрій із таким mix format ми не обслуговуємо — кажемо
 			// це вголос і йдемо; відео не зачеплене.
@@ -374,12 +412,12 @@ func audioCapture(ctx context.Context, paused *atomic.Bool, c audioCapturer, sen
 			peak = f.RMS
 		}
 
-		gap := audioGap(f.Timestamp.Sub(first), enc.emitted, audioSyncTolerance)
+		gap := audioGap(f.Timestamp.Sub(first), enc.clock(), audioSyncTolerance, enc.rate())
 		gaps += gap
 		out := enc.silence(gap)
 		out = append(out, enc.encode(f.Data, f.Format)...)
 		for _, fr := range out {
-			if err := send(fr, pcmu.Duration(len(fr))); err != nil {
+			if err := send(fr, audioCodec.FrameDur(fr)); err != nil {
 				// Мертва аудіо-доріжка НЕ привід рвати сесію: розрив помітить
 				// відеошлях (txErrCh/pcDown) і підніме транспорт заново, а
 				// наступний send уже піде в нову доріжку.

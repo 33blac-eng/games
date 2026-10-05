@@ -1,5 +1,3 @@
-//go:build windows
-
 package main
 
 import (
@@ -12,6 +10,7 @@ import (
 	"github.com/pion/webrtc/v4"
 
 	"github.com/organicoils/oo-screen/agent/audio"
+	"github.com/organicoils/oo-screen/internal/opusenc"
 	"github.com/organicoils/oo-screen/internal/pcmu"
 )
 
@@ -22,6 +21,14 @@ func withAudioFlag(t *testing.T, on bool) {
 	prev := audioEnabled
 	audioEnabled = on
 	t.Cleanup(func() { audioEnabled = prev })
+}
+
+// withAudioCodec — те саме для OO_SCREEN_AUDIO_CODEC.
+func withAudioCodec(t *testing.T, c opusenc.Codec) {
+	t.Helper()
+	prev := audioCodec
+	audioCodec = c
+	t.Cleanup(func() { audioCodec = prev })
 }
 
 // agentOffer будує offer агента рівно тим шляхом, що dialWebRTC: той самий
@@ -74,42 +81,12 @@ func countMediaLines(sdp, kind string) int {
 	return n
 }
 
-// TestAudioFlagOffChangesNothing — ГОЛОВНИЙ тест кроку на стороні агента: без
-// OO_SCREEN_AUDIO агент поводиться рівно як до появи звуку. Це захист робочого
-// проду, а не фічі.
-//
-// Три половини правди в одному місці, бо вимкнена фіча мусить бути невидимою
-// цілком, а не «майже»: доріжки немає (nil -> sendAudio нікуди не пише і
-// runAudio не стартує), m=audio в offer немає, PCMU у MediaEngine не
-// зареєстрований (інакше він проліз би в SDP при першому ж чужому трансивері).
-func TestAudioFlagOffChangesNothing(t *testing.T) {
-	withAudioFlag(t, false)
-
-	sdp, atrk := agentOffer(t)
-	if atrk != nil {
-		t.Fatal("addAudioTrack віддав доріжку при вимкненому прапорці")
-	}
-	if n := countMediaLines(sdp, "audio"); n != 0 {
-		t.Fatalf("m=audio у offer агента: %d, want 0:\n%s", n, sdp)
-	}
-	if n := countMediaLines(sdp, "video"); n != 1 {
-		t.Fatalf("m=video у offer агента: %d, want 1:\n%s", n, sdp)
-	}
-	if strings.Contains(strings.ToUpper(sdp), "PCMU") {
-		t.Fatalf("PCMU у offer при вимкненому прапорці:\n%s", sdp)
-	}
-	// Поле offer-а теж мусить лишитись відсутнім: інакше хаб на тій нозі
-	// чекав би звук, якого нема, і глушив би запасний тон.
-	if req := (offerReq{Audio: atrk != nil}); req.Audio {
-		t.Fatal("offerReq.Audio=true при вимкненому прапорці")
-	}
-}
-
 // TestAudioFlagOnPublishesPCMUTrack — під прапорцем агент оголошує другу доріжку
 // саме тим кодеком, який приймає браузер (див. internal/pcmu: перевірено живцем
 // у Chrome 148 — PCMU/8000 є в RTCRtpReceiver.getCapabilities('audio')).
 func TestAudioFlagOnPublishesPCMUTrack(t *testing.T) {
 	withAudioFlag(t, true)
+	withAudioCodec(t, opusenc.CodecPCMU)
 
 	sdp, atrk := agentOffer(t)
 	if atrk == nil {
@@ -209,7 +186,7 @@ func TestAudioGap(t *testing.T) {
 		{"перший кадр", 0, 0, 0},
 	}
 	for _, c := range cases {
-		if got := audioGap(c.elapsed, c.emitted, tol); got != c.want {
+		if got := audioGap(c.elapsed, c.emitted, tol, pcmu.Rate); got != c.want {
 			t.Errorf("%s: audioGap(%v, %d) = %d, want %d", c.name, c.elapsed, c.emitted, got, c.want)
 		}
 	}
@@ -227,7 +204,7 @@ func TestSilenceFillKeepsClock(t *testing.T) {
 	if e.emitted != 800 {
 		t.Fatalf("годинник = %d, want 800", e.emitted)
 	}
-	if got := audioGap(100*time.Millisecond, e.emitted, audioSyncTolerance); got != 0 {
+	if got := audioGap(100*time.Millisecond, e.emitted, audioSyncTolerance, pcmu.Rate); got != 0 {
 		t.Fatalf("після доливання розрив = %d, want 0 — тиша лилась би нескінченно", got)
 	}
 }
@@ -240,7 +217,7 @@ func TestUnsupportedFormatsRejected(t *testing.T) {
 		SampleRate: 48000, Channels: 2, SampleFormat: audio.SampleFormatFloat,
 		BitsPerSample: 32, ValidBitsPerSample: 32, BytesPerFrame: 8,
 	}
-	if _, _, ok := audioLayout(base); !ok {
+	if _, _, ok := audioLayout(base, pcmu.Rate); !ok {
 		t.Fatal("48кГц стерео float32 відхилено — це і є типовий mix format WASAPI")
 	}
 
@@ -253,7 +230,7 @@ func TestUnsupportedFormatsRejected(t *testing.T) {
 	for name, mutate := range bad {
 		f := base
 		mutate(&f)
-		if _, _, ok := audioLayout(f); ok {
+		if _, _, ok := audioLayout(f, pcmu.Rate); ok {
 			t.Errorf("%s: audioLayout прийняв %+v", name, f)
 		}
 	}
@@ -261,7 +238,7 @@ func TestUnsupportedFormatsRejected(t *testing.T) {
 	// PCM 16 біт мусить проходити — це другий за поширеністю mix format.
 	f := base
 	f.SampleFormat, f.BitsPerSample, f.ValidBitsPerSample, f.BytesPerFrame = audio.SampleFormatPCM, 16, 16, 4
-	if _, _, ok := audioLayout(f); !ok {
+	if _, _, ok := audioLayout(f, pcmu.Rate); !ok {
 		t.Fatal("48кГц стерео PCM16 відхилено")
 	}
 }

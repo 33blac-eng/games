@@ -24,6 +24,12 @@ const HUB_OFFER_URL = params.get("hub")
   ? `http://${params.get("hub")}/offer/viewer`
   : "http://127.0.0.1:4470/offer/viewer";
 
+// F6: ?monitor=N — головне відео показує потік монітора N (хаб з
+// OO_SCREEN_MULTIMON=1, агент з -multimon). ?side=1,2 — ще й ці монітори поруч,
+// кожен окремою viewer-ногою. Без параметрів сторінка як до F6.
+const MONITOR = parseInt(params.get("monitor") || "0", 10) || 0;
+const SIDE = (params.get("side") || "").split(",").map((x) => parseInt(x, 10)).filter((x) => x >= 0 && x <= 15 && x !== MONITOR);
+
 const statusEl = document.getElementById("status");
 const video = document.getElementById("v");
 let ndjson = [];
@@ -56,6 +62,16 @@ async function start() {
   };
 
   const offer = await pc.createOffer();
+  if (params.get("audio") === "1") {
+    // F1: Opus стерео — без stereo=1 у власному fmtp Chrome зводить у моно.
+    // Та сама правка, що opusStereoSdp у desktop-oo-webrtc.js.
+    const pts = [...offer.sdp.matchAll(/^a=rtpmap:(\d+) opus\/48000/gim)].map((m) => m[1]);
+    offer.sdp = offer.sdp.split("\r\n").map((l) => {
+      const f = /^a=fmtp:(\d+) (.*)$/.exec(l);
+      if (!f || !pts.includes(f[1]) || /stereo=/.test(f[2])) return l;
+      return l + ";stereo=1;sprop-stereo=1";
+    }).join("\r\n");
+  }
   await pc.setLocalDescription(offer);
   await new Promise((resolve) => {
     if (pc.iceGatheringState === "complete") return resolve();
@@ -67,7 +83,7 @@ async function start() {
   const resp = await fetch(HUB_OFFER_URL, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ sdp: pc.localDescription.sdp, token }),
+    body: JSON.stringify(Object.assign({ sdp: pc.localDescription.sdp, token }, MONITOR > 0 ? { monitor: MONITOR } : {})),
   });
   if (!resp.ok) {
     statusEl.textContent = "offer/viewer failed: " + resp.status;
@@ -204,6 +220,40 @@ if (params.get("audio") === "1") {
       + hz.toFixed(1) + " Гц (чекали 440), RMS " + rms.toFixed(4);
   });
 }
+
+// F6 side-by-side: по ногі на монітор, відео в один ряд (flex).
+async function startSide(m) {
+  const row = document.getElementById("side") || (() => {
+    const r = document.createElement("div");
+    r.id = "side";
+    r.style.cssText = "display:flex;gap:8px;margin-top:8px";
+    video.style.maxWidth = "none";
+    video.parentNode.insertBefore(r, video);
+    r.appendChild(video);
+    video.style.flex = "1 1 0";
+    video.style.minWidth = "0";
+    return r;
+  })();
+  const v = document.createElement("video");
+  v.autoplay = v.muted = v.playsInline = true;
+  v.style.cssText = "flex:1 1 0;min-width:0;background:#000";
+  v.title = "монітор " + (m + 1);
+  row.appendChild(v);
+  const pc = new RTCPeerConnection({ iceServers: [] });
+  pc.addTransceiver("video", { direction: "recvonly" });
+  pc.ontrack = (ev) => { v.srcObject = ev.streams[0]; };
+  await pc.setLocalDescription(await pc.createOffer());
+  await new Promise((resolve) => {
+    if (pc.iceGatheringState === "complete") return resolve();
+    pc.onicegatheringstatechange = () => { if (pc.iceGatheringState === "complete") resolve(); };
+  });
+  const body = { sdp: pc.localDescription.sdp, token };
+  if (m > 0) body.monitor = m;
+  const resp = await fetch(HUB_OFFER_URL, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+  if (!resp.ok) { statusEl.textContent += "\nмонітор " + m + ": offer " + resp.status; return; }
+  await pc.setRemoteDescription({ type: "answer", sdp: (await resp.json()).sdp });
+}
+for (const m of SIDE) startSide(m).catch((err) => { statusEl.textContent += "\nмонітор " + m + ": " + err; });
 
 start().catch((err) => {
   statusEl.textContent = "error: " + err;

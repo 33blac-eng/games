@@ -1,3 +1,5 @@
+//go:build windows
+
 /* mft.c — hardware Media Foundation H.264 encoder (Ф0, plan §5.1/§5.2/§5.5).
  *
  * Pipeline:
@@ -29,8 +31,10 @@
 #include <mfobjects.h>
 #include <mftransform.h>
 #include <mferror.h>
+/* ICodecAPI is declared in strmif.h; the CI runner's mingw-w64 does not pull it in
+ * transitively through mfidl.h/d3d11.h, so include it explicitly. */
+#include <strmif.h>
 #include <codecapi.h>
-#include <icodecapi.h>
 #include <d3d11.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -55,6 +59,21 @@ OOS_GUID(OOS_AVEncVideoMaxNumRefFrame,    STATIC_CODECAPI_AVEncVideoMaxNumRefFra
 OOS_GUID(OOS_AVEncCommonMaxBitRate,       STATIC_CODECAPI_AVEncCommonMaxBitRate);
 OOS_GUID(OOS_AVEncCommonBufferSize,       STATIC_CODECAPI_AVEncCommonBufferSize);
 OOS_GUID(OOS_AVEncVideoForceKeyFrame,     STATIC_CODECAPI_AVEncVideoForceKeyFrame);
+/* ТЗ P8: software-only knobs (Microsoft H264 Video Encoder MFT, Win8+). */
+OOS_GUID(OOS_AVEncNumWorkerThreads,       STATIC_CODECAPI_AVEncNumWorkerThreads);
+OOS_GUID(OOS_AVEncH264CABACEnable,        STATIC_CODECAPI_AVEncH264CABACEnable);
+
+/* Static-screen refine (ТЗ P4). CODECAPI_AVEncVideoMaxQP comes from the
+ * STATIC_ token list like the others; MFSampleExtension_VideoEncodeQP is a
+ * plain DEFINE_GUID in mfapi.h (storage allocated via INITGUID). Verified
+ * against mingw-w64 headers. */
+OOS_GUID(OOS_AVEncVideoMaxQP,             STATIC_CODECAPI_AVEncVideoMaxQP);
+
+/* IID_ICodecAPI: mingw declares it extern in strmif.h, but icodecapi.h (which
+ * would define it) redefines struct CodecAPIEventData and cannot be included
+ * alongside mfapi.h; no mingw import lib provides it either. */
+DEFINE_GUID(IID_ICodecAPI,
+            0x901db4c7, 0x31ce, 0x41a2, 0x85,0xdc, 0x8f,0xa0,0xbf,0x41,0xb8,0xda);
 
 /* CLSID of the built-in "Microsoft H264 Video Encoder MFT" (wmcodecdsp.h). We
  * define it locally rather than pulling the whole wmcodecdsp.h COBJMACROS surface
@@ -150,6 +169,7 @@ struct oos_enc {
     int32_t  draining;
     int32_t  mf_held;       /* this encoder holds a ref on the MTA anchor */
     int64_t  last_pts;
+    int32_t  refine_qp;     /* >0: per-frame QP for the following submits (ТЗ P4) */
 
     /* Timing of the last submit, split so the gate can tell the MFT's own cost
      * apart from back-pressure (waiting for METransformNeedInput). */
@@ -462,6 +482,26 @@ static void configure_codecapi(oos_enc *e)
      * нашому вмісті радше ЗМЕНШУЮТЬ потік. Більше двох не беремо: без B-кадрів
      * і при GOP=2с виграш згасає, а пошук дорожчає. */
     note_cfg(e, "MaxNumRefFrame", set_codec_u32(e, &OOS_AVEncVideoMaxNumRefFrame, 2));
+
+    if (!e->is_hardware) {
+        /* ТЗ P8. Софтверний Microsoft H264 MFT без підказки бере ВСІ логічні
+         * ядра: на офісному 4-ядерному ПК кожен кадр на мить забирає весь CPU
+         * у застосунку, з яким людина працює (Excel/1С), і з нашим же
+         * захопленням/readback. Лишаємо одне ядро вільним від 4 ядер; на 1-3
+         * ядрах різати нема з чого — там бюджет тримає FPS-політика
+         * (internal/swlimit). */
+        SYSTEM_INFO si;
+        GetSystemInfo(&si);
+        ULONG n = (ULONG)si.dwNumberOfProcessors;
+        if (n >= 4) {
+            note_cfg(e, "NumWorkerThreads",
+                     set_codec_u32(e, &OOS_AVEncNumWorkerThreads, n - 1));
+        }
+        /* Main-профіль дозволяє CABAC; на тексті він дає помітно менший потік
+         * за той самий QP, тобто чіткіший текст у тому ж бюджеті. Явно, бо
+         * дефолт софт-MFT документацією не зафіксований. */
+        note_cfg(e, "CABAC", set_codec_bool(e, &OOS_AVEncH264CABACEnable, 1));
+    }
 }
 
 const char *oos_enc_cfg_report(oos_enc *e) { return (e && e->cfg_report[0]) ? e->cfg_report : ""; }
@@ -533,7 +573,10 @@ static HRESULT make_scaler(oos_enc *e)
     cd.InputHeight = (UINT)e->src_h;
     cd.OutputWidth  = (UINT)e->width;
     cd.OutputHeight = (UINT)e->height;
-    cd.Usage = D3D11_VIDEO_USAGE_PLAYBACK_NORMAL;
+    /* ТЗ P2/1.2: text on a downscaled desktop — ask the driver for its best
+     * scaler rather than the playback default (the only quality knob D3D11
+     * exposes for the resampling filter itself). */
+    cd.Usage = D3D11_VIDEO_USAGE_OPTIMAL_QUALITY;
 
     hr = ID3D11Device_QueryInterface(e->dev, &IID_ID3D11VideoDevice, (void **)&e->vdev);
     if (FAILED(hr)) return hr;
@@ -555,6 +598,38 @@ static HRESULT make_scaler(oos_enc *e)
     }
     ID3D11VideoContext_VideoProcessorSetStreamFrameFormat(e->vctx, e->vproc, 0,
             D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE);
+
+    /* ТЗ P2: no driver "enhancements" on desktop text. Auto-processing
+     * (denoise/edge/skin-tone/etc. the driver may enable on its own) off, and
+     * every filter the processor advertises explicitly disabled. Void calls:
+     * nothing to check; an unsupported filter is skipped via FilterCaps. */
+    ID3D11VideoContext_VideoProcessorSetStreamAutoProcessingMode(e->vctx, e->vproc, 0, FALSE);
+    {
+        D3D11_VIDEO_PROCESSOR_CAPS caps;
+        memset(&caps, 0, sizeof caps);
+        if (SUCCEEDED(ID3D11VideoProcessorEnumerator_GetVideoProcessorCaps(e->venum, &caps))) {
+            for (int f = D3D11_VIDEO_PROCESSOR_FILTER_BRIGHTNESS;
+                 f <= D3D11_VIDEO_PROCESSOR_FILTER_STEREO_ADJUSTMENT; f++) {
+                if (caps.FilterCaps & (1u << f))
+                    ID3D11VideoContext_VideoProcessorSetStreamFilter(e->vctx, e->vproc, 0,
+                            (D3D11_VIDEO_PROCESSOR_FILTER)f, FALSE, 0);
+            }
+        }
+    }
+
+    /* Colour: capture (agent/capture/dxgi.c) already emits studio-range BT.709
+     * NV12, and the SPS VUI signals the same. Declare BT.709 limited on BOTH
+     * sides so the scaler is a pure resample — with the defaults (stream
+     * BT.601) the driver would re-matrix 709->601 and shift colours. */
+    {
+        D3D11_VIDEO_PROCESSOR_COLOR_SPACE cs;
+        memset(&cs, 0, sizeof cs);
+        cs.Usage = 0;          /* playback */
+        cs.YCbCr_Matrix = 1;   /* BT.709 */
+        cs.Nominal_Range = D3D11_VIDEO_PROCESSOR_NOMINAL_RANGE_16_235;
+        ID3D11VideoContext_VideoProcessorSetStreamColorSpace(e->vctx, e->vproc, 0, &cs);
+        ID3D11VideoContext_VideoProcessorSetOutputColorSpace(e->vctx, e->vproc, &cs);
+    }
     return S_OK;
 }
 
@@ -777,6 +852,16 @@ static LONGLONG sample_dur(oos_enc *e, int64_t pts_100ns)
                  : (LONGLONG)(10000000LL / e->fps);
     if (d > 10000000LL) d = 10000000LL;
     return d;
+}
+
+/* Refine frame: ask for a fixed QP on this sample. Best effort — an MFT that
+ * ignores the attribute still has MaxQP clamped by oos_enc_set_refine_qp. */
+static void apply_refine_qp(oos_enc *e, IMFSample *sample)
+{
+    if (e->refine_qp > 0)
+        IMFSample_SetUINT64(sample,
+                            &MFSampleExtension_VideoEncodeQP,
+                            (UINT64)e->refine_qp);
 }
 
 static int submit_sample(oos_enc *e, IMFSample *sample, char *err, int32_t err_len)
@@ -1116,6 +1201,18 @@ int oos_enc_open(const oos_enc_cfg *cfg, oos_enc **out, char *err, int32_t err_l
         }
     }
 
+    /* ТЗ P8: софтверний Microsoft H264 MFT частину ICodecAPI (rate control,
+     * B-кадри, LowLatency, к-сть потоків) читає лише при узгодженні типу —
+     * MSDN «H.264 Video Encoder»: ці властивості задаються ДО SetOutputType.
+     * Тому для софту ставимо їх і до, і (як для всіх) після; повтор
+     * безпечний. Звіт cfg_report лишається від другого, остаточного, проходу. */
+    if (!e->is_hardware &&
+        SUCCEEDED(IMFTransform_QueryInterface(e->mft, &IID_ICodecAPI,
+                                              (void **)&e->codec))) {
+        configure_codecapi(e);
+        SAFE_RELEASE(e->codec);
+    }
+
     /* Encoders want the output type first. */
     hr = set_output_type(e);
     if (FAILED(hr)) { set_err(err, err_len, "SetOutputType(H264)", hr);
@@ -1202,6 +1299,7 @@ int oos_enc_submit_cpu(oos_enc *e,
     IMFSample_SetSampleTime(sample, (LONGLONG)pts_100ns);
     IMFSample_SetSampleDuration(sample, sample_dur(e, pts_100ns));
     e->last_pts = pts_100ns;
+    apply_refine_qp(e, sample);
 
     int rc = submit_sample(e, sample, err, err_len);
     SAFE_RELEASE(sample);
@@ -1294,6 +1392,7 @@ int oos_enc_submit_texture(oos_enc *e, uintptr_t tex, uint64_t gen,
     IMFSample_SetSampleTime(sample, (LONGLONG)pts_100ns);
     IMFSample_SetSampleDuration(sample, sample_dur(e, pts_100ns));
     e->last_pts = pts_100ns;
+    apply_refine_qp(e, sample);
 
     int rc = submit_sample(e, sample, err, err_len);
     SAFE_RELEASE(sample);
@@ -1370,6 +1469,21 @@ int oos_enc_set_bitrate(oos_enc *e, int32_t bps, char *err, int32_t err_len)
      * MF_MT_AVG_BITRATE on every output-type renegotiation, which would
      * otherwise resurrect the value from open time. */
     e->bitrate = bps;
+    return OOS_ENC_OK;
+}
+
+int oos_enc_set_refine_qp(oos_enc *e, int32_t qp, char *err, int32_t err_len)
+{
+    if (!e) return OOS_ENC_ERROR;
+    if (qp < 0 || qp > 51) { set_msg(err, err_len, "refine qp out of range"); return OOS_ENC_ERROR; }
+    e->refine_qp = qp;
+    if (!e->codec) return OOS_ENC_OK; /* sample attribute alone */
+    /* MaxQP caps the rate controller from above, so the frame cannot come out
+     * blurrier than qp even if the per-sample QP is ignored. 51 = no cap.
+     * MaxBitRate/BufferSize stay untouched: the HRD still bounds the burst. */
+    HRESULT hr = set_codec_u32(e, &OOS_AVEncVideoMaxQP, (ULONG)(qp > 0 ? qp : 51));
+    if (FAILED(hr)) { set_err(err, err_len, "AVEncVideoMaxQP", hr);
+                      return OOS_ENC_ERROR; }
     return OOS_ENC_OK;
 }
 

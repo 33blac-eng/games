@@ -195,6 +195,11 @@ func defaultBitrate(flagBps, w, h int) int {
 	bps := int(baselineBitrateBps * px / baselinePixels)
 	// A-41: без стелі 4K давав 32 Мбіт/с — більше, ніж є в каналі більшості
 	// ПК; регулятор хаба потім тижнями «підіймався» до неї.
+	// P0: стелю піднято 16 -> 30 Мбіт/с. 16 різало 4K (8.3 Мпікс) до ~4
+	// біт/кпікс — удвічі менше щільності 1080p, текст мильний. Причина A-41
+	// («тижнями підіймався») прибрана в хабі: B4 ріже до доставленої швидкості
+	// за 1-2 RR, а B5 відновлює мультиплікативно (секунди, не тижні). 30, а не
+	// 32: запас під накладні RTP/SRTP у гігабітному LAN, де 4K і живе.
 	if bps > maxAutoBitrateBps {
 		bps = maxAutoBitrateBps
 	}
@@ -202,7 +207,7 @@ func defaultBitrate(flagBps, w, h int) int {
 }
 
 // maxAutoBitrateBps — стеля автоматичного бітрейту (явний -bitrate її не має).
-const maxAutoBitrateBps = 16_000_000
+const maxAutoBitrateBps = 30_000_000
 
 // outputRequest переносить запит на перемикання з control-горутини в кадровий
 // цикл — рівно як bitrateTarget переносить bitrate_target. Причина та сама і

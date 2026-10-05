@@ -11,6 +11,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/organicoils/oo-screen/hub"
 	"github.com/pion/rtp"
 	"github.com/pion/webrtc/v4"
 )
@@ -55,10 +56,16 @@ type viewerLeg struct {
 	trk    *webrtc.TrackLocalStaticRTP
 	userID string // user_id з claims тікета — для runtime-revoke за user
 
+	// audit — S4: лічильники сесії для журналу аудиту (nil = аудит вимкнено).
+	audit *hub.AuditSession
+
 	// ready — ця нога у PeerConnectionStateConnected; live — ready І є publisher
 	// ноди (єдине місце запису live — recomputeBinding, як і раніше).
 	ready bool
 	live  bool
+	// joinSent — "viewer-join" для цієї ноги вже пішов агенту (S3): шлемо
+	// рівно раз на ногу, а не на кожен транзієнтний Disconnected->Connected.
+	joinSent bool
 
 	// hidden — F-39: вкладка ЦЬОГО глядача прихована, він сам про це сказав
 	// (POST /viewer/visibility, visibility.go). Прихована нога НЕ отримує
@@ -88,6 +95,10 @@ type viewerLeg struct {
 	// primed — нозі вже віддано кеш GOP (пункт 41), тобто картинка в неї піде
 	// без позачергового IDR. Ставить рівно recomputeBinding, під ns.mu.
 	primed bool
+	// primeSlack — скільки пакетів кешу GOP поклали в чергу при priming; на
+	// стільки поріг відставання ноги вищий за viewerQueueDepth, доки pump не
+	// розбере чергу нижче за viewerQueueDepth. Під ns.mu.
+	primeSlack int
 
 	// H-12: стан drop-to-IDR. discarding — нозі зараз НІЧОГО не кладуть у чергу,
 	// доки не прийде ключовий пакет; саме пауза в записі й дає pump-у розібрати
@@ -126,6 +137,18 @@ type viewerLeg struct {
 	nackWinAt time.Time
 	pliUntil  time.Time
 
+	// B4: сигнали затору до ретрансмісії (legCongestion). nackSeen — унікальні
+	// seq із NACK за поточний інтервал між RR (nackPrev — за попередній, щоб
+	// повторний NACK того самого seq через межу інтервалу не рахувався двічі),
+	// sentAtRR — vl.sent на початку інтервалу, pliCnt — PLI від глядача за
+	// інтервал. preLoss/plis — підсумок останнього закритого інтервалу. Під ns.mu.
+	nackSeen map[uint16]struct{}
+	nackPrev map[uint16]struct{}
+	sentAtRR uint64
+	pliCnt   int
+	preLoss  float64
+	plis     int
+
 	sent    uint64 // скільки пакетів реально пішло в трек (атомарно)
 	lastSeq uint32 // останній seq, реально записаний у трек (атомарно, uint16 у uint32)
 
@@ -140,18 +163,51 @@ type viewerLeg struct {
 
 	// audioDropped — кадри, викинуті через переповнену чергу (атомарно).
 	audioDropped uint64
+
+	// tilesOut — черга текстових тайлів (tiles.go); nil, поки глядач не
+	// відкрив канал "oosc-tiles" (і завжди без OO_SCREEN_TILES). Пишеться
+	// під ns.mu, не закривається. tilesSent/tilesDropped — атомарно.
+	tilesOut     chan []byte
+	tilesSent    uint64
+	tilesDropped uint64
+
+	// born — момент створення ноги: старт відліку time-to-first-frame
+	// (/metrics, metrics.go). Пишеться раз, до pump.
+	born time.Time
+	// tilesLossy — з останнього TypeKeep глядач втратив хоч один тайл: його
+	// сховище може не мати тайлів, які агент вважає утриманими (tiles.go).
+	tilesLossy atomic.Bool
+
+	// probe — поточна проба смуги цієї ноги (probe.go); nil — проби немає.
+	probe atomic.Pointer[legProbe]
+	// tcc — transport-cc стан ноги (delaybwe.go, OO_SCREEN_DELAYBWE); nil — вимкнено.
+	tcc atomic.Pointer[twccLeg]
+	// probeKick будить pump, коли пробу виставлено: інакше на тихій нозі
+	// (статичний екран) pump спить у select до наступного пакета й не дописує.
+	probeKick chan struct{}
 }
 
 // addViewer реєструє нову viewer-ногу ноди й піднімає її pump. Нога ще НЕ live:
 // публікація вмикається лише recomputeBinding() після Connected ТА наявного
 // publisher-а (fail-closed — той самий інваріант, що й на одному глядачеві).
 func addViewer(ns *nodeSession, pc *webrtc.PeerConnection, trk *webrtc.TrackLocalStaticRTP, userID string) *viewerLeg {
+	return addViewerLimit(ns, pc, trk, userID, 0)
+}
+
+// addViewerLimit — addViewer зі стелею: перевірка len(ns.viewers) і вставка
+// йдуть під одним ns.mu, тож паралельні /offer (ICE-gathering між раннім
+// viewerCapReached і реєстрацією триває довго) стелю не перескочать.
+// limit<=0 — без стелі. nil — стелю досягнуто, нічого не зареєстровано.
+func addViewerLimit(ns *nodeSession, pc *webrtc.PeerConnection, trk *webrtc.TrackLocalStaticRTP, userID string, limit int) *viewerLeg {
 	vl := &viewerLeg{
 		pc:     pc,
 		trk:    trk,
 		userID: userID,
-		out:    make(chan *rtp.Packet, viewerQueueDepth),
+		out:    make(chan *rtp.Packet, viewerQueueDepth+gopMaxPackets), // + місце під кеш GOP
 		done:   make(chan struct{}),
+		born:   time.Now(),
+
+		probeKick: make(chan struct{}, 1),
 	}
 	// Черга звуку існує ЛИШЕ під прапорцем: без нього нога має бути бітово
 	// такою, як до появи звуку (nil-канал forwardAudioToViewers пропускає).
@@ -160,6 +216,10 @@ func addViewer(ns *nodeSession, pc *webrtc.PeerConnection, trk *webrtc.TrackLoca
 		vl.audioOut = make(chan []byte, audioQueueDepth)
 	}
 	ns.mu.Lock()
+	if limit > 0 && len(ns.viewers) >= limit {
+		ns.mu.Unlock()
+		return nil
+	}
 	if ns.viewers == nil {
 		ns.viewers = make(map[*webrtc.PeerConnection]*viewerLeg)
 	}
@@ -168,9 +228,13 @@ func addViewer(ns *nodeSession, pc *webrtc.PeerConnection, trk *webrtc.TrackLoca
 	ns.viewerCount.Store(int32(n))
 	ns.mu.Unlock()
 	log.Printf("viewer leg added [node=%s]: %d viewer(s)", ns.nodeID, n)
+	refreshCursorGrant(ns) // F9: новий глядач без шару — агент знову малює вказівник
 
 	go vl.pump(ns)
-	go watchSessionCap(ns, vl, sessionCap) // стелю читаємо тут, а не в горутині: тест її підміняє
+	// Стелю читаємо ТУТ, синхронно, а не в горутині сторожа: інакше читання
+	// глобалі відкладалось до планування горутини й гонило з її зміною
+	// (тести підміняють sessionCap; race detector ловив це під навантаженням).
+	go watchSessionCap(ns, vl, sessionCap)
 	return vl
 }
 
@@ -228,11 +292,16 @@ func removeViewer(ns *nodeSession, vl *viewerLeg) bool {
 	if ok && left == 0 {
 		hadFps = clearViewerCapsLocked(ns)
 	}
+	if !hasLiveViewerLocked(ns) {
+		ns.gop.reset() // B3: див. recomputeBinding — кеш без глядачів застаріває
+	}
 	ns.mu.Unlock()
 	if !ok {
 		return false
 	}
 	close(vl.done)
+	vl.audit.End("viewer removed")
+	refreshCursorGrant(ns)
 	if left == 0 {
 		scheduleRecordClose(ns)
 		if hadFps {
@@ -277,6 +346,25 @@ func markViewerReady(ns *nodeSession, vl *viewerLeg) bool {
 	return first
 }
 
+// sendViewerJoin — S3: повідомляє агенту, що підключилась НОВА нога глядача
+// (на кожну, не лише на перехід 0->1), щоб агент із політикою згоди перепитав
+// користувача ПК: згода першого глядача не покриває другого. Викликати ДО
+// recomputeBinding, щоб сигнал по впорядкованому control-каналу випередив
+// ввід цього глядача. Старий агент текст не розпізнає й ігнорує.
+func sendViewerJoin(ns *nodeSession, vl *viewerLeg) {
+	ns.mu.Lock()
+	dc := ns.agentCtrl
+	already := vl.joinSent
+	vl.joinSent = true
+	ns.mu.Unlock()
+	if already || dc == nil || dc.ReadyState() != webrtc.DataChannelStateOpen {
+		return
+	}
+	if err := dc.SendText("viewer-join"); err != nil {
+		log.Printf("sendViewerJoin [node=%s]: %v", ns.nodeID, err)
+	}
+}
+
 // viewerPrimed — чи поїхав цій нозі кеш GOP (пункт 41). Читання під ns.mu, бо
 // пише його recomputeBinding під тим самим локом.
 func viewerPrimed(ns *nodeSession, vl *viewerLeg) bool {
@@ -290,6 +378,7 @@ func viewerPrimed(ns *nodeSession, vl *viewerLeg) bool {
 func markViewerNotReady(ns *nodeSession, vl *viewerLeg) {
 	ns.mu.Lock()
 	vl.ready, vl.live, vl.primed = false, false, false
+	vl.primeSlack = 0
 	ns.mu.Unlock()
 }
 
@@ -441,19 +530,180 @@ func worstViewerRR(ns *nodeSession, vl *viewerLeg, loss float64, jitter uint32, 
 	return worstLoss, worstJitter, worstExcess
 }
 
+// legMinSent — найменше відправлених за інтервал, з якого preLoss має сенс:
+// на 1-2 пакетах keepalive один NACK дав би 50%.
+const legMinSent = 20
+
+// noteNackSeqs кладе запитані seq у множину поточного інтервалу. Кликати під ns.mu.
+func (vl *viewerLeg) noteNackSeqs(seqs []uint16) {
+	if vl.nackSeen == nil {
+		vl.nackSeen = make(map[uint16]struct{}, len(seqs))
+	}
+	for _, s := range seqs {
+		if _, dup := vl.nackPrev[s]; dup {
+			continue
+		}
+		vl.nackSeen[s] = struct{}{}
+	}
+}
+
+// notePLI рахує PLI від глядача цієї ноги (keyframe-request rate, B4).
+func notePLI(ns *nodeSession, vl *viewerLeg) {
+	ns.mu.Lock()
+	vl.pliCnt++
+	ns.mu.Unlock()
+}
+
+// legCongestion — B4: закриває інтервал ЦІЄЇ ноги (кликати на її RR) і віддає
+// НАЙГІРШІ preLoss/plis серед свіжих ніг — те саме правило, що worstViewerRR.
+// preLoss = унікальні NACK-нуті seq / відправлені за інтервал: втрати ДО
+// ретрансмісії, яких RR FractionLost не показує (див. bitrate.go, B4).
+//
+// mediaSSRC — щоб із FEC знаменник був у тому ж вихідному просторі seq, що й
+// NACK-нуті seq (legOutSent), інакше preLoss завищено на частку FEC.
+func legCongestion(ns *nodeSession, vl *viewerLeg, mediaSSRC uint32, now time.Time) congSignals {
+	sent := legOutSent(vl, mediaSSRC)
+	ns.mu.Lock()
+	defer ns.mu.Unlock()
+	if sent < vl.sentAtRR {
+		vl.sentAtRR = sent // лічильник змінився (FEC стартував) — новий відлік
+	}
+	if d := sent - vl.sentAtRR; d >= legMinSent {
+		vl.preLoss = float64(len(vl.nackSeen)) / float64(d)
+		if vl.preLoss > 1 {
+			vl.preLoss = 1
+		}
+		vl.plis = vl.pliCnt
+		vl.nackPrev, vl.nackSeen = vl.nackSeen, nil
+		vl.sentAtRR, vl.pliCnt = sent, 0
+	}
+	worst := congSignals{preLoss: vl.preLoss, plis: vl.plis}
+	for _, o := range ns.viewers {
+		if o == vl || !o.ready || o.lastRR.IsZero() || now.Sub(o.lastRR) > viewerRRStale {
+			continue
+		}
+		if o.preLoss > worst.preLoss {
+			worst.preLoss = o.preLoss
+		}
+		if o.plis > worst.plis {
+			worst.plis = o.plis
+		}
+	}
+	return worst
+}
+
 // pump — власний писар ноги: єдине місце, де пакет іде у трек глядача. Живе
 // окремою горутиною, щоб WriteRTP (SRTP + interceptor-ланцюг цієї ноги) не
 // стояв у циклі форвардингу. Помилка запису = ця нога мертва: рвемо ЇЇ, джерело
 // й інші глядачі не зачіпаються.
 func (vl *viewerLeg) pump(ns *nodeSession) {
+	var (
+		ring    [probeRing]*rtp.Packet // останні відправлені — джерело дублів проби
+		ringN   int
+		pc      pacer
+		paceAt  time.Time
+		ticker  *time.Ticker
+		tickC   <-chan time.Time
+		padNext int
+	)
+	pace := paceEnabled // знімок: тести перемикають глобаль до addViewer
+	defer func() {
+		if ticker != nil {
+			ticker.Stop()
+		}
+	}()
+	write := func(pkt *rtp.Packet) bool {
+		if err := vl.trk.WriteRTP(pkt); err != nil {
+			dropViewer(ns, vl, "WriteRTP: "+err.Error())
+			return false
+		}
+		return true
+	}
+	// pad дописує дублі до швидкості проби. Дублі — не «відправлені» для
+	// vl.sent (preLoss B4 і NACK_recovered_ratio рахують унікальні пакети).
+	pad := func(now time.Time) bool {
+		p := vl.probe.Load()
+		if p == nil || now.Before(p.start) || !now.Before(p.end) || p.aborted.Load() || ringN == 0 {
+			return true
+		}
+		owed := padOwed(p.bps, p.start, now, p.sentBytes.Load())
+		// Не більше за ~2 тики наперед: дублі мають іти рівно, а не сплеском.
+		maxBurst := int64(float64(p.bps) / 8 * (2 * probeTick).Seconds())
+		if owed > maxBurst {
+			owed = maxBurst
+		}
+		n := ringN
+		if n > probeRing {
+			n = probeRing
+		}
+		for owed > 0 {
+			// Найсвіжіші пакети по колу: дубль свіжого ще й страхує його втрату.
+			idx := (ringN - 1 - padNext%n) % probeRing
+			if idx < 0 {
+				idx += probeRing
+			}
+			padNext++
+			dup := ring[idx]
+			if !write(dup) {
+				return false
+			}
+			sz := uint64(pktSize(dup))
+			p.sentBytes.Add(sz)
+			p.padBytes.Add(sz)
+			owed -= int64(sz)
+		}
+		return true
+	}
 	for {
+		probeOn := vl.probe.Load() != nil
+		if probeOn && ticker == nil {
+			ticker = time.NewTicker(probeTick)
+			tickC = ticker.C
+		} else if !probeOn && ticker != nil {
+			ticker.Stop()
+			ticker, tickC = nil, nil
+		}
 		select {
 		case <-vl.done:
 			return
-		case pkt := <-vl.out:
-			if err := vl.trk.WriteRTP(pkt); err != nil {
-				dropViewer(ns, vl, "WriteRTP: "+err.Error())
+		case <-vl.probeKick:
+			// Лише перечитати vl.probe на початку циклу (запустити тікер).
+		case now := <-tickC:
+			if !pad(now) {
 				return
+			}
+		case pkt := <-vl.out:
+			if pace && len(vl.out) < paceBacklog && time.Since(vl.born) > paceWarmup {
+				now := time.Now()
+				if now.Sub(paceAt) >= paceRefreshInt {
+					pc.setRate(bitrateTarget(ns))
+					paceAt = now
+				}
+				if d := pc.wait(pktSize(pkt), now); d > 0 {
+					t := time.NewTimer(d)
+					select {
+					case <-vl.done:
+						t.Stop()
+						return
+					case <-t.C:
+					}
+				}
+			}
+			wpkt := pkt
+			if t := vl.tcc.Load(); t != nil {
+				// N3: копія з transport-wide seq (дублі проби — без нього).
+				wpkt = t.stamp(pkt, time.Now())
+			}
+			if !write(wpkt) {
+				return
+			}
+			ring[ringN%probeRing] = pkt
+			ringN++
+			if p := vl.probe.Load(); p != nil {
+				now := time.Now()
+				if !now.Before(p.start) && now.Before(p.end) {
+					p.sentBytes.Add(uint64(pktSize(pkt)))
+				}
 			}
 			// lastSeq — найновіший seq у буфері ретрансмісії ЦІЄЇ ноги: рівно
 			// те, що pion назве highestAdded. Пишемо тут, а не в
@@ -461,7 +711,9 @@ func (vl *viewerLeg) pump(ns *nodeSession) {
 			// viewerQueueDepth пакетів, і на цю різницю поїхала б оцінка
 			// NACK_recovered_ratio (nack.go).
 			atomic.StoreUint32(&vl.lastSeq, uint32(pkt.SequenceNumber))
-			atomic.AddUint64(&vl.sent, 1)
+			if atomic.AddUint64(&vl.sent, 1) == 1 && !vl.born.IsZero() {
+				metricsTTFF(ns, time.Since(vl.born))
+			}
 		}
 	}
 }

@@ -180,10 +180,11 @@ func TestRecordRotatedFileStartsAtZero(t *testing.T) {
 // читання recordEnabled/recordIdleClose — файл тут не закриється.
 func TestRecordCloseUsesSessionSnapshot(t *testing.T) {
 	withRecordFlag(t, true)
-	prev := recordIdleClose
-	recordIdleClose = 20 * time.Millisecond
-	ns := newRegistry().getOrCreate("snap")      // знімок налаштувань — тут
-	recordEnabled, recordIdleClose = false, prev // «наступний тест» переписав глобали
+	prev := recordIdleClose.Load()
+	recordIdleClose.Store(int64(20 * time.Millisecond))
+	ns := newRegistry().getOrCreate("snap") // знімок налаштувань — тут
+	recordEnabled.Store(false)              // «наступний тест» переписав глобали
+	recordIdleClose.Store(prev)
 
 	vl := silentViewer(t, ns)
 	ns.viewerCount.Store(1)
