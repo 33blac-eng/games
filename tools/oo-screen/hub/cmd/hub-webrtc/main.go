@@ -731,11 +731,7 @@ func newAPI(profile string) (*webrtc.API, error) {
 			// натомість потік зворотного звʼязку, який нікуди не йде.
 			// Апгрейд робиться на місці: зʼявиться оцінювач — додається
 			// {Type: "transport-cc"} і ConfigureTWCCSender.
-			RTCPFeedback: []webrtc.RTCPFeedback{
-				{Type: "nack"},
-				{Type: "nack", Parameter: "pli"},
-				{Type: "goog-remb"},
-			},
+			RTCPFeedback: videoFeedback(),
 		},
 		PayloadType: 102,
 	}, webrtc.RTPCodecTypeVideo); err != nil {
@@ -1501,6 +1497,9 @@ func setupViewerLeg(ns *nodeSession, pc *webrtc.PeerConnection, claims *hub.Tick
 	if vl == nil {
 		return "", errViewerCap
 	}
+	if delayBWEEnabled {
+		vl.tcc.Store(newTwccLeg(sender))
+	}
 	// F-11: секрет ЦІЄЇ ноги. Він не дає нічого, крім права переукласти
 	// ICE/SDP на PeerConnection, яка вже існує і вже авторизована: node, user і
 	// grant у неї ті самі, а зникає нога з реєстру — зникає й дія цього
@@ -1615,6 +1614,9 @@ func setupViewerLeg(ns *nodeSession, pc *webrtc.PeerConnection, claims *hub.Tick
 					if st.escalate {
 						propagatePLI(ns)
 					}
+				case *rtcp.TransportLayerCC:
+					// N3: transport-cc фідбек -> детектор затримки (delaybwe.go).
+					onTWCC(ns, vl, pkt, time.Now())
 				case *rtcp.ReceiverEstimatedMaximumBitrate:
 					// Пункт 40. REMB — це ПРЯМА оцінка смуги hub->глядач від
 					// самого приймача, і вона приходить раніше за втрати в RR:

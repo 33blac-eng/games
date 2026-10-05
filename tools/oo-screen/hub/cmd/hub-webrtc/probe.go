@@ -103,7 +103,7 @@ func (c bitrateCtl) probeCeil() uint64 {
 
 // probeDue — ЧИСТА: чи час почати пробу і на яку швидкість (біт/с).
 func (c bitrateCtl) probeDue(now time.Time) (bitrateCtl, uint64, bool) {
-	if !c.probeOn || c.probing || c.startBps == 0 {
+	if !c.probeOn || c.probing || c.startBps == 0 || c.delayHeld(now) {
 		return c, 0, false
 	}
 	ceil := c.probeCeil()

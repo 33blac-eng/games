@@ -171,6 +171,8 @@ type viewerLeg struct {
 
 	// probe — поточна проба смуги цієї ноги (probe.go); nil — проби немає.
 	probe atomic.Pointer[legProbe]
+	// tcc — transport-cc стан ноги (delaybwe.go, OO_SCREEN_DELAYBWE); nil — вимкнено.
+	tcc atomic.Pointer[twccLeg]
 	// probeKick будить pump, коли пробу виставлено: інакше на тихій нозі
 	// (статичний екран) pump спить у select до наступного пакета й не дописує.
 	probeKick chan struct{}
@@ -669,7 +671,12 @@ func (vl *viewerLeg) pump(ns *nodeSession) {
 					}
 				}
 			}
-			if !write(pkt) {
+			wpkt := pkt
+			if t := vl.tcc.Load(); t != nil {
+				// N3: копія з transport-wide seq (дублі проби — без нього).
+				wpkt = t.stamp(pkt, time.Now())
+			}
+			if !write(wpkt) {
 				return
 			}
 			ring[ringN%probeRing] = pkt
