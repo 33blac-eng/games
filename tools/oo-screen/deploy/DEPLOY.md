@@ -452,7 +452,11 @@ oo-agent -hub https://hub-a.example/offer/agent ^
 
 ### 3. Глядач (ERP)
 У конфіг шару `createOoWebrtcLayer` додати
-`standbySignalUrls: ['https://hub-b.example/offer/viewer']`. Без нього
+`standbySignalUrls: ['https://hub-b.example/offer/viewer']`. Або (краще) повернути
+`standbySignalUrls` з ERP-ендпоінта ticket-а поруч із `signalUrl` — `requestTicket()`
+віддає його шару, і він має пріоритет над конфігом. Увага: зараз у total-erp-app
+немає жодного виклику `createOoWebrtcLayer` і PHP-ендпоінта ticket-а, тож ці поля
+має заповнити той, хто підключатиме шар. Без них
 робиться одна спроба, як раніше. Наступний URL пробується при мережевій
 помилці, таймауті спроби (blackhole/завислий хаб; кожна спроба має власний
 `offerTimeoutMs`), 502/503/504 і 404 `no publisher for node` (агент після

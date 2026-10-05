@@ -1,6 +1,6 @@
 // O2: резервний хаб глядача. Запуск: node resources/js/remote/__tests__/standby.test.mjs
 import assert from 'node:assert/strict';
-import { signalCandidates, shouldFailover, postOfferWithFailover, combineAbortSignals } from '../desktop-oo-webrtc.js';
+import { resolveStandby, signalCandidates, shouldFailover, postOfferWithFailover, combineAbortSignals } from '../desktop-oo-webrtc.js';
 
 // OFF за замовчуванням: рівно один URL.
 assert.deepEqual(signalCandidates('https://a/offer/viewer'), ['https://a/offer/viewer']);
@@ -103,3 +103,10 @@ for (const a of ['neterr', 502]) {
 }
 clearInterval(keepAlive);
 console.log('standby.test.mjs OK');
+
+// O2: резерв із відповіді requestTicket() має пріоритет над config; типово OFF.
+assert.equal(resolveStandby({ ticket: 't' }, {}), undefined);
+assert.equal(resolveStandby(null, undefined), undefined);
+assert.deepEqual(resolveStandby({ standbySignalUrls: ['https://b/o'] }, { standbySignalUrls: ['https://c/o'] }), ['https://b/o']);
+assert.deepEqual(resolveStandby({ ticket: 't' }, { standbySignalUrls: ['https://c/o'] }), ['https://c/o']);
+console.log('standby resolve OK');

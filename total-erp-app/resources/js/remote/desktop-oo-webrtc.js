@@ -424,7 +424,7 @@ export function buildRtcConfig(config) {
  *                               inputAllowed? }
  *   inputChannel (F5, типово false) — власний канал вводу oosc-input замість
  *   Mesh, лише для ролі control; inputAllowed() — гачок політики згоди.
- *   requestTicket() → Promise<{ticket, signalUrl, grant?}> — §6.4 свіжий одноразовий
+ *   requestTicket() → Promise<{ticket, signalUrl, grant?, standbySignalUrls?}> — §6.4 свіжий одноразовий
  *   ticket на цю ноду; offer їде з ticket, НЕ з довгоживучим токеном (BLOCKER-1/3).
  * @param {Function} o.onStateChange(state, reason)
  * @returns {{destroy: Function, state: Function, generation: Function}}
@@ -556,6 +556,18 @@ export function signalCandidates(signalUrl, standby) {
  *  - 400/401/403 (ticket, ACL) — НІ: резервний відповість так само.
  * Наступна спроба завжди йде зі СВІЖИМ ticket-ом (postOfferWithFailover).
  */
+/**
+ * O2: звідки брати резервні URL глядача. Пріоритет — відповідь requestTicket()
+ * (поле standbySignalUrls поруч із signalUrl: той самий серверний канал, що вже
+ * несе signalUrl, тож ERP вмикає резерв без зміни коду виклику шару); інакше —
+ * config.standbySignalUrls. Нічого нема → undefined (типово OFF, одна спроба).
+ */
+export function resolveStandby(ticketResp, config) {
+    if (ticketResp && Array.isArray(ticketResp.standbySignalUrls)) return ticketResp.standbySignalUrls;
+    if (config && Array.isArray(config.standbySignalUrls)) return config.standbySignalUrls;
+    return undefined;
+}
+
 export function shouldFailover(err, status, tornDown) {
     if (err) return !tornDown;
     return status === 404 || status === 502 || status === 503 || status === 504;
@@ -1134,7 +1146,8 @@ export function createOoWebrtcLayer(o) {
         // §6.4 / BLOCKER-1,3: свіжий одноразовий ticket на цю ноду САМЕ перед
         // offer-ом (щоб не згорів по TTL, поки збирався ICE). node_id уже в
         // claims ticket-а — hub звʼяже глядача з publisher-ом цієї ноди.
-        const { ticket, signalUrl, grant: granted } = await config.requestTicket();
+        const ticketResp = await config.requestTicket();
+        const { ticket, signalUrl, grant: granted } = ticketResp || {};
         if (!session.isCurrent(gen)) return;
         if (!ticket || !signalUrl) throw new Error('offer/viewer: немає ticket або signalUrl');
         armInput(gen, ticket, granted);
@@ -1145,7 +1158,7 @@ export function createOoWebrtcLayer(o) {
         // F6: monitor>0 — потік додаткового монітора (desktop-oo-multimon.js);
         // 0/відсутнє — поле не шлемо зовсім, offer як до F6.
         const resp = await postOfferWithFailover({
-            urls: signalCandidates(signalUrl, config.standbySignalUrls),
+            urls: signalCandidates(signalUrl, resolveStandby(ticketResp, config)),
             ticket,
             requestTicket: config.requestTicket,
             makeBody: (t) => offerBody(peer.localDescription.sdp, t, config.monitor),
