@@ -934,6 +934,9 @@ func main() {
 	gopSeconds := flag.Int("gop-seconds", 10, "інтервал періодичного IDR, с (ТЗ 1.4). Довгий GOP = менше важких IDR (див. bench/quality/RESULTS-workloads.md); новий глядач отримує кадр із GOP-кешу хаба (OO_SCREEN_GOP_SPAN, дефолт 12s ≥ GOP, макс 30s) або IDR на keyframe_request/PLI. >11 вимагає на хабі більшого OO_SCREEN_GOP_SPAN")
 	consentFlag := flag.String("consent-policy", os.Getenv("OO_SCREEN_CONSENT"), "S3: згода користувача ПК: off (дефолт) | always-ask | ask-if-user-logged-in (питати, якщо сесія не заблокована) | unattended-allowed-by-admin (без запиту, з індикатором). Не-off: агент стартує в паузі й не віддає кадри/ввід до згоди; поки глядач є — topmost-плашка з кнопкою «Завершити сесію»")
 	consentTimeout := flag.Duration("consent-timeout", 30*time.Second, "S3: скільки чекати відповіді на запит згоди; мовчання = відмова")
+	autoUpdateURL := flag.String("auto-update-url", "", "S6: URL підписаного (ed25519) маніфесту оновлень; порожньо = автооновлення вимкнено (дефолт). Потрібен ключ, зашитий при збірці (-X main.updatePubKey)")
+	autoUpdateEvery := flag.Duration("auto-update-interval", 6*time.Hour, "S6: як часто перевіряти маніфест")
+	autoUpdateHealth := flag.Duration("auto-update-health-window", 2*time.Minute, "S6: за скільки новий бінарь мусить достукатись до хаба, інакше автоматичний відкат")
 	flag.Parse()
 
 	// Прапорці перекривають env з тієї ж причини, що й -token вище: агента
@@ -1005,6 +1008,23 @@ func main() {
 
 	nodeID = *node
 
+	if *hubAddr == "" {
+		switch *transportKind {
+		case "wt":
+			*hubAddr = "localhost:4460"
+		case "webrtc":
+			*hubAddr = "http://127.0.0.1:4470/offer/agent"
+		}
+	}
+
+	// Реєструється РАНІШЕ за defer release(), отже виконується ПІСЛЯ нього:
+	// новий процес не наткнеться на ще зайнятий м'ютекс.
+	defer func() {
+		if relaunchAfterExit.Load() {
+			relaunchSelf()
+		}
+	}()
+
 	// A-36: другий екземпляр на тому ж ПК рве DXGI-дублікацію першого.
 	release, dup := acquireSingleInstance()
 	if *multimonChild > 0 {
@@ -1015,15 +1035,6 @@ func main() {
 		return
 	}
 	defer release()
-
-	if *hubAddr == "" {
-		switch *transportKind {
-		case "wt":
-			*hubAddr = "localhost:4460"
-		case "webrtc":
-			*hubAddr = "http://127.0.0.1:4470/offer/agent"
-		}
-	}
 
 	// A-04: під -H windowsgui os.Stderr не існує — уся капчер-діагностика
 	// (recreate failed, access lost) губилась навіть із -log. Один сток.
@@ -1061,6 +1072,21 @@ func main() {
 	// A-39: logoff/shutdown гасять ctx тим самим шляхом, що Ctrl+C; lock/unlock
 	// читає кадровий цикл. nil = вікно не піднялось, поведінка як до A-39.
 	session := watchSession(stop)
+
+	// S6: щойно встановлене оновлення перевіряємо ПІСЛЯ м'ютекса одного
+	// екземпляра і паралельно з роботою агента (health = агент підключився).
+	if *multimonChild == 0 {
+		go autoUpdateStartup(ctx, *hubAddr, *autoUpdateHealth, stop)
+	}
+
+	if *autoUpdateURL != "" && *multimonChild == 0 {
+		if u, uerr := newUpdater(*autoUpdateURL, nodeID); uerr != nil {
+			log.Printf("oo-agent: autoupdate вимкнено: %v", uerr)
+		} else {
+			log.Printf("oo-agent: autoupdate: версія %s, маніфест %s кожні %s", agentVersion, *autoUpdateURL, *autoUpdateEvery)
+			go runAutoUpdate(ctx, u, *autoUpdateEvery, stop)
+		}
+	}
 
 	// A-27: замість Fatalf — чекаємо з бек-офом (див. retryUntil). Але
 	// заблокований/захищений робочий стіл (E_ACCESSDENIED на DuplicateOutput)
@@ -1331,6 +1357,7 @@ func main() {
 		return
 	}
 	log.Printf("oo-agent: connected via %s to %s", *transportKind, *hubAddr)
+	markAgentConnected()
 
 	type sendJob struct {
 		au  encode.AU
