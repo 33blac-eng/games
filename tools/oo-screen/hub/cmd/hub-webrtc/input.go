@@ -155,6 +155,7 @@ func viewerInputHandler(ns *nodeSession, vl *viewerLeg, ticket, grant string) fu
 			verdict, ev, why := judgeInput(msg.Data, ticket, grant, lim, now)
 			switch verdict {
 			case inputAccept:
+				vl.audit.Count("input_accepted", 1)
 				// F-39: людина клацає — отже, дивиться. Знімаємо прихованість,
 				// навіть якщо її POST /viewer/visibility загубився або прийшов
 				// не в тому порядку. Це страховка в бік «слати», а не «різати».
@@ -164,10 +165,12 @@ func viewerInputHandler(ns *nodeSession, vl *viewerLeg, ticket, grant string) fu
 						"події глядача летять у нікуди (ПК розкочено без -input?)", ns.nodeID)
 				}
 			case inputDrop:
+				vl.audit.Count("input_dropped", 1)
 				if logLim.AllowN(now, 1) {
 					log.Printf("input: подію відкинуто [node=%s]: %s", ns.nodeID, why)
 				}
 			case inputKill:
+				vl.audit.Count("input_killed", 1)
 				log.Printf("input: РВУ СЕСІЮ ГЛЯДАЧА [node=%s]: %s", ns.nodeID, why)
 				dropViewer(ns, vl, "input: "+why)
 			}

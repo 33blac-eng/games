@@ -1512,6 +1512,7 @@ func setupViewerLeg(ns *nodeSession, pc *webrtc.PeerConnection, claims *hub.Tick
 	ns.mu.Lock()
 	vl.sessionID = sessionID
 	ns.mu.Unlock()
+	auditViewerStart(ns, vl, claims)
 	if atrk != nil {
 		go vl.audioPump(ns, atrk)
 	}
@@ -1552,6 +1553,7 @@ func setupViewerLeg(ns *nodeSession, pc *webrtc.PeerConnection, claims *hub.Tick
 		switch s {
 		case webrtc.PeerConnectionStateConnected:
 			first := markViewerReady(ns, vl)
+			sendViewerJoin(ns, vl) // S3: агент перепитує згоду на КОЖНОГО нового глядача
 			recomputeBinding(ns)
 			sendGate(ns) // зʼявився глядач → агент кодує (resume — вже на ПЕРШОМУ)
 			if first {
@@ -2356,6 +2358,7 @@ func main() {
 	mux.HandleFunc("/nodes", handleNodes)
 	// H-16: здоровʼя для моніторингу: скільки нод, чи свіжий пол ревокацій.
 	mux.HandleFunc("/healthz", handleHealthz)
+	startAudit(mux) // S4: лише за OO_SCREEN_AUDIT_LOG
 
 	if ticketModeEnabled() {
 		// H-01: токен у журнал НЕ пишемо — journald читає будь-хто з групи adm.

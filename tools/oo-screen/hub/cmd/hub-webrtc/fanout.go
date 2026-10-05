@@ -11,6 +11,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/organicoils/oo-screen/hub"
 	"github.com/pion/rtp"
 	"github.com/pion/webrtc/v4"
 )
@@ -55,10 +56,16 @@ type viewerLeg struct {
 	trk    *webrtc.TrackLocalStaticRTP
 	userID string // user_id з claims тікета — для runtime-revoke за user
 
+	// audit — S4: лічильники сесії для журналу аудиту (nil = аудит вимкнено).
+	audit *hub.AuditSession
+
 	// ready — ця нога у PeerConnectionStateConnected; live — ready І є publisher
 	// ноди (єдине місце запису live — recomputeBinding, як і раніше).
 	ready bool
 	live  bool
+	// joinSent — "viewer-join" для цієї ноги вже пішов агенту (S3): шлемо
+	// рівно раз на ногу, а не на кожен транзієнтний Disconnected->Connected.
+	joinSent bool
 
 	// hidden — F-39: вкладка ЦЬОГО глядача прихована, він сам про це сказав
 	// (POST /viewer/visibility, visibility.go). Прихована нога НЕ отримує
@@ -277,6 +284,7 @@ func removeViewer(ns *nodeSession, vl *viewerLeg) bool {
 		return false
 	}
 	close(vl.done)
+	vl.audit.End("viewer removed")
 	if left == 0 {
 		scheduleRecordClose(ns)
 	}
@@ -316,6 +324,25 @@ func markViewerReady(ns *nodeSession, vl *viewerLeg) bool {
 	first := !hasVisibleViewerLocked(ns)
 	vl.ready = true
 	return first
+}
+
+// sendViewerJoin — S3: повідомляє агенту, що підключилась НОВА нога глядача
+// (на кожну, не лише на перехід 0->1), щоб агент із політикою згоди перепитав
+// користувача ПК: згода першого глядача не покриває другого. Викликати ДО
+// recomputeBinding, щоб сигнал по впорядкованому control-каналу випередив
+// ввід цього глядача. Старий агент текст не розпізнає й ігнорує.
+func sendViewerJoin(ns *nodeSession, vl *viewerLeg) {
+	ns.mu.Lock()
+	dc := ns.agentCtrl
+	already := vl.joinSent
+	vl.joinSent = true
+	ns.mu.Unlock()
+	if already || dc == nil || dc.ReadyState() != webrtc.DataChannelStateOpen {
+		return
+	}
+	if err := dc.SendText("viewer-join"); err != nil {
+		log.Printf("sendViewerJoin [node=%s]: %v", ns.nodeID, err)
+	}
 }
 
 // viewerPrimed — чи поїхав цій нозі кеш GOP (пункт 41). Читання під ns.mu, бо

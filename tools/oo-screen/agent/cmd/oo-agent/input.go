@@ -15,13 +15,21 @@
 package main
 
 import (
+	"errors"
 	"log"
 	"os"
 	"sync/atomic"
 	"time"
 
 	"github.com/organicoils/oo-screen/agent/input"
+	"github.com/organicoils/oo-screen/internal/consent"
 )
+
+// consentGate — S3 (internal/consent). nil = політика off, ввід як раніше.
+// Ставить main до першого dial; читає канал вводу.
+var consentGate *consent.Gate
+
+var errNoConsent = errors.New("input dropped: no local consent (S3)")
 
 // inputChannelLabel — та сама мітка, що в хабі. Один канал, одна назва.
 const inputChannelLabel = "oosc-input"
@@ -41,6 +49,10 @@ type eventInjector interface {
 // логує: викликач глушить лог від флуду (logInputProblem), і робити це двічі
 // не треба.
 func handleInputMessage(data []byte, inj eventInjector) error {
+	// S3: без локальної згоди ввід не інʼєктується, що б не прислав хаб.
+	if !consentGate.Allowed() {
+		return errNoConsent
+	}
 	ev, err := input.ParseEvent(data)
 	if err != nil {
 		return err

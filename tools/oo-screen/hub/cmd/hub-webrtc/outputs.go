@@ -150,6 +150,7 @@ func handleControl(w http.ResponseWriter, r *http.Request) {
 		ns.activeOutput = idx
 		ns.mu.Unlock()
 		log.Printf("select_output [node=%s]: -> %d", ns.nodeID, idx)
+		auditControl(ns, claims, "select_output", idx)
 	}
 
 	resp := outputsSnapshot(ns)
