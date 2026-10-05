@@ -133,6 +133,7 @@ func main() {
 	// (internal/ulpfec). Хабу треба OO_SCREEN_FEC=1 (у -hub-env), інакше він
 	// red/ulpfec просто не узгодить.
 	fecOn := flag.Bool("fec", false, "глядач пропонує red/ulpfec і декодує FEC")
+	twccOn := flag.Bool("twcc", false, "глядач шле transport-cc фідбек, як Chrome (для OO_SCREEN_DELAYBWE)")
 	flag.Parse()
 
 	if *logdir == "" {
@@ -328,6 +329,10 @@ func main() {
 	// дозволяє наблизитись до libwebrtc (NACK одразу на дірку, повтор раз на RTT).
 	must(webrtc.ConfigureNackWithOptions(m, ir, []nack.GeneratorOption{nack.GeneratorInterval(*nackIvl)}))
 	must(webrtc.ConfigureRTCPReports(ir))
+	if *twccOn {
+		// Як Chrome: transport-cc фідбек раз на ~100 мс (pion twcc).
+		must(webrtc.ConfigureTWCCSender(m, ir))
+	}
 	// Вікно SRTP replay — як у libwebrtc (1024). Дефолт pion 64: NACK-ретрансмісія,
 	// що приходить через >64 пакети (800 пак/с x RTT), мовчки відкидалась би
 	// SRTP-шаром — такої втрати браузер не має.

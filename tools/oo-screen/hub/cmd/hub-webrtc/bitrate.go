@@ -508,6 +508,11 @@ type bitrateCtl struct {
 	probeLastOK    bool // остання проба вдалась (наступна ×2); скидає зріз
 	probeNextAt    time.Time
 	probeMuteUntil time.Time
+
+	// --- N3: детектор градієнта затримки (delaybwe.go) ---
+	// delayOverAt — останній підтверджений OVERUSE; нуль = не було (або
+	// прапорець OO_SCREEN_DELAYBWE вимкнено) — тоді поведінка рівно як до N3.
+	delayOverAt time.Time
 }
 
 // Ручки швидкого відновлення. Свідомо консервативні щодо задокументованих
@@ -853,7 +858,7 @@ func (c bitrateCtl) stepSig(lossFrac float64, rttExcess time.Duration, sig congS
 	// повзла назад до стелі просто тому, що втрат немає, хоч черга стояла на
 	// місці (заміряно на ramp5 і depth). Поріг звільнення rttUpClear свідомо
 	// нижчий за поріг зрізу — див. його коментар про пилку.
-	case lossFrac <= lossLowFrac && excess < rttUpClear && !queueLossy:
+	case lossFrac <= lossLowFrac && excess < rttUpClear && !queueLossy && !c.delayHeld(now):
 		if c.goodSince.IsZero() {
 			c.goodSince = now
 		}
