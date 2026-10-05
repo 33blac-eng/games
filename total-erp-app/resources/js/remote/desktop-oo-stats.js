@@ -145,6 +145,14 @@ export function formatStatsLines(s) {
     ];
 }
 
+/** N6: рядок шляху медіа — direct (агент↔браузер напряму) чи relay (через хаб). */
+export function formatPathLine(path) {
+    if (path === 'direct') return 'Шлях: direct (P2P)';
+    if (path === 'relay') return 'Шлях: relay (хаб)';
+    if (path === 'direct-connecting') return 'Шлях: direct… (ICE)';
+    return 'Шлях: —';
+}
+
 /**
  * DOM-оверлей статистики. getPc() — актуальний RTCPeerConnection або null.
  * @returns {{show: Function, hide: Function, toggle: Function, visible: Function, destroy: Function}}
@@ -195,7 +203,9 @@ export function createStatsOverlay(o) {
             if (destroyed || timer === null) return;
             const r = computeVideoStats(report, prev);
             prev = r ? r.snap : null;
-            panel.textContent = formatStatsLines(r && r.stats).join('\n');
+            const lines = formatStatsLines(r && r.stats);
+            if (typeof o.getPath === 'function') lines.unshift(formatPathLine(o.getPath()));
+            panel.textContent = lines.join('\n');
         } catch (e) { /* ignore */ } finally { busy = false; }
     }
 
