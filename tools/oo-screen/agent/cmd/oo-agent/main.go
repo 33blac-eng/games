@@ -940,6 +940,7 @@ func main() {
 	autoUpdateURL := flag.String("auto-update-url", "", "S6: URL підписаного (ed25519) маніфесту оновлень; порожньо = автооновлення вимкнено (дефолт). Потрібен ключ, зашитий при збірці (-X main.updatePubKey)")
 	autoUpdateEvery := flag.Duration("auto-update-interval", 6*time.Hour, "S6: як часто перевіряти маніфест")
 	autoUpdateHealth := flag.Duration("auto-update-health-window", 2*time.Minute, "S6: за скільки новий бінарь мусить достукатись до хаба, інакше автоматичний відкат")
+	autoUpdateReport := flag.String("auto-update-report-url", "", "O4: куди POST-ити вердикт здоров'я нової версії (ok/fail/inconclusive) для поетапної викатки (oo-rollout serve); порожньо = не звітувати. Токен — env OO_ROLLOUT_REPORT_TOKEN")
 	flag.Parse()
 
 	// Прапорці перекривають env з тієї ж причини, що й -token вище: агента
@@ -1086,7 +1087,7 @@ func main() {
 	// S6: щойно встановлене оновлення перевіряємо ПІСЛЯ м'ютекса одного
 	// екземпляра і паралельно з роботою агента (health = агент підключився).
 	if *multimonChild == 0 {
-		go autoUpdateStartup(ctx, *hubAddr, *autoUpdateHealth, stop)
+		go autoUpdateStartup(ctx, *hubAddr, *autoUpdateHealth, stop, *autoUpdateReport, *node)
 	}
 
 	if *autoUpdateURL != "" && *multimonChild == 0 {

@@ -135,6 +135,43 @@ sudo sh -c 'umask 077; grep ^OO_SCREEN_AGENT_SECRET= /etc/oo-screen/hub.env | cu
 `OO_SCREEN_AGENT_SECRET` (або з ним == `OO_SCREEN_T1_TOKEN`) токени нод НЕ приймає
 (ERROR у журналі) — крок 1 обовʼязковий.
 
+### 4.1 O4: поетапна викатка через автооновлення (канарка, ворота, зупинка)
+
+Альтернатива ручному `agent-deploy.ps1` для агентів, зібраних з
+`OO_UPDATE_PUBKEY` і запущених з `-auto-update-url`. Ланцюжок:
+
+1. Агент після swap на нову версію сам перевіряє здоров'я (S6/хвиля 2:
+   за `-auto-update-health-window` мусить підключитись до хаба; інакше
+   локальний відкат і deny версії). З `-auto-update-report-url
+   https://<хаб>/rollout/report` (+ env `OO_ROLLOUT_REPORT_TOKEN`) він POST-ить
+   вердикт `ok` / `fail` / `inconclusive` (Committed / RolledBack або
+   RollbackFailed / Inconclusive). Звіт best-effort: помилка лише в лог.
+2. `oo-rollout serve -listen 127.0.0.1:8095 -reports /var/lib/oo-rollout/reports.jsonl`
+   (env `OO_ROLLOUT_REPORT_TOKEN`) — приймає звіти, перевіряє токен/поля,
+   час ставить свій. nginx: `location /rollout/report { proxy_pass http://127.0.0.1:8095; }`.
+3. Підписати реліз (`oo-update-sign ... -rollout 0`), потім
+   `deploy/agent-rollout.sh init <manifest.json>` — маніфест перепідписано
+   на перший етап (типово 1 %).
+4. `deploy/agent-rollout.sh step <manifest.json>` з cron/systemd timer
+   (або `watch` — цикл кожні `INTERVAL` с). Кожен крок:
+   - частка `fail/(ok+fail)` по ВСІХ звітах версії > `-max-fail-rate` (5 %) →
+     **halt**: маніфест перепідписано з `rollout_percent 0`, код 3,
+     викликається `OO_ROLLOUT_ON_HALT "<рядок рішення>"`; halt липкий;
+   - етап відстояв `-soak` (2 год) і зібрав ≥ `-min-reports` (3) вердиктів
+     ok/fail з початку етапу → наступний етап (1 → 10 → 50 → 100);
+   - за `-max-stage-time` (48 год) не набралось звітів → halt (тиша ≠ зелене світло).
+   Маніфест має лежати там, звідки його роздає `-auto-update-url`
+   (запис атомарний: temp + rename).
+5. Після halt: виправити, випустити НОВУ версію (вищу), `FORCE=1 ... init`.
+
+Що halt робить і чого ні: нові вузли версію більше не беруть; вузли з `fail`
+уже відкотились самі; вузли, що прийняли версію (`ok`), лишаються на ній до
+наступного релізу — масового «відкату назад» немає (агент не ставить версію
+≤ поточної). Звіти довіряються власнику токена (спільний токен на флот).
+Перевірено: юніт-тести `internal/rollout`, `agent/cmd/oo-rollout`,
+`agent/cmd/oo-agent` (вердикт/POST) і `deploy/test/agent-rollout-test.sh`
+(справжні бінарі, згенерований ключ). На живих ПК/хабі не перевірялось.
+
 ## 7. Відкат
 
 - **Хаб, автоматично**: `hub-deploy.sh` сам повертає симлінк, якщо нова версія
