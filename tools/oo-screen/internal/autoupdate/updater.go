@@ -45,7 +45,15 @@ var (
 	ErrNoArtifact    = errors.New("autoupdate: no artifact for this os/arch")
 	ErrDigest        = errors.New("autoupdate: artifact sha256/size mismatch")
 	ErrUpdatePending = errors.New("autoupdate: previous update still pending")
+	ErrDenied        = errors.New("autoupdate: version was rolled back on this node")
+	// ErrInconclusive: health could not be judged (e.g. hub down). Wrap it in
+	// the health error so Startup keeps the marker without a rollback and
+	// without counting this start towards MaxStarts.
+	ErrInconclusive = errors.New("autoupdate: health inconclusive")
 )
+
+// maxDenied caps the on-disk denylist.
+const maxDenied = 32
 
 func (u *Updater) client() *http.Client {
 	if u.Client != nil {
@@ -64,6 +72,45 @@ func (u *Updater) maxBytes() int64 {
 func (u *Updater) markerPath() string { return u.ExePath + ".update.json" }
 func (u *Updater) oldPath() string    { return u.ExePath + ".old" }
 func (u *Updater) newPath() string    { return u.ExePath + ".new" }
+func (u *Updater) denyPath() string   { return u.ExePath + ".update-deny.json" }
+
+// Denied reports whether version v was rolled back on this node before.
+// A rolled-back version is never installed again; only a strictly different
+// (newer) signed version can be tried.
+func (u *Updater) Denied(v string) bool {
+	for _, d := range u.readDeny() {
+		if CompareVersions(d, v) == 0 {
+			return true
+		}
+	}
+	return false
+}
+
+func (u *Updater) readDeny() []string {
+	b, err := os.ReadFile(u.denyPath())
+	if err != nil {
+		return nil
+	}
+	var l []string
+	_ = json.Unmarshal(b, &l)
+	return l
+}
+
+func (u *Updater) deny(v string) error {
+	if v == "" || u.Denied(v) {
+		return nil
+	}
+	l := append(u.readDeny(), v)
+	if len(l) > maxDenied {
+		l = l[len(l)-maxDenied:]
+	}
+	b, _ := json.Marshal(l)
+	tmp := u.denyPath() + ".tmp"
+	if err := os.WriteFile(tmp, b, 0o644); err != nil {
+		return err
+	}
+	return os.Rename(tmp, u.denyPath())
+}
 
 func (u *Updater) get(ctx context.Context, url string, limit int64) ([]byte, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
@@ -104,6 +151,9 @@ func (u *Updater) Check(ctx context.Context) (*Manifest, *Artifact, error) {
 	}
 	if CompareVersions(m.Version, u.CurrentVersion) <= 0 {
 		return m, nil, ErrNotNewer
+	}
+	if u.Denied(m.Version) {
+		return m, nil, ErrDenied
 	}
 	if !InRollout(u.NodeID, m) {
 		return m, nil, ErrNotInRollout
@@ -175,12 +225,27 @@ func (u *Updater) readMarker() (*Pending, error) {
 	return &p, nil
 }
 
-// Rollback restores <exe>.old over <exe> and removes the marker. The caller
-// must exit so the supervisor (scheduled task) starts the old binary.
+// ErrRollbackImpossible: <exe>.old is gone, the new binary stays in place.
+var ErrRollbackImpossible = errors.New("autoupdate: rollback impossible")
+
+// Rollback restores <exe>.old over <exe>, records the pending version in the
+// denylist (so Check never re-installs it) and removes the marker. The caller
+// must exit so the old binary is started.
 func (u *Updater) Rollback() error {
+	bad := ""
+	if p, err := u.readMarker(); err == nil {
+		bad = p.To
+	}
+	return u.rollback(bad)
+}
+
+func (u *Updater) rollback(badVersion string) error {
+	// Deny first: even if the file shuffle below fails, the node must not
+	// download this version again.
+	derr := u.deny(badVersion)
 	if _, err := os.Stat(u.oldPath()); err != nil {
 		_ = os.Remove(u.markerPath())
-		return fmt.Errorf("autoupdate: rollback impossible, %s missing: %w", u.oldPath(), err)
+		return errors.Join(fmt.Errorf("%w: %s missing: %v", ErrRollbackImpossible, u.oldPath(), err), derr)
 	}
 	bad := u.ExePath + ".bad"
 	_ = os.Remove(bad)
@@ -205,9 +270,11 @@ func (u *Updater) Commit() error {
 type StartupResult int
 
 const (
-	NoPending  StartupResult = iota // nothing to verify
-	Committed                       // new binary healthy, kept
-	RolledBack                      // old binary restored; caller must exit
+	NoPending      StartupResult = iota // nothing to verify
+	Committed                           // new binary healthy, kept
+	RolledBack                          // old binary restored; caller must exit
+	RollbackFailed                      // unhealthy, but <exe>.old missing: still running the new binary
+	Inconclusive                        // health unknown (ErrInconclusive); marker kept, decide next start
 )
 
 // Startup runs at every agent start. If a swap is pending it counts the
@@ -218,7 +285,7 @@ func (u *Updater) Startup(ctx context.Context, health func(context.Context) erro
 		return NoPending, nil
 	}
 	if err != nil { // unreadable marker: be conservative
-		return RolledBack, u.Rollback()
+		return u.rollbackResult(u.rollback(""))
 	}
 	maxStarts := u.MaxStarts
 	if maxStarts <= 0 {
@@ -226,18 +293,31 @@ func (u *Updater) Startup(ctx context.Context, health func(context.Context) erro
 	}
 	p.Starts++
 	if p.Starts > maxStarts {
-		return RolledBack, u.Rollback()
+		return u.rollbackResult(u.rollback(p.To))
 	}
 	if err := u.writeMarker(*p); err != nil {
 		return NoPending, err
 	}
 	if herr := health(ctx); herr != nil {
-		if rerr := u.Rollback(); rerr != nil {
-			return RolledBack, errors.Join(herr, rerr)
+		if errors.Is(herr, ErrInconclusive) {
+			// Not a crash: do not count this start.
+			p.Starts--
+			if werr := u.writeMarker(*p); werr != nil {
+				return Inconclusive, errors.Join(herr, werr)
+			}
+			return Inconclusive, herr
 		}
-		return RolledBack, herr
+		res, rerr := u.rollbackResult(u.rollback(p.To))
+		return res, errors.Join(herr, rerr)
 	}
 	return Committed, u.Commit()
+}
+
+func (u *Updater) rollbackResult(err error) (StartupResult, error) {
+	if errors.Is(err, ErrRollbackImpossible) {
+		return RollbackFailed, err
+	}
+	return RolledBack, err
 }
 
 // CleanupStale removes leftovers of an interrupted Stage.

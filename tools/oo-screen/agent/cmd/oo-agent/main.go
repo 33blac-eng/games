@@ -1017,12 +1017,6 @@ func main() {
 		}
 	}
 
-	// S6: щойно встановлене оновлення перевіряємо ДО м'ютекса одного
-	// екземпляра — після відкату запускаємо старий бінарь і виходимо.
-	if *multimonChild == 0 && autoUpdateStartup(*hubAddr, *autoUpdateHealth) {
-		relaunchSelf()
-		return
-	}
 	// Реєструється РАНІШЕ за defer release(), отже виконується ПІСЛЯ нього:
 	// новий процес не наткнеться на ще зайнятий м'ютекс.
 	defer func() {
@@ -1078,6 +1072,12 @@ func main() {
 	// A-39: logoff/shutdown гасять ctx тим самим шляхом, що Ctrl+C; lock/unlock
 	// читає кадровий цикл. nil = вікно не піднялось, поведінка як до A-39.
 	session := watchSession(stop)
+
+	// S6: щойно встановлене оновлення перевіряємо ПІСЛЯ м'ютекса одного
+	// екземпляра і паралельно з роботою агента (health = агент підключився).
+	if *multimonChild == 0 {
+		go autoUpdateStartup(ctx, *hubAddr, *autoUpdateHealth, stop)
+	}
 
 	if *autoUpdateURL != "" && *multimonChild == 0 {
 		if u, uerr := newUpdater(*autoUpdateURL, nodeID); uerr != nil {
@@ -1357,6 +1357,7 @@ func main() {
 		return
 	}
 	log.Printf("oo-agent: connected via %s to %s", *transportKind, *hubAddr)
+	markAgentConnected()
 
 	type sendJob struct {
 		au  encode.AU
