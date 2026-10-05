@@ -48,6 +48,14 @@ type rig struct {
 	consent *fakeConsent
 	blocked atomic.Bool
 
+	// paused — агент «завис/упав»: не полить взагалі.
+	paused atomic.Bool
+	// forget — агент «перезапустився»: реєстр ніг порожній, ноги не названі.
+	forget      atomic.Bool
+	consentPoll time.Duration
+	sessionTTL  time.Duration
+	reg         p2p.AgentLegs
+
 	mu   sync.Mutex
 	legs []*p2p.AgentLeg
 	got  [][]byte
@@ -55,8 +63,11 @@ type rig struct {
 
 const node = "node-1"
 
-func newRig(t *testing.T) *rig {
+func newRig(t *testing.T, opts ...func(*rig)) *rig {
 	r := &rig{t: t, consent: &fakeConsent{}}
+	for _, o := range opts {
+		o(r)
+	}
 	r.consent.ok.Store(true)
 	r.audit = filepath.Join(t.TempDir(), "audit.jsonl")
 	al, err := hub.OpenAuditLog(r.audit)
@@ -72,7 +83,7 @@ func newRig(t *testing.T) *rig {
 		Authorize: func(_ *http.Request, ticket string) (p2p.Grant, int, int, string) {
 			switch ticket {
 			case "t-control":
-				return p2p.Grant{User: "u1", Node: node, Grant: "control"}, int(r.viewers.Load()), 0, ""
+				return p2p.Grant{User: "u1", Node: node, Grant: "control", Claims: "claims-u1"}, int(r.viewers.Load()), 0, ""
 			case "t-view":
 				return p2p.Grant{User: "u2", Node: node, Grant: "view"}, int(r.viewers.Load()), 0, ""
 			}
@@ -87,6 +98,9 @@ func newRig(t *testing.T) *rig {
 		},
 	})
 	r.broker.PollWait = 300 * time.Millisecond
+	if r.sessionTTL > 0 {
+		r.broker.SessionTTL = r.sessionTTL
+	}
 	mux := http.NewServeMux()
 	r.broker.Register(mux, nil)
 	r.srv = httptest.NewServer(mux)
@@ -122,7 +136,15 @@ func (r *rig) agentLoop(stop chan struct{}, cfg p2p.Config) {
 			return
 		default:
 		}
-		req, _ := http.NewRequest(http.MethodGet, r.srv.URL+"/p2p/poll?node="+node, nil)
+		if r.paused.Load() {
+			time.Sleep(20 * time.Millisecond)
+			continue
+		}
+		active := r.reg.Active()
+		if r.forget.Load() {
+			active = ""
+		}
+		req, _ := http.NewRequest(http.MethodGet, r.srv.URL+"/p2p/poll?node="+node+"&active="+active, nil)
 		req.Header.Set("Authorization", "Bearer agent-"+node)
 		resp, err := http.DefaultClient.Do(req)
 		if err != nil {
@@ -133,14 +155,14 @@ func (r *rig) agentLoop(stop chan struct{}, cfg p2p.Config) {
 			_ = json.NewDecoder(resp.Body).Decode(&m)
 		}
 		resp.Body.Close()
-		if m.Type != "offer" {
+		if r.reg.Handle(m) || m.Type != "offer" {
 			continue
 		}
 		o := *m.Offer
 		track, _ := webrtc.NewTrackLocalStaticSample(webrtc.RTPCodecCapability{MimeType: webrtc.MimeTypeH264}, "video", "oo")
 		leg, sdp, err := p2p.NewAgentLeg(o, p2p.AgentLegOptions{
 			Config: cfg, SettingEngine: loopbackSE(r.blocked.Load()), Consent: r.consent,
-			Tracks: []webrtc.TrackLocal{track},
+			Tracks: []webrtc.TrackLocal{track}, ConsentPoll: r.consentPoll,
 			OnInput: func(b []byte) {
 				r.mu.Lock()
 				r.got = append(r.got, b)
@@ -161,6 +183,7 @@ func (r *rig) agentLoop(stop chan struct{}, cfg p2p.Config) {
 		r.mu.Lock()
 		r.legs = append(r.legs, leg)
 		r.mu.Unlock()
+		r.reg.Add(o.ID, leg)
 		r.agentReq(http.MethodPost, "/p2p/answer", p2p.AgentAnswerReq{ID: o.ID, Node: node, SDP: sdp})
 		go func() {
 			for i := 0; i < 100; i++ {
@@ -287,6 +310,11 @@ func TestP2PDirectControl(t *testing.T) {
 	if n := r.broker.RevokeUser("u1"); n != 1 {
 		t.Fatalf("revoked %d", n)
 	}
+	// Агент забирає "close" poll-ом і сам рве пряму ногу (хаб медіа не бачить).
+	waitFor(t, "agent leg closed by revoke", func() bool { c, _ := r.legs[0].Closed(); return c })
+	if _, ok := r.broker.RedeemRelayTicket(v.resp.RelayTicket); ok {
+		t.Fatal("relay ticket survived revoke")
+	}
 	a := r.auditEvents()
 	if !strings.Contains(a, `"session_start"`) || !strings.Contains(a, `transport=p2p`) || !strings.Contains(a, `"grant":"control"`) || !strings.Contains(a, `revoked`) {
 		t.Fatalf("audit:\n%s", a)
@@ -329,7 +357,8 @@ func TestP2PViewOnlyInputDropped(t *testing.T) {
 }
 
 func TestP2PConsentWithdrawnDropsInput(t *testing.T) {
-	r := newRig(t)
+	// Watcher згоди фактично вимкнено, щоб перевірити саме гейт на подію.
+	r := newRig(t, func(r *rig) { r.consentPoll = time.Hour })
 	v := r.viewer("t-control")
 	<-v.dcOpen
 	r.consent.ok.Store(false) // «Завершити» на ПК
@@ -352,6 +381,16 @@ func TestP2PNoConsentFallsBack(t *testing.T) {
 	if r.broker.Active() != 0 {
 		t.Fatal("session left open")
 	}
+	// ERP-квиток спожито /p2p/offer — relay-повтор іде з relay-квитком, один раз.
+	if !strings.HasPrefix(v.resp.RelayTicket, p2p.RelayTicketPrefix) {
+		t.Fatalf("no relay ticket: %+v", v.resp)
+	}
+	if g, ok := r.broker.RedeemRelayTicket(v.resp.RelayTicket); !ok || g.Claims != "claims-u1" || g.Node != node {
+		t.Fatalf("redeem: %v %+v", ok, g)
+	}
+	if _, ok := r.broker.RedeemRelayTicket(v.resp.RelayTicket); ok {
+		t.Fatal("relay ticket reused")
+	}
 	if a := r.auditEvents(); !strings.Contains(a, "fallback:consent") {
 		t.Fatalf("audit:\n%s", a)
 	}
@@ -363,6 +402,9 @@ func TestP2PNATBlockedFallsBackToRelay(t *testing.T) {
 	v := r.viewer("t-control")
 	if v.status != http.StatusOK {
 		t.Fatalf("signalling should succeed: %d", v.status)
+	}
+	if _, ok := r.broker.RedeemRelayTicket(v.resp.RelayTicket); ok {
+		t.Fatal("relay ticket redeemable while direct leg is alive")
 	}
 	select {
 	case reason := <-v.fellBack:
@@ -376,6 +418,9 @@ func TestP2PNATBlockedFallsBackToRelay(t *testing.T) {
 	waitFor(t, "node freed", func() bool { return r.broker.Active() == 0 })
 	if s := r.broker.Metrics().Snapshot(); s.Direct != 0 || s.DirectShare() != 0 {
 		t.Fatalf("%+v", s)
+	}
+	if g, ok := r.broker.RedeemRelayTicket(v.resp.RelayTicket); !ok || g.User != "u1" {
+		t.Fatalf("relay ticket after ICE fallback: %v %+v", ok, g)
 	}
 }
 
@@ -415,5 +460,75 @@ func TestP2PDisabledRegistersNothing(t *testing.T) {
 	})
 	if !c.Enabled || len(c.ICEServers()) != 3 {
 		t.Fatalf("%+v", c)
+	}
+}
+
+func directUp(t *testing.T, r *rig) *viewer {
+	t.Helper()
+	v := r.viewer("t-control")
+	if v.status != http.StatusOK {
+		t.Fatalf("status %d %+v", v.status, v.resp)
+	}
+	select {
+	case <-v.track:
+	case <-time.After(8 * time.Second):
+		t.Fatal("no media over the direct leg")
+	}
+	return v
+}
+
+func TestP2PConsentWithdrawnStopsVideo(t *testing.T) {
+	r := newRig(t, func(r *rig) { r.consentPoll = 50 * time.Millisecond })
+	v := directUp(t, r)
+	r.consent.ok.Store(false) // «Завершити» на ПК
+	waitFor(t, "leg closed", func() bool { c, why := r.legs[0].Closed(); return c && why == "consent-withdrawn" })
+	if s := r.legs[0].PC.ConnectionState(); s != webrtc.PeerConnectionStateClosed {
+		t.Fatalf("agent pc %v", s)
+	}
+	waitFor(t, "viewer pc down", func() bool { return v.pc.ICEConnectionState() != webrtc.ICEConnectionStateConnected })
+	waitFor(t, "hub freed node", func() bool { return r.broker.Active() == 0 })
+	if a := r.auditEvents(); !strings.Contains(a, "consent-withdrawn") {
+		t.Fatalf("audit:\n%s", a)
+	}
+}
+
+func TestP2PRevokeWhileAgentNotPolling(t *testing.T) {
+	r := newRig(t)
+	directUp(t, r)
+	r.paused.Store(true)
+	time.Sleep(400 * time.Millisecond) // поточний poll відпрацював
+	if n := r.broker.RevokeUser("u1"); n != 1 {
+		t.Fatalf("revoked %d", n)
+	}
+	if c, _ := r.legs[0].Closed(); c {
+		t.Fatal("closed without poll?")
+	}
+	r.paused.Store(false) // "close" не загубився, поки агент мовчав
+	waitFor(t, "agent leg closed after resume", func() bool { c, _ := r.legs[0].Closed(); return c })
+}
+
+func TestP2PAgentLostFreesNode(t *testing.T) {
+	r := newRig(t, func(r *rig) { r.sessionTTL = 700 * time.Millisecond })
+	directUp(t, r)
+	r.paused.Store(true) // агент завис: ні poll, ні result
+	waitFor(t, "ttl reaped", func() bool { return r.broker.Active() == 0 })
+	if a := r.auditEvents(); !strings.Contains(a, "agent-lost") {
+		t.Fatalf("audit:\n%s", a)
+	}
+	r.paused.Store(false)
+	// Стару ногу агент таки рве (хаб назвав її в "close"), нода знову вільна.
+	waitFor(t, "stale leg closed", func() bool { c, _ := r.legs[0].Closed(); return c })
+	if v := r.viewer("t-control"); v.status != http.StatusOK {
+		t.Fatalf("node still blocked: %d %+v", v.status, v.resp)
+	}
+}
+
+func TestP2PAgentRestartFreesNode(t *testing.T) {
+	r := newRig(t)
+	directUp(t, r)
+	r.forget.Store(true) // перезапуск: poll з порожнім active
+	waitFor(t, "agent-lost on restart", func() bool { return r.broker.Active() == 0 })
+	if a := r.auditEvents(); !strings.Contains(a, "agent-lost") {
+		t.Fatalf("audit:\n%s", a)
 	}
 }

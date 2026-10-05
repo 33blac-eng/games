@@ -111,6 +111,9 @@ type Grant struct {
 	Org   string `json:"org,omitempty"`
 	Node  string `json:"node"`
 	Grant string `json:"grant"`
+	// Claims — непрозорі claims хаба (спожитий ERP-квиток); брокер лише
+	// зберігає їх для relay-повтору (RedeemRelayTicket), агентові не йдуть.
+	Claims any `json:"-"`
 }
 
 // Offer — те, що агент отримує з poll.

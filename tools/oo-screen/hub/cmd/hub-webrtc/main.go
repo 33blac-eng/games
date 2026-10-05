@@ -870,7 +870,7 @@ func authorizeViewer(req offerReq) (*nodeSession, *hub.TicketClaims, int, string
 	if req.Ticket == "" {
 		return nil, nil, http.StatusForbidden, "ticket required"
 	}
-	claims, err := hub.ConsumeTicket(erpBase, hubKey, req.Ticket)
+	claims, err := consumeViewerTicket(req.Ticket)
 	if err != nil {
 		log.Printf("viewer ticket consume failed: %v", err)
 		return nil, nil, http.StatusForbidden, "ticket consume failed"

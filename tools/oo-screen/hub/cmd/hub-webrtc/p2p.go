@@ -7,6 +7,7 @@ package main
 // p2pBroker == nil, маршрутів /p2p/* нема, хаб поводиться як раніше.
 
 import (
+	"errors"
 	"log"
 	"net/http"
 	"strings"
@@ -44,7 +45,27 @@ func p2pAuthorize(_ *http.Request, ticket string) (p2p.Grant, int, int, string) 
 	ns.mu.Lock()
 	viewers := len(ns.viewers)
 	ns.mu.Unlock()
-	return p2p.Grant{User: claims.UserID, Org: claims.OrgID, Node: ns.nodeID, Grant: claims.Grant}, viewers, 0, ""
+	return p2p.Grant{User: claims.UserID, Org: claims.OrgID, Node: ns.nodeID, Grant: claims.Grant, Claims: claims}, viewers, 0, ""
+}
+
+// consumeViewerTicket — ERP-квиток (одноразовий jti) або relay-квиток, який
+// /p2p/offer видав при відмові/відкаті прямої ноги: ERP-квиток там уже
+// спожито, тож повтор на /offer/viewer бере збережені claims (одноразово,
+// з TTL, знищуються відкликанням S2). Нода й publisher далі перевіряються
+// authorizeViewer як завжди.
+func consumeViewerTicket(ticket string) (*hub.TicketClaims, error) {
+	if strings.HasPrefix(ticket, p2p.RelayTicketPrefix) {
+		if p2pBroker == nil {
+			return nil, errors.New("p2p disabled")
+		}
+		g, ok := p2pBroker.RedeemRelayTicket(ticket)
+		c, _ := g.Claims.(*hub.TicketClaims)
+		if !ok || c == nil {
+			return nil, errors.New("relay ticket invalid, expired or used")
+		}
+		return c, nil
+	}
+	return hub.ConsumeTicket(erpBase, hubKey, ticket)
 }
 
 func p2pAgentAuth(r *http.Request, node string) bool {
@@ -60,7 +81,7 @@ func p2pAuditStart(g p2p.Grant, id string) func(string) {
 	return s.End
 }
 
-// p2pRevoke — S2: відкликання рве і прямі сесії (агент отримує "close").
+// p2pRevoke — S2: відкликання рве і прямі сесії: хаб ставить "close" у чергу агента, яку той забирає poll-ом (AgentLegs.Handle рве ногу).
 func p2pRevoke(match func(p2p.Grant) bool) {
 	if p2pBroker != nil {
 		if n := p2pBroker.RevokeWhere(match); n > 0 {
