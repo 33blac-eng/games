@@ -453,8 +453,14 @@ oo-agent -hub https://hub-a.example/offer/agent ^
 ### 3. Глядач (ERP)
 У конфіг шару `createOoWebrtcLayer` додати
 `standbySignalUrls: ['https://hub-b.example/offer/viewer']`. Без нього
-робиться одна спроба, як раніше. Наступний URL пробується лише при мережевій
-помилці fetch або 502/503/504; при 4xx (ticket/ACL) — ні.
+робиться одна спроба, як раніше. Наступний URL пробується при мережевій
+помилці, таймауті спроби (blackhole/завислий хаб; кожна спроба має власний
+`offerTimeoutMs`), 502/503/504 і 404 `no publisher for node` (агент після
+failover лишається на резерві й сам на основний не повертається, тож живий
+основний відповідає 404 — глядач іде далі). При 400/401/403 (ticket/ACL) — ні.
+Кожна наступна спроба бере **новий** одноразовий ticket через `requestTicket()`:
+той самий ticket ніколи не шлеться на другий хаб (облік використаних ticket-ів
+у кожного хаба свій, тож повтор дав би подвійне погашення).
 
 ### 4. nginx (варіант без змін клієнтів)
 Один публічний сигнальний вхід, nginx сам іде на резерв. Медіа (UDP/ICE-TCP)
@@ -469,15 +475,24 @@ server {
     server_name hub.example;
     location /offer/ {
         proxy_pass http://oo_hub;
-        proxy_next_upstream error timeout http_502 http_503 http_504 non_idempotent;
+        # БЕЗ non_idempotent: POST повторюється лише якщо до upstream
+        # не вдалося навіть надіслати запит (connect refused/timeout).
+        proxy_next_upstream error timeout;
         proxy_next_upstream_tries 2;
         proxy_set_header X-Forwarded-For $remote_addr;
     }
     location = /healthz { proxy_pass http://oo_hub; }
 }
 ```
-`non_idempotent` потрібен, бо offer — це POST (без нього nginx не повторює POST
-на backup). Безпечно: відмовлений хаб ticket не спожив. Активних health-check
+`non_idempotent` НЕ ставити: offer несе одноразовий ticket, а used-ticket облік
+у кожного хаба свій. З `non_idempotent` (або `http_50x`, `timeout` після
+надсилання) nginx перешле той самий ticket на backup після того, як основний
+його вже міг спожити — ticket погаситься двічі. Без нього nginx повторює POST
+лише коли запит не дійшов до основного (тоді ticket точно не спожитий).
+Обмеження варіанту: backup вмикається лише коли основний недоступний; якщо
+основний живий, а агент сидить на резерві (split-brain), nginx віддасть 404 —
+для цього випадку потрібен `standbySignalUrls` у глядача.
+Активних health-check
 у open-source nginx нема (лише пасивні `max_fails`). Додайте IP nginx у
 `OO_SCREEN_TRUSTED_PROXIES` на обох хабах.
 
