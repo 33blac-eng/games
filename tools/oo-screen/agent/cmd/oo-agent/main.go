@@ -355,8 +355,12 @@ func dialWebRTC(hubURL string, frameInterval time.Duration, onKeyframeRequest fu
 			_ = pc.Close()
 			return nil, fmt.Errorf("create cursor datachannel: %w", dcErr)
 		}
-		cur.OnOpen(func() { cursorPub.SetSink(cur) })
-		cur.OnClose(func() { cursorPub.ClearSink(cur) })
+		// F9: канал відкрито ≠ шар увімкнено. Вказівник і далі вмальовується
+		// в кадр, поки хаб не пришле KindMode=1 (усі глядачі ноги вміють шар
+		// і сесія не пишеться в MKV) — cursorGrantHandler.
+		cur.OnOpen(func() { cursorChannelOpen(cur) })
+		cur.OnClose(func() { cursorChannelClosed(cur) })
+		cur.OnMessage(func(m webrtc.DataChannelMessage) { cursorGrantMessage(cur, m.Data) })
 	}
 	track, err := webrtc.NewTrackLocalStaticSample(webrtc.RTPCodecCapability{
 		MimeType:    webrtc.MimeTypeH264,
@@ -924,7 +928,7 @@ func main() {
 	logPath := flag.String("log", "", "шлях до файлу логу; якщо задано — увесь вивід іде туди (GUI-режим -H windowsgui без консолі, stdout нема)")
 	audioFlag := flag.Bool("audio", false, "передавати звук ПК (перекриває env OO_SCREEN_AUDIO=1)")
 	inputFlag := flag.Bool("input", false, "приймати клавіатуру й мишу від глядача (перекриває env OO_SCREEN_INPUT=1)")
-	cursorLayerFlag := flag.Bool("cursor-layer", false, "шар курсора: НЕ вмальовувати вказівник у кадр, а слати форму+позицію каналом oosc-cursor (рух миші не коштує кадру); потрібен плеєр з config.cursorLayer")
+	cursorLayerFlag := flag.Bool("cursor-layer", false, "шар курсора: НЕ вмальовувати вказівник у кадр, а слати форму+позицію каналом oosc-cursor (рух миші не коштує кадру); вмикається лише коли хаб дозволить: усі глядачі ноги з config.cursorLayer і без запису MKV, інакше курсор у кадрі як без прапорця")
 	refineFlag := flag.Bool("refine", true, "дошліфування нерухомого екрана (ТЗ P4): через 200 мс без нових кадрів 1–2 рази перекодувати останній кадр із нижчим QP; false — вимкнути")
 	textTilesFlag := flag.Bool("text-tiles", false, "текстові тайли (STAGE3-444 B): на нерухомому дошліфованому екрані один раз слати lossless PNG-тайли кольорового тексту каналом oosc-tiles (потрібен OO_SCREEN_TILES=1 на хабі і config.textTiles у плеєрі)")
 	textFPS := flag.Int("text-fps", 15, "стеля FPS у текстовому режимі (gap #2: набір/читання — дрібні dirty rects); 0 = не обмежувати. Вихід із режиму (рух) знімає стелю миттєво")
@@ -962,7 +966,9 @@ func main() {
 	// першого capture.New — перемикач читається при кожному відкритті капчера.
 	if *cursorLayerFlag {
 		cursorLayerEnabled = true
-		capture.SetCursorLayer(true)
+		// F9: НЕ capture.SetCursorLayer(true) — до дозволу від хаба
+		// вказівник у кадрі (глядач без шару й запис MKV його бачать).
+		applyCursorGrant(false)
 		go runCursorPoller(nil)
 	}
 

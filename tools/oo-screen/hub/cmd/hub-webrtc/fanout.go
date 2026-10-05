@@ -219,6 +219,7 @@ func addViewerLimit(ns *nodeSession, pc *webrtc.PeerConnection, trk *webrtc.Trac
 	ns.viewerCount.Store(int32(n))
 	ns.mu.Unlock()
 	log.Printf("viewer leg added [node=%s]: %d viewer(s)", ns.nodeID, n)
+	refreshCursorGrant(ns) // F9: новий глядач без шару — агент знову малює вказівник
 
 	go vl.pump(ns)
 	// Стелю читаємо ТУТ, синхронно, а не в горутині сторожа: інакше читання
@@ -287,6 +288,7 @@ func removeViewer(ns *nodeSession, vl *viewerLeg) bool {
 	}
 	close(vl.done)
 	vl.audit.End("viewer removed")
+	refreshCursorGrant(ns)
 	if left == 0 {
 		scheduleRecordClose(ns)
 	}

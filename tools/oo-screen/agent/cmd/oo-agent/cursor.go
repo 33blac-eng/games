@@ -1,5 +1,12 @@
 // Шар курсора на боці агента (-cursor-layer, ТИПОВО ВИМКНЕНО).
 //
+// F9, ПЕРЕГОВОРИ: прапорець лише дозволяє шар. Агент вмальовує вказівник у
+// кадр, доки хаб не пришле по тому ж каналу cursorproto.KindMode=1 — а хаб
+// шле його лише коли КОЖЕН глядач ноги відкрив 'oosc-cursor' (плеєр із
+// config.cursorLayer) і нода не пишеться в MKV. Новий глядач без шару,
+// увімкнений запис чи закритий канал — KindMode=0 / відкат: вказівник знову в
+// кадрі, Publisher на паузі (останнім шле приховану позицію).
+//
 // Без прапорця нічого тут не працює: канал "oosc-cursor" не створюється, SDP
 // той самий, вказівник і далі вмальовується в кадр (dxgi.c), як було.
 //
@@ -20,11 +27,13 @@
 package main
 
 import (
+	"log"
 	"sync/atomic"
 	"time"
 
 	"github.com/organicoils/oo-screen/agent/capture"
 	"github.com/organicoils/oo-screen/internal/cursorproto"
+	"github.com/pion/webrtc/v4"
 )
 
 // cursorLayerEnabled — прапорець -cursor-layer. Ставиться в main до dial.
@@ -41,6 +50,40 @@ var cursorPollOwns atomic.Bool
 type frameGeom struct{ out, w, h int }
 
 var cursorFrameGeom atomic.Pointer[frameGeom]
+
+// cursorChan — поточний канал курсора (старий OnClose не чіпає новий).
+var cursorChan atomic.Pointer[webrtc.DataChannel]
+
+// applyCursorGrant — єдине місце, що вмикає/вимикає шар: і капчер (кадр із
+// вказівником чи без), і Publisher (шле чи мовчить) перемикаються разом.
+func applyCursorGrant(on bool) {
+	capture.SetCursorLayer(on)
+	cursorPub.SetActive(on)
+}
+
+func cursorChannelOpen(dc *webrtc.DataChannel) {
+	cursorChan.Store(dc)
+	applyCursorGrant(false) // новий хаб/нога: дозвіл треба отримати заново
+	cursorPub.SetSink(dc)
+}
+
+func cursorChannelClosed(dc *webrtc.DataChannel) {
+	if cursorChan.CompareAndSwap(dc, nil) {
+		applyCursorGrant(false)
+	}
+	cursorPub.ClearSink(dc)
+}
+
+// cursorGrantMessage — хаб -> агент. Чуже/зіпсоване ігнорується (шар
+// лишається, яким був; типово — вимкнено).
+func cursorGrantMessage(dc *webrtc.DataChannel, b []byte) {
+	on, ok := cursorproto.DecodeMode(b)
+	if !ok || cursorChan.Load() != dc {
+		return
+	}
+	log.Printf("oo-agent: cursor layer %v (хаб)", on)
+	applyCursorGrant(on)
+}
 
 // observeCursor — з кадрового циклу на КОЖЕН кадр (NoChange теж).
 func observeCursor(f *capture.NV12Frame, c *capture.Capturer, output int) {
