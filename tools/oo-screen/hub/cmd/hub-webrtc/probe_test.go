@@ -10,8 +10,15 @@ func probeCtl(target, start uint64) bitrateCtl {
 }
 
 func TestProbeOffByDefault(t *testing.T) {
-	if probeEnabled || paceEnabled {
-		t.Fatal("проба/пейсинг мають бути вимкнені без env")
+	// Глобалі читаються з env процесу (суїт мусить проходити і з
+	// OO_SCREEN_PROBE=1/OO_SCREEN_PACE=1), тож перевіряємо розбір, а не їх.
+	for _, v := range []string{"", "0", "true", "yes", " 1"} {
+		if flagOn(v) {
+			t.Fatalf("flagOn(%q) = true", v)
+		}
+	}
+	if !flagOn("1") {
+		t.Fatal(`flagOn("1") = false`)
 	}
 	c := bitrateCtl{target: 2_000_000, startBps: 8_000_000, cleanSince: t0}
 	if _, _, ok := c.probeDue(t0.Add(10 * time.Second)); ok {
@@ -142,6 +149,19 @@ func TestProbeVerdict(t *testing.T) {
 	}
 	if v := probeVerdict([]*legProbe{mk(full/10, 0)}); v != probeInconclusive {
 		t.Fatalf("v=%v", v)
+	}
+	// Недовезла швидкість (50-94%) — не доказ: inconclusive, а не OK.
+	if v := probeVerdict([]*legProbe{mk(full*6/10, 0)}); v != probeInconclusive {
+		t.Fatalf("60%%: v=%v", v)
+	}
+	if v := probeVerdict([]*legProbe{mk(full, 0), mk(full*9/10, 0)}); v != probeInconclusive {
+		t.Fatalf("одна нога 90%%: v=%v", v)
+	}
+	if v := probeVerdict([]*legProbe{mk(full*96/100, 0)}); v != probeOK {
+		t.Fatalf("96%%: v=%v", v)
+	}
+	if v := probeVerdict([]*legProbe{nil}); v != probeInconclusive {
+		t.Fatalf("nil-нога: v=%v", v)
 	}
 	if v := probeVerdict(nil); v != probeInconclusive {
 		t.Fatalf("v=%v", v)

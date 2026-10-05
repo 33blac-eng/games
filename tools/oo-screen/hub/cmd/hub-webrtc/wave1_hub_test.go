@@ -25,13 +25,21 @@ import (
 // вивід прогону й ще й псують рахунок алокацій.
 func quietNDJSON(t *testing.T, w *bytes.Buffer) {
 	t.Helper()
+	// Під ndjsonMu: таймери проби (OO_SCREEN_PROBE=1) пишуть NDJSON уже
+	// після кінця тесту, що їх запустив.
+	ndjsonMu.Lock()
 	prev := ndjsonOut
 	if w == nil {
 		ndjsonOut = discardWriter{}
 	} else {
 		ndjsonOut = w
 	}
-	t.Cleanup(func() { ndjsonOut = prev })
+	ndjsonMu.Unlock()
+	t.Cleanup(func() {
+		ndjsonMu.Lock()
+		ndjsonOut = prev
+		ndjsonMu.Unlock()
+	})
 }
 
 // ── H-26 ────────────────────────────────────────────────────────────────────

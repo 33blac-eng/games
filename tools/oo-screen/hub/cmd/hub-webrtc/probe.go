@@ -20,7 +20,10 @@
 // Чому probeAccept 0.85 і probeDur 700 мс: черга вузького місця 100 мс при
 // стелі cap переповнюється за probeDur, лише якщо (rate-cap)*probeDur >
 // 0.1*cap, тобто cap < rate/(1+0.1/0.7) = 0.875*rate. Отже успішна проба
-// гарантує cap >= ~0.875*rate, і ціль 0.85*rate — нижче за стелю.
+// гарантує cap >= ~0.875*rate, і ціль 0.85*rate — нижче за стелю. Це
+// тримається, лише якщо нога реально пронесла rate: тому OK — тільки коли
+// кожна нога записала ≥ probeFull (95%) від rate*probeDur, інакше
+// inconclusive і ціль не змінюється (probeVerdict).
 //
 // ПЕЙСИНГ (OO_SCREEN_PACE=1, дефолт ВИМКНЕНО). IDR — найбільший кадр, і pion
 // пише його пакети одним сплеском: при стелі 8M IDR ~250 КБ проти черги 100 мс
@@ -41,8 +44,8 @@ import (
 )
 
 var (
-	probeEnabled = os.Getenv("OO_SCREEN_PROBE") == "1"
-	paceEnabled  = os.Getenv("OO_SCREEN_PACE") == "1"
+	probeEnabled = flagOn(os.Getenv("OO_SCREEN_PROBE"))
+	paceEnabled  = flagOn(os.Getenv("OO_SCREEN_PACE"))
 	paceMul      = envFloat("OO_SCREEN_PACE_MUL", 1.5)
 )
 
@@ -59,7 +62,8 @@ const (
 	probeNackMax = 2                      // унікальних NACK за пробу — ще «чисто» (рівномірна 1% втрата)
 	probeMute    = 1500 * time.Millisecond
 	probeTick    = 5 * time.Millisecond
-	probeRing    = 64 // скільки останніх пакетів ноги тримаємо для дублів
+	probeFull    = 0.95 // нога мусила реально пронести ≥ стільки від rate
+	probeRing    = 64   // скільки останніх пакетів ноги тримаємо для дублів
 
 	paceBurst      = 20 * time.Millisecond // місткість бакета в часі
 	paceMinBytes   = 6000                  // ...але не менше за ~4 пакети
@@ -67,6 +71,9 @@ const (
 	paceWarmup     = 2 * time.Second       // перші секунди ноги — кеш GOP, без пейсингу
 	paceRefreshInt = 50 * time.Millisecond
 )
+
+// flagOn — значення env-прапорця P1: увімкнено лише рівно "1".
+func flagOn(v string) bool { return v == "1" }
 
 // probeMul — у скільки разів проба вища за ціль. ×2 — лише одразу після
 // успішної проби (канал щойно довів запас — розгін після зняття стелі);
@@ -186,6 +193,15 @@ type legProbe struct {
 	aborted    atomic.Bool
 }
 
+// setProbe — виставити/зняти пробу ноги й розбудити її pump.
+func (vl *viewerLeg) setProbe(p *legProbe) {
+	vl.probe.Store(p)
+	select {
+	case vl.probeKick <- struct{}{}:
+	default: // nil-канал (нога без pump-а) або побудка вже чекає
+	}
+}
+
 // noteProbeNack — NACK під час проби/grace. true — NACK віднесено до проби
 // (у preLoss B4 його не рахуємо: це наш власний тиск, а не затор відео).
 func (vl *viewerLeg) noteProbeNack(n int, now time.Time) bool {
@@ -268,35 +284,45 @@ func startProbe(ns *nodeSession, rate uint64, now time.Time) {
 		return
 	}
 	for _, vl := range legs {
-		vl.probe.Store(&legProbe{start: now, end: now.Add(probeDur), bps: rate, evalUntil: now.Add(eval)})
+		vl.setProbe(&legProbe{start: now, end: now.Add(probeDur), bps: rate, evalUntil: now.Add(eval)})
 	}
 	ndjsonf(`{"leg":"probe","node":%q,"phase":"start","bps":%d}`+"\n", ns.nodeID, rate)
 	time.AfterFunc(eval, func() { finishProbe(ns, legs, time.Now()) })
 }
 
 // probeVerdict — ЧИСТА: вердикт по ногах.
+//
+// sentBytes — УСЕ, що нога записала у вікні проби (відео + дублі): саме цей
+// потік ішов через вузьке місце, тож він і є перевіреною швидкістю, хоч би
+// скільки в ньому було дублів. Нога, що недовезла probeFull від rate (тікер
+// стартував пізно, WriteRTP стояв, проба обірвалась), швидкість rate НЕ
+// довела — вердикт inconclusive, ціль не росте (інакше 0.85*rate могло б
+// перевищити реально перевірене). Ноги без пакетів (статичний екран, ring
+// порожній) — теж inconclusive.
 func probeVerdict(ps []*legProbe) probeOutcome {
-	if len(ps) == 0 {
-		return probeInconclusive
-	}
-	res := probeOK
-	padded := false
+	any := false
 	for _, p := range ps {
 		if p == nil {
 			continue
 		}
+		any = true
 		if p.aborted.Load() || p.nacks.Load() > probeNackMax {
 			return probeFailed
 		}
-		want := float64(p.bps) / 8 * p.end.Sub(p.start).Seconds()
-		if float64(p.sentBytes.Load()) >= 0.5*want {
-			padded = true
-		}
 	}
-	if !padded {
+	if !any {
 		return probeInconclusive
 	}
-	return res
+	for _, p := range ps {
+		if p == nil {
+			continue
+		}
+		want := float64(p.bps) / 8 * p.end.Sub(p.start).Seconds()
+		if float64(p.sentBytes.Load()) < probeFull*want {
+			return probeInconclusive
+		}
+	}
+	return probeOK
 }
 
 func finishProbe(ns *nodeSession, legs []*viewerLeg, now time.Time) {

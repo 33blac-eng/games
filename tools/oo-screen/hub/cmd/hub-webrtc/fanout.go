@@ -164,6 +164,9 @@ type viewerLeg struct {
 
 	// probe — поточна проба смуги цієї ноги (probe.go); nil — проби немає.
 	probe atomic.Pointer[legProbe]
+	// probeKick будить pump, коли пробу виставлено: інакше на тихій нозі
+	// (статичний екран) pump спить у select до наступного пакета й не дописує.
+	probeKick chan struct{}
 }
 
 // addViewer реєструє нову viewer-ногу ноди й піднімає її pump. Нога ще НЕ live:
@@ -185,6 +188,8 @@ func addViewerLimit(ns *nodeSession, pc *webrtc.PeerConnection, trk *webrtc.Trac
 		out:    make(chan *rtp.Packet, viewerQueueDepth+gopMaxPackets), // + місце під кеш GOP
 		done:   make(chan struct{}),
 		born:   time.Now(),
+
+		probeKick: make(chan struct{}, 1),
 	}
 	// Черга звуку існує ЛИШЕ під прапорцем: без нього нога має бути бітово
 	// такою, як до появи звуку (nil-канал forwardAudioToViewers пропускає).
@@ -548,6 +553,7 @@ func (vl *viewerLeg) pump(ns *nodeSession) {
 		tickC   <-chan time.Time
 		padNext int
 	)
+	pace := paceEnabled // знімок: тести перемикають глобаль до addViewer
 	defer func() {
 		if ticker != nil {
 			ticker.Stop()
@@ -607,12 +613,14 @@ func (vl *viewerLeg) pump(ns *nodeSession) {
 		select {
 		case <-vl.done:
 			return
+		case <-vl.probeKick:
+			// Лише перечитати vl.probe на початку циклу (запустити тікер).
 		case now := <-tickC:
 			if !pad(now) {
 				return
 			}
 		case pkt := <-vl.out:
-			if paceEnabled && len(vl.out) < paceBacklog && time.Since(vl.born) > paceWarmup {
+			if pace && len(vl.out) < paceBacklog && time.Since(vl.born) > paceWarmup {
 				now := time.Now()
 				if now.Sub(paceAt) >= paceRefreshInt {
 					pc.setRate(bitrateTarget(ns))
