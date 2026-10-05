@@ -27,7 +27,9 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -140,7 +142,12 @@ func api() *webrtc.API {
 
 var httpc = &http.Client{Timeout: 15 * time.Second}
 
-func negotiate(pc *webrtc.PeerConnection, path string, body map[string]any) error {
+// errStopped — нога перервана краном (тиха точка), а не збоєм хаба.
+var errStopped = errors.New("stopped by gate")
+
+var errNotConnected = errors.New("not connected")
+
+func negotiate(pc *webrtc.PeerConnection, path string, body map[string]any, stop <-chan struct{}) error {
 	offer, err := pc.CreateOffer(nil)
 	if err != nil {
 		return err
@@ -151,13 +158,34 @@ func negotiate(pc *webrtc.PeerConnection, path string, body map[string]any) erro
 	}
 	select {
 	case <-gather:
+	case <-stop:
+		return errStopped
 	case <-time.After(10 * time.Second):
 		return fmt.Errorf("gather timeout")
 	}
 	body["sdp"] = pc.LocalDescription().SDP
 	buf, _ := json.Marshal(body)
-	resp, err := httpc.Post(*hubURL+path, "application/json", bytes.NewReader(buf))
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() {
+		select {
+		case <-stop:
+			cancel()
+		case <-ctx.Done():
+		}
+	}()
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, *hubURL+path, bytes.NewReader(buf))
 	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := httpc.Do(req)
+	if err != nil {
+		select {
+		case <-stop:
+			return errStopped
+		default:
+		}
 		return err
 	}
 	defer resp.Body.Close()
@@ -174,7 +202,8 @@ func negotiate(pc *webrtc.PeerConnection, path string, body map[string]any) erro
 	return pc.SetRemoteDescription(webrtc.SessionDescription{Type: webrtc.SDPTypeAnswer, SDP: ans.SDP})
 }
 
-func waitConnected(pc *webrtc.PeerConnection, d time.Duration) bool {
+// waitConnected: nil — з'єднано; errStopped — кран закрито; інакше таймаут.
+func waitConnected(pc *webrtc.PeerConnection, d time.Duration, stop <-chan struct{}) error {
 	ch := make(chan struct{})
 	var once sync.Once
 	pc.OnConnectionStateChange(func(s webrtc.PeerConnectionState) {
@@ -183,13 +212,15 @@ func waitConnected(pc *webrtc.PeerConnection, d time.Duration) bool {
 		}
 	})
 	if pc.ConnectionState() == webrtc.PeerConnectionStateConnected {
-		return true
+		return nil
 	}
 	select {
 	case <-ch:
-		return true
+		return nil
+	case <-stop:
+		return errStopped
 	case <-time.After(d):
-		return false
+		return errNotConnected
 	}
 }
 
@@ -219,11 +250,14 @@ func runAgent(node string, hold time.Duration, stop <-chan struct{}) error {
 		}
 	}()
 	bps := uint64(*pps) * uint64(*size+12) * 8
-	if err := negotiate(pc, "/offer/agent", map[string]any{"token": *authToken, "node": node, "bitrate": bps}); err != nil {
+	if err := negotiate(pc, "/offer/agent", map[string]any{"token": *authToken, "node": node, "bitrate": bps}, stop); err != nil {
 		return err
 	}
-	if !waitConnected(pc, 10*time.Second) {
-		return fmt.Errorf("agent %s: not connected", node)
+	if err := waitConnected(pc, 10*time.Second, stop); err != nil {
+		if err == errStopped {
+			return err
+		}
+		return fmt.Errorf("agent %s: %w", node, err)
 	}
 	statAgentOK.Add(1)
 	publish(trk, hold, stop)
@@ -303,11 +337,14 @@ func runViewer(node string, hold time.Duration, stop <-chan struct{}) error {
 		}()
 	})
 	tk := fmt.Sprintf("%s|%d", node, ticketSeq.Add(1))
-	if err := negotiate(pc, "/offer/viewer", map[string]any{"ticket": tk}); err != nil {
+	if err := negotiate(pc, "/offer/viewer", map[string]any{"ticket": tk}, stop); err != nil {
 		return err
 	}
-	if !waitConnected(pc, 10*time.Second) {
-		return fmt.Errorf("viewer %s: not connected", node)
+	if err := waitConnected(pc, 10*time.Second, stop); err != nil {
+		if err == errStopped {
+			return err
+		}
+		return fmt.Errorf("viewer %s: %w", node, err)
 	}
 	select {
 	case <-stop:
@@ -330,20 +367,34 @@ func randDur(a, b time.Duration) time.Duration {
 
 // gate — «кран» навантаження: тиха точка закриває його і чекає, поки всі
 // активні ноги завершаться.
+//
+// enter і closeAll серіалізовані через mu: active.Add(1) виконується лише
+// під mu і лише коли кран відкритий, тож Add ніколи не перетинається з
+// Wait у closeAll (вимога sync.WaitGroup), і жодна нова нога не стартує
+// після закриття крана. negotiate/waitConnected теж слухають stop, тож
+// ноги в процесі з'єднання перериваються, а не доходять до connected.
 type gate struct {
 	mu     sync.Mutex
 	stop   chan struct{}
+	closed bool
 	active sync.WaitGroup
 }
 
-func (g *gate) cur() chan struct{} {
+// enter реєструє нову ногу; ok=false — кран закрито, ногу не запускати.
+// При ok=true викликач зобов'язаний викликати g.active.Done().
+func (g *gate) enter() (stop <-chan struct{}, ok bool) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
-	return g.stop
+	if g.closed {
+		return nil, false
+	}
+	g.active.Add(1)
+	return g.stop, true
 }
 
 func (g *gate) closeAll() {
 	g.mu.Lock()
+	g.closed = true
 	close(g.stop)
 	g.mu.Unlock()
 	g.active.Wait()
@@ -352,6 +403,7 @@ func (g *gate) closeAll() {
 func (g *gate) reopen() {
 	g.mu.Lock()
 	g.stop = make(chan struct{})
+	g.closed = false
 	g.mu.Unlock()
 }
 
@@ -378,9 +430,12 @@ func agentLoop(slot int, g *gate, done <-chan struct{}) {
 			time.Sleep(200 * time.Millisecond)
 			continue
 		}
-		g.active.Add(1)
-		stop := g.cur()
-		if err := runAgent(node, randDur(*aHoldMin, *aHoldMax), stop); err != nil {
+		stop, ok := g.enter()
+		if !ok {
+			time.Sleep(200 * time.Millisecond)
+			continue
+		}
+		if err := runAgent(node, randDur(*aHoldMin, *aHoldMax), stop); err != nil && err != errStopped {
 			statAgentFail.Add(1)
 			log.Printf("agent %s: %v", node, err)
 			time.Sleep(time.Second)
@@ -415,11 +470,16 @@ func viewerLoop(g *gate, done <-chan struct{}) {
 			time.Sleep(200 * time.Millisecond)
 			continue
 		}
-		g.active.Add(1)
-		stop := g.cur()
+		stop, ok := g.enter()
+		if !ok {
+			time.Sleep(200 * time.Millisecond)
+			continue
+		}
 		err := runViewer(pickNode(), randDur(*vHoldMin, *vHoldMax), stop)
 		g.active.Done()
-		if err != nil {
+		if err == errStopped {
+			// перервано тихою точкою — не збій і не успіх
+		} else if err != nil {
 			statViewerFail.Add(1)
 			log.Printf("viewer: %v", err)
 			time.Sleep(500 * time.Millisecond)
