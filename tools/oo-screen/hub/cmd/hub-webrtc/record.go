@@ -365,7 +365,7 @@ func (r *recorder) handleAudio(it recItem) {
 	if !r.haveA {
 		r.aPTS, r.haveA = it.at.Sub(r.t0), true
 	}
-	r.mkv.block(mkvAudioTrack, r.aPTS.Milliseconds(), true, pcmBlock(it.aud))
+	r.mkv.block(mkvAudioTrack, r.aPTS.Milliseconds(), true, audioBlock(it.aud))
 	r.aPTS += it.dur
 	r.aFrames++
 }

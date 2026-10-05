@@ -32,7 +32,9 @@ import (
 	"encoding/binary"
 	"io"
 	"math"
+	"time"
 
+	"github.com/organicoils/oo-screen/internal/opusenc"
 	"github.com/organicoils/oo-screen/internal/pcmu"
 )
 
@@ -84,7 +86,11 @@ const (
 	// назад у 16 біт точно й у пʼять рядків (pcmu.Decode), а от A_MS/ACM з
 	// WAVEFORMATEX у CodecPrivate читають не всі плеєри. Заразом зникають
 	// CodecDelay/SeekPreRoll/OpusHead — у PCM їх просто немає.
-	codecIDPCM     = "A_PCM/INT/LIT"
+	codecIDPCM = "A_PCM/INT/LIT"
+	// Opus (F1) — пакети як є, без перекодування; OpusHead у CodecPrivate.
+	codecIDOpus    = "A_OPUS"
+	idCodecDelay   = 0x56AA
+	idSeekPreRoll  = 0x56BB
 	audioBitDepth  = 16
 	segmentUnknown = 0x01FFFFFFFFFFFFFF // «розмір невідомий» (8-байтний vint)
 )
@@ -226,16 +232,26 @@ func (m *mkvWriter) writeHeader(width, height int, avcC []byte, audio bool) erro
 	tracks := elem(idTrackEntry, vt.Bytes())
 	if audio {
 		var au bytes.Buffer
-		au.Write(elemFloat(idSampleFreq, pcmu.Rate))
-		au.Write(elemUint(idChannels, 1))
-		au.Write(elemUint(idBitDepth, audioBitDepth))
-
 		var at bytes.Buffer
 		at.Write(elemUint(idTrackNumber, mkvAudioTrack))
 		at.Write(elemUint(idTrackUID, mkvAudioTrack))
 		at.Write(elemUint(idTrackType, trackTypeAudio))
 		at.Write(elemUint(idFlagLacing, 0))
-		at.Write(elemStr(idCodecID, codecIDPCM))
+		if hubAudioCodec() == opusenc.CodecOpus {
+			au.Write(elemFloat(idSampleFreq, opusenc.Rate))
+			au.Write(elemUint(idChannels, opusenc.Channels))
+			at.Write(elemStr(idCodecID, codecIDOpus))
+			// pre-skip 312 — lookahead libopus/gopus на 48 кГц; точне значення
+			// агента хабу невідоме, а помилка в кілька мс тут нешкідлива.
+			at.Write(elem(idCodecPriv, opusenc.OpusHead(312)))
+			at.Write(elemUint(idCodecDelay, uint64(312*time.Second/opusenc.Rate)))
+			at.Write(elemUint(idSeekPreRoll, uint64(80*time.Millisecond)))
+		} else {
+			au.Write(elemFloat(idSampleFreq, pcmu.Rate))
+			au.Write(elemUint(idChannels, 1))
+			au.Write(elemUint(idBitDepth, audioBitDepth))
+			at.Write(elemStr(idCodecID, codecIDPCM))
+		}
 		at.Write(elem(idAudio, au.Bytes()))
 		tracks = append(tracks, elem(idTrackEntry, at.Bytes())...)
 	}
@@ -251,6 +267,15 @@ func pcmBlock(ulaw []byte) []byte {
 		out = binary.LittleEndian.AppendUint16(out, uint16(pcmu.Decode(b)))
 	}
 	return out
+}
+
+// audioBlock — тіло аудіо-блока у файлі: μ-law розтискається в PCM, Opus
+// лягає як є (A_OPUS).
+func audioBlock(frame []byte) []byte {
+	if hubAudioCodec() == opusenc.CodecOpus {
+		return frame
+	}
+	return pcmBlock(frame)
 }
 
 // block кладе кадр у поточний кластер, відкриваючи новий за потреби. ts — мс від

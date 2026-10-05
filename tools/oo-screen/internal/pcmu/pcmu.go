@@ -1,5 +1,9 @@
 // Package pcmu — G.711 μ-law (RTP payload type 0, PCMU/8000).
 //
+// F1: ТЕПЕР ЦЕ ЗАПАСНИЙ КОДЕК (OO_SCREEN_AUDIO_CODEC=pcmu). Типовий — Opus 48
+// кГц стерео через internal/opusenc: знайшовся чистий-Go енкодер
+// (github.com/thesyncim/gopus), тож аргумент «libopus/cgo» нижче більше не діє.
+//
 // ЧОМУ САМЕ ЦЕЙ КОДЕК, А НЕ OPUS. Твердження «WebRTC іншого аудіокодека не
 // приймає» — неправда, і це перевірено живцем, а не за памʼяттю. Chrome
 // 148.0.7778.280 на цій машині, RTCRtpReceiver.getCapabilities('audio'):
