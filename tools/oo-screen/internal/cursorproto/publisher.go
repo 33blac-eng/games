@@ -64,6 +64,11 @@ type Publisher struct {
 	order []uint32
 
 	now func() time.Time
+
+	// paused — the hub has not granted the cursor layer (some viewer of the
+	// leg cannot draw it, or the session is recorded): the pointer is in the
+	// image, so nothing is sent; positions and shapes are still tracked.
+	paused bool
 }
 
 // NewPublisher returns an idle publisher (no sink yet).
@@ -214,6 +219,37 @@ func (p *Publisher) useShapeLocked(id uint32, msg []byte, raw RawShape) {
 	p.hotX, p.hotY = raw.HotX, raw.HotY
 }
 
+// SetActive starts (true) or pauses (false) sending. Pausing first sends a
+// hidden position so a viewer that draws the overlay does not show a second
+// pointer next to the composited one; resuming re-sends shape + position.
+func (p *Publisher) SetActive(on bool) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if on == !p.paused {
+		return
+	}
+	if !on {
+		if p.sink != nil {
+			hide := p.co.cur
+			hide.Visible = false
+			_ = p.sink.Send(EncodePos(hide))
+		}
+		p.paused = true
+		return
+	}
+	p.paused = false
+	p.shapeSent = false
+	p.co.Reset()
+	p.flushLocked()
+}
+
+// Active reports whether the publisher is sending.
+func (p *Publisher) Active() bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return !p.paused
+}
+
 // Flush sends whatever is due.
 func (p *Publisher) Flush() {
 	p.mu.Lock()
@@ -222,7 +258,7 @@ func (p *Publisher) Flush() {
 }
 
 func (p *Publisher) flushLocked() {
-	if p.sink == nil {
+	if p.sink == nil || p.paused {
 		return
 	}
 	if !p.shapeSent && p.shapeMsg != nil {

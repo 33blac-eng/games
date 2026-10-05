@@ -235,6 +235,9 @@ type Capturer struct {
 
 	// readback mirrors oos_set_readback so a reinit restores the choice.
 	readback bool
+	// layerApplied — the cursor-layer state this handle currently has
+	// (NextFrame follows the process-wide switch live, F9 negotiation).
+	layerApplied bool
 
 	// scratch reused across frames so a steady capture loop allocates nothing.
 	y  []byte
@@ -333,7 +336,8 @@ func (c *Capturer) open() error {
 	if !c.readback {
 		C.oos_set_readback(handle, 0)
 	}
-	if cursorLayer.Load() {
+	c.layerApplied = cursorLayer.Load()
+	if c.layerApplied {
 		C.oos_set_cursor_layer(handle, 1)
 	}
 	c.width = int(C.oos_width(handle))
@@ -386,7 +390,10 @@ var cursorLayer atomic.Bool
 // reopened after ACCESS_LOST) from now on: the pointer is no longer composited
 // into the image and pointer-only updates come back as NoChange frames; the
 // caller ships the pointer separately (CursorShape + frame Cursor* fields).
-// Call it once at startup, before New.
+// It may be flipped at any time (F9: the hub grants/revokes the layer as
+// viewers come and go): the next NextFrame applies it and re-duplicates the
+// output so the first frame after the flip is a full image with (or without)
+// the pointer drawn, instead of waiting for the desktop to change.
 func SetCursorLayer(on bool) { cursorLayer.Store(on) }
 
 // RawCursorShape is DXGI's pointer shape as-is (see oos_cursor_shape).
@@ -608,6 +615,15 @@ func (c *Capturer) NextFrame(ctx context.Context) (*NV12Frame, error) {
 			if err := c.reinit(ctx); err != nil {
 				return nil, err
 			}
+		}
+		if want := cursorLayer.Load(); want != c.layerApplied {
+			v := C.int32_t(0)
+			if want {
+				v = 1
+			}
+			C.oos_set_cursor_layer(c.c, v)
+			c.layerApplied = want
+			C.oos_suspend(c.c) // A-17 resume path: next oos_next re-duplicates
 		}
 
 		var f C.oos_frame
