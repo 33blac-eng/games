@@ -196,6 +196,9 @@ sudo sh -c 'umask 077; grep ^OO_SCREEN_AGENT_SECRET= /etc/oo-screen/hub.env | cu
 | `OO_SCREEN_INPUT` | вимк. | `1` — канал вводу (і на агенті) |
 | `OO_SCREEN_RECORD` | вимк. | `1` — запис сесій у MKV |
 | `OO_SCREEN_RECORD_DIR` | `recordings` | каталог записів (0700, файли 0600; 14 днів / 8 ГіБ) |
+| `OO_SCREEN_RECORD_KEY_FILE` / `OO_SCREEN_RECORD_KEY` | вимк. | S5: ключ AES-256 (32 байти сирі / 64 hex / base64; файл 0600) — записи `.mkv.enc`; задано, але битий = запис НЕ пишеться. Розшифровка: `oo-rec-decrypt -key-file K f.mkv.enc -o f.mkv` |
+| `OO_SCREEN_RECORD_MAX_AGE` | `14d` | S5: скільки живуть записи (`Nd` або Go duration, ≥1h) |
+| `OO_SCREEN_RECORD_MAX_BYTES` | `8G` | S5: стеля архіву (байти або K/M/G/T, ≥1M) |
 | `OO_SCREEN_PPROF_ADDR` | порожньо | адреса pprof (окремий слухач); ставити лише 127.0.0.1:порт |
 | `OO_SCREEN_METRICS_ADDR` | порожньо (вимк.) | адреса окремого слухача Prometheus `/metrics` (мітка `node`: ноди, глядачі, ingress bps/fps, keyframes/хв, ціль бітрейту + причина, loss/RTT max/avg, NACK/PLI, кеш GOP, TTFF, черги egress/глядачів, процес); ставити лише 127.0.0.1:порт |
 
@@ -410,3 +413,10 @@ TCP лишається **запасним** шляхом, а UDP має пріо
 SNI, корпоративні DPI і явні HTTP-проксі (через CONNECT ICE-TCP не пройде;
 TURN-TLS — лише якщо браузер сам піде через проксі), справжня динаміка TCP
 (cwnd, RTO) замість моделі.
+
+## Моніторинг (O1)
+
+`deploy/monitoring/oo-screen-dashboard.json` — імпорт у Grafana (Dashboards → Import, вибрати Prometheus-джерело).
+`deploy/monitoring/oo-screen-alerts.yml` — `rule_files` у prometheus.yml; scrape job має називатись `oo-screen-hub`
+(target = `OO_SCREEN_METRICS_ADDR`). Перевірка: `promtool check rules deploy/monitoring/oo-screen-alerts.yml`.
+Пороги — стартові, підібрати після тижня реального трафіку.

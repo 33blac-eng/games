@@ -34,6 +34,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"log"
 	"os"
@@ -46,6 +47,7 @@ import (
 	"github.com/pion/rtp/codecs"
 
 	"github.com/organicoils/oo-screen/internal/h264"
+	"github.com/organicoils/oo-screen/internal/reccrypt"
 )
 
 // recordEnabled — прапорець. Змінна, а не os.Getenv на місці: тести перемикають
@@ -142,6 +144,10 @@ type recorder struct {
 // OO_SCREEN_RECORD не заданий — це і є «без прапорця нічого не змінилось».
 func startRecording(nodeID string) *recorder {
 	if !recordEnabled.Load() {
+		return nil
+	}
+	// S5: шифрування просили, а ключ битий — відкритим текстом не пишемо.
+	if !recordAllowedByKey() {
 		return nil
 	}
 	dir := *recordDir.Load()
@@ -391,7 +397,12 @@ func (r *recorder) open() bool {
 	// O_EXCL: дві сесії однієї ноди в ту саму секунду не обнуляють запис
 	// одна одній (os.Create робив O_TRUNC), і підкладений симлінк не відкриваємо;
 	// зайняте імʼя — не відмова, а наступний суфікс.
-	f, err := createRecordFile(r.dir, r.nodeID, time.Now())
+	key := currentRecordKey()
+	ext := ".mkv"
+	if key != nil {
+		ext = reccrypt.Ext
+	}
+	f, err := createRecordFileExt(r.dir, r.nodeID, time.Now(), ext)
 	if err != nil {
 		log.Printf("record: файл сесії ноди %s не створився: %v", r.nodeID, err)
 		r.started = true
@@ -399,7 +410,22 @@ func (r *recorder) open() bool {
 		return false
 	}
 	r.f, r.path = f, f.Name()
-	r.mkv = newMKVWriter(f)
+	var sink io.Writer = f
+	if key != nil {
+		ew, err := reccrypt.NewWriter(f, key)
+		if err != nil {
+			// Заголовок не ліг — файл без сенсу; прибираємо, щоб не лишити сміття.
+			log.Printf("record: шифрування %s не стартувало: %v — сесія не пишеться", r.path, err)
+			f.Close()
+			os.Remove(r.path)
+			r.f = nil
+			r.started = true
+			r.mkv = newMKVWriter(discardWriter{})
+			return false
+		}
+		sink = ew
+	}
+	r.mkv = newMKVWriter(sink)
 	if err := r.mkv.writeHeader(sps.Width, sps.Height, avcC(r.sps, r.pps), audioEnabled); err != nil {
 		log.Printf("record: заголовок %s не записався: %v", r.path, err)
 	}
@@ -481,12 +507,17 @@ func ensureRecordDir(dir string) error {
 // порядок у межах секунди — порядком створення до "-9" (прибирання все одно
 // сортує за mtime, див. recordprune.go).
 func createRecordFile(dir, node string, now time.Time) (*os.File, error) {
+	return createRecordFileExt(dir, node, now, ".mkv")
+}
+
+// createRecordFileExt — те саме з довільним суфіксом (S5: ".mkv.enc").
+func createRecordFileExt(dir, node string, now time.Time, ext string) (*os.File, error) {
 	base := fmt.Sprintf("%s-%s", safeNodeID(node), now.UTC().Format("20060102-150405"))
 	var err error
 	for i := 1; i <= recordNameAttempts; i++ {
-		name := base + ".mkv"
+		name := base + ext
 		if i > 1 {
-			name = fmt.Sprintf("%s-%d.mkv", base, i)
+			name = fmt.Sprintf("%s-%d%s", base, i, ext)
 		}
 		var f *os.File
 		f, err = os.OpenFile(filepath.Join(dir, name), os.O_WRONLY|os.O_CREATE|os.O_EXCL, recordFilePerm)
