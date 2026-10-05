@@ -158,7 +158,7 @@ func cmdInit(args []string, now time.Time) error {
 	if err != nil {
 		return err
 	}
-	s := rollout.State{Version: m.Version, StageStarted: now}
+	s := rollout.State{Version: m.Version, StageStarted: now, Since: now}
 	b, _ := json.MarshalIndent(s, "", "  ")
 	if err := resign(*man, priv, *m, p.Stages[0], now); err != nil {
 		return err

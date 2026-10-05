@@ -12,6 +12,18 @@ import (
 	"github.com/organicoils/oo-screen/internal/rollout"
 )
 
+func TestRolloutIDFallsBackToHostname(t *testing.T) {
+	if got := rolloutID("pc-1"); got != "pc-1" {
+		t.Fatalf("mesh node: %q", got)
+	}
+	if got := hostRolloutID(func() (string, error) { return "WS-07", nil }); got != "host:ws-07" {
+		t.Fatalf("T1 host: %q", got)
+	}
+	if got := hostRolloutID(func() (string, error) { return "", context.Canceled }); got != "" {
+		t.Fatalf("no hostname: %q", got)
+	}
+}
+
 func TestStartupVerdict(t *testing.T) {
 	cases := map[autoupdate.StartupResult]string{
 		autoupdate.NoPending:      "",

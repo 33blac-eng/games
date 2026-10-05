@@ -110,3 +110,20 @@ func TestBadState(t *testing.T) {
 		t.Fatal("bad stage accepted")
 	}
 }
+
+// init -force restarts a halted rollout: reports before Since must not count.
+func TestRestartIgnoresReportsBeforeSince(t *testing.T) {
+	p := plan()
+	old := []Report{rep("a", ResultFail, t0), rep("b", ResultFail, t0)}
+	restart := t0.Add(time.Hour)
+	s := State{Version: "1.2.0", StageStarted: restart, Since: restart}
+	_, d, _ := Step(p, s, old, restart.Add(time.Minute))
+	if d.Action != Hold || d.Fail != 0 {
+		t.Fatalf("old fail reports counted after restart: %+v", d)
+	}
+	// without Since (pre-fix state) they still count
+	s.Since = time.Time{}
+	if _, d, _ = Step(p, s, old, restart.Add(time.Minute)); d.Action != Halt {
+		t.Fatalf("want halt without Since, got %+v", d)
+	}
+}

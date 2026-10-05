@@ -120,12 +120,32 @@ func sessionHealth(hub string, connected <-chan struct{}) func(context.Context) 
 	}
 }
 
+// rolloutID — ключ кошика викатки й node у звіті здоров'я. Mesh-нода має
+// -node; legacy T1-агент (без -node) інакше мав би порожній ключ: усі такі
+// агенти падали б в один кошик Bucket("", v), а звіти з node="" хаб
+// відкидає (400) — відкати T1-флоту не доходили б до halt-гейта. Тому для
+// них беремо стабільне "host:<hostname>"; "" лише якщо й hostname невідомий.
+func rolloutID(node string) string {
+	if node != "" {
+		return node
+	}
+	return hostRolloutID(os.Hostname)
+}
+
+func hostRolloutID(hostname func() (string, error)) string {
+	h, err := hostname()
+	if err != nil || h == "" {
+		return ""
+	}
+	return "host:" + strings.ToLower(h)
+}
+
 // newUpdater збирає Updater; nil, якщо оновлення неможливе (нема ключа/exe).
 func newUpdater(manifestURL, node string) (*autoupdate.Updater, error) {
 	if startExeErr != nil {
 		return nil, startExeErr
 	}
-	u := &autoupdate.Updater{ExePath: startExe, NodeID: node, CurrentVersion: agentVersion,
+	u := &autoupdate.Updater{ExePath: startExe, NodeID: rolloutID(node), CurrentVersion: agentVersion,
 		ManifestURL: manifestURL, GOOS: runtime.GOOS, GOARCH: runtime.GOARCH}
 	if manifestURL != "" {
 		pk, err := autoupdate.ParsePublicKey(updatePubKey)
@@ -154,7 +174,7 @@ func autoUpdateStartup(ctx context.Context, hub string, window time.Duration, st
 	if r := startupVerdict(res); r != "" && reportURL != "" {
 		rctx, rcancel := context.WithTimeout(context.Background(), 10*time.Second)
 		if rerr := postHealthReport(rctx, http.DefaultClient, reportURL, os.Getenv("OO_ROLLOUT_REPORT_TOKEN"),
-			rollout.Report{Node: node, Version: agentVersion, Result: r, At: time.Now().UTC()}); rerr != nil {
+			rollout.Report{Node: rolloutID(node), Version: agentVersion, Result: r, At: time.Now().UTC()}); rerr != nil {
 			log.Printf("oo-agent: autoupdate: звіт викатки: %v", rerr)
 		}
 		rcancel()

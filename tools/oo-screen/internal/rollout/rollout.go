@@ -73,8 +73,12 @@ type State struct {
 	Version      string    `json:"version"`
 	Stage        int       `json:"stage"` // index into Plan.Stages
 	StageStarted time.Time `json:"stage_started"`
-	Halted       bool      `json:"halted"`
-	Reason       string    `json:"reason,omitempty"`
+	// Since: reports older than this are ignored. init sets it, so
+	// `init -force` really restarts a halted rollout of the same version
+	// instead of re-counting the fail reports that halted it.
+	Since  time.Time `json:"since"`
+	Halted bool      `json:"halted"`
+	Reason string    `json:"reason,omitempty"`
 }
 
 // Action is what a step decided.
@@ -124,8 +128,8 @@ func Tally(reports []Report, version string) (ok, fail, inc int) {
 }
 
 // Step decides the next action and returns the updated state. The fail rate
-// is cumulative over all reports for the version (a canary failure still
-// counts at 50 %); MinReports is per stage (reports since the stage started).
+// is cumulative over all reports for the version since State.Since (a canary
+// failure still counts at 50 %); MinReports is per stage (reports since the stage started).
 func Step(p Plan, s State, reports []Report, now time.Time) (State, Decision, error) {
 	if err := p.Validate(); err != nil {
 		return s, Decision{}, err
@@ -135,6 +139,15 @@ func Step(p Plan, s State, reports []Report, now time.Time) (State, Decision, er
 	}
 	if s.Halted {
 		return s, Decision{Action: Halt, Percent: 0, Reason: s.Reason}, nil
+	}
+	if !s.Since.IsZero() {
+		var fresh []Report
+		for _, r := range reports {
+			if !r.At.Before(s.Since) {
+				fresh = append(fresh, r)
+			}
+		}
+		reports = fresh
 	}
 	ok, fail, inc := Tally(reports, s.Version)
 	d := Decision{OK: ok, Fail: fail, Inconcl: inc, Percent: p.Stages[s.Stage]}
