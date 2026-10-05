@@ -70,7 +70,7 @@ func registerHubInterceptors(m *webrtc.MediaEngine, i *interceptor.Registry) err
 		addFECInterceptor(i)
 		return nil
 	}
-	if err := webrtc.ConfigureNackWithOptions(m, i, nackGeneratorOptions()); err != nil {
+	if err := configureHubNack(m, i); err != nil {
 		return err
 	}
 	if err := webrtc.ConfigureRTCPReports(i); err != nil {
@@ -84,4 +84,30 @@ func registerHubInterceptors(m *webrtc.MediaEngine, i *interceptor.Registry) err
 		return err
 	}
 	return webrtc.ConfigureTWCCSender(m, i)
+}
+
+// configureHubNack — як webrtc.ConfigureNackWithOptions, але responder для
+// ніг без RTX — спільнопамʼятний sharedNackResponder (nackresp.go, R4).
+// Pion-responder лишається лише для ніг з RTX (хаб їх не узгоджує) або
+// повністю — за OO_SCREEN_NACK_RESPONDER=pion.
+func configureHubNack(m *webrtc.MediaEngine, i *interceptor.Registry) error {
+	if nackResponderPion {
+		return webrtc.ConfigureNackWithOptions(m, i, nackGeneratorOptions())
+	}
+	gen, err := nack.NewGeneratorInterceptor(nackGeneratorOptions()...)
+	if err != nil {
+		return err
+	}
+	rtx, err := nack.NewResponderInterceptor(nack.ResponderStreamsFilter(func(info *interceptor.StreamInfo) bool {
+		return streamHasNack(info) && info.SSRCRetransmission != 0
+	}))
+	if err != nil {
+		return err
+	}
+	m.RegisterFeedback(webrtc.RTCPFeedback{Type: "nack"}, webrtc.RTPCodecTypeVideo)
+	m.RegisterFeedback(webrtc.RTCPFeedback{Type: "nack", Parameter: "pli"}, webrtc.RTPCodecTypeVideo)
+	i.Add(sharedNackFactory{})
+	i.Add(rtx)
+	i.Add(gen)
+	return nil
 }
