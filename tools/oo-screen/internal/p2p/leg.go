@@ -6,6 +6,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/pion/interceptor"
 	"github.com/pion/webrtc/v4"
 )
 
@@ -25,6 +26,12 @@ type AgentLegOptions struct {
 	// OnState — direct/turn/fallback (+pair або причина). Агент шле це в
 	// /p2p/result.
 	OnState func(state, pair, reason string)
+	// Setup — додати до MediaEngine/реєстру interceptor-ів ноги (N6: Opus
+	// агента, transport-cc + bwe.RecorderFactory). nil — як раніше: дефолтні
+	// кодеки pion і жодного interceptor-а.
+	Setup func(*webrtc.MediaEngine, *interceptor.Registry) error
+	// OnDataChannel — канали браузера, крім oosc-input (N6: oosc-cursor).
+	OnDataChannel func(*webrtc.DataChannel)
 	// ConsentPoll — як часто перевіряти згоду посеред сесії; відкликання
 	// («Завершити») рве PeerConnection — і відео, і ввід. 0 = 250 мс.
 	ConsentPoll time.Duration
@@ -58,7 +65,13 @@ func NewAgentLeg(o Offer, opt AgentLegOptions) (*AgentLeg, string, error) {
 	if opt.SettingEngine != nil {
 		se = *opt.SettingEngine
 	}
-	api := webrtc.NewAPI(webrtc.WithMediaEngine(me), webrtc.WithSettingEngine(se))
+	reg := &interceptor.Registry{}
+	if opt.Setup != nil {
+		if err := opt.Setup(me, reg); err != nil {
+			return nil, "", err
+		}
+	}
+	api := webrtc.NewAPI(webrtc.WithMediaEngine(me), webrtc.WithSettingEngine(se), webrtc.WithInterceptorRegistry(reg))
 	pc, err := api.NewPeerConnection(webrtc.Configuration{ICEServers: opt.Config.ICEServers()})
 	if err != nil {
 		return nil, "", err
@@ -72,6 +85,9 @@ func NewAgentLeg(o Offer, opt AgentLegOptions) (*AgentLeg, string, error) {
 	}
 	pc.OnDataChannel(func(dc *webrtc.DataChannel) {
 		if dc.Label() != InputLabel {
+			if opt.OnDataChannel != nil {
+				opt.OnDataChannel(dc)
+			}
 			return
 		}
 		dc.OnMessage(func(m webrtc.DataChannelMessage) { l.handleInput(m.Data) })
@@ -289,6 +305,19 @@ func Monitor(pc *webrtc.PeerConnection, cfg Config, restart func() error, report
 					st = StateTURN
 				}
 				report(st, PairType(p), "")
+			}
+		case webrtc.ICEConnectionStateClosed:
+			// Віддалена сторона закрила зʼєднання (браузер закрив peer, DTLS
+			// close_notify) — нога мертва без жодного «disconnected». Без
+			// цього відкат чекав би SessionTTL, і relay_ticket глядача
+			// лишався б недійсним (плеєр пішов би в Mesh, а не на relay).
+			// Власний Close() сюди теж приходить — його відсіює викликач
+			// (AgentLeg: closed уже стоїть).
+			mu.Lock()
+			was := connected
+			mu.Unlock()
+			if was {
+				fall("peer-closed")
 			}
 		case webrtc.ICEConnectionStateFailed:
 			mu.Lock()

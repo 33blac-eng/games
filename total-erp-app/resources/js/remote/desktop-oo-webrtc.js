@@ -731,7 +731,11 @@ export function waitIceOutcome(peer, timeoutMs, timers) {
  * negotiateViewer — увесь SDP-обмін глядача: (опційно) пряма нога, інакше
  * relay. Ставить remote description і повертає {peer, path} (null — сесія
  * вже не поточна).
- * o: { p2p, p2pUrl, signalUrl, standby, ticket, grant, requestTicket, peer,
+ * Пряма нога повертає ще relayTicket — одноразовий квиток на relay, якщо
+ * вже ЗЄДНАНА нога згодом обірветься (див. createDirectRescue).
+ * o.relayTicket (порятунок обірваної прямої ноги) — /p2p/offer не чіпаємо,
+ * одразу relay з цим квитком.
+ * o: { p2p, p2pUrl, signalUrl, standby, ticket, grant, requestTicket, peer, relayTicket,
  *      rebuildPeer() → Promise<peer>, waitIce(peer) → Promise<'connected'|'failed'>,
  *      makeBody(sdp, ticket), onTicket(ticket, grant, peer), onPath(path),
  *      isCurrent(), fetchFn, teardownSignal, timeoutMs, relayRetries, relayRetryMs, sleep }
@@ -742,9 +746,9 @@ export async function negotiateViewer(o) {
     const current = o.isCurrent || (() => true);
     const onPath = o.onPath || (() => {});
     const net = { fetchFn: o.fetchFn, teardownSignal: o.teardownSignal, timeoutMs: o.timeoutMs || DEFAULT_OFFER_TIMEOUT_MS, combine: o.combine };
-    let relayTicket = null;
+    let relayTicket = o.relayTicket || null;
     let ticket = o.ticket;
-    const p2pUrl = o.p2p ? p2pOfferUrl(o.signalUrl, o.p2pUrl) : null;
+    const p2pUrl = (o.p2p && !relayTicket) ? p2pOfferUrl(o.signalUrl, o.p2pUrl) : null;
     if (p2pUrl) {
         const r = await postP2POffer({ ...net, url: p2pUrl, ticket, sdp: peer.localDescription.sdp });
         if (!current()) return null;
@@ -755,7 +759,7 @@ export async function negotiateViewer(o) {
             if (!current()) return null;
             if (out === 'connected') {
                 onPath(PATH_DIRECT);
-                return { peer, path: PATH_DIRECT };
+                return { peer, path: PATH_DIRECT, relayTicket: r.relayTicket || '' };
             }
             // ICE не зʼєднався: нова PeerConnection на relay (стару вже
             // описано answer-ом агента). Агент сам звітує fallback хабу.
@@ -803,6 +807,32 @@ export async function negotiateViewer(o) {
     return { peer, path: PATH_RELAY };
 }
 
+/**
+ * createDirectRescue — N6: обрив УЖЕ ЗЄДНАНОЇ прямої ноги (ICE failed, кадри
+ * перестали йти, агент закрив ногу) — це не привід іти в Mesh: хаб видав
+ * разом з answer одноразовий relay_ticket, і він стає дійсним, щойно агент
+ * звітує fallback (його ICE-сторож). Порятунок — рівно один раз на сесію:
+ * arm() після успішної прямої ноги, take() у фолбеку повертає квиток (і
+ * гасить себе), якщо поточний шлях — direct. Relay-нога, що теж впала, іде
+ * в Mesh як завжди.
+ */
+export function createDirectRescue() {
+    let armed = null;
+    return {
+        arm(relayTicket, grant, signalUrl) {
+            armed = relayTicket ? { relayTicket, grant, signalUrl } : null;
+        },
+        take(path) {
+            if (path !== PATH_DIRECT || !armed) return null;
+            const r = armed;
+            armed = null;
+            return r;
+        },
+        clear() { armed = null; },
+        armed: () => armed !== null,
+    };
+}
+
 export function createOoWebrtcLayer(o) {
     const opts = o || {};
     const container = opts.container;
@@ -843,6 +873,7 @@ export function createOoWebrtcLayer(o) {
     let statsOverlay = null;      // getStats()-оверлей (Ctrl+Alt+S); config.statsOverlay === false — вимкнено
     let transportPath = null;     // N6: 'direct' | 'relay' (| 'direct-connecting') — у стат-оверлеї
     let p2pTrialPeer = null;      // N6: peer, чий ICE ще пробує пряму ногу — його стани не фолбечать у Mesh
+    const directRescue = createDirectRescue(); // N6: обрив зʼєднаної прямої ноги -> relay, не Mesh
 
     const session = createOoSession({
         firstFrameMs: config.firstFrameMs,
@@ -1078,7 +1109,20 @@ export function createOoWebrtcLayer(o) {
         }
     }
 
-    function doFallback() {
+    function doFallback(gen, reason) {
+        // N6: впала вже зʼєднана пряма нога — relay з relay_ticket (новий
+        // peer, нова генерація), а не Mesh. Mesh на час переходу розглушуємо,
+        // як і при першому підключенні: пауза — лише після SDP-обміну.
+        const rescue = destroyed ? null : directRescue.take(transportPath);
+        if (rescue) {
+            restoreMesh();
+            unpauseMesh();
+            teardownOo();
+            transportPath = null;
+            start(rescue);
+            return;
+        }
+        directRescue.clear();
         // Спершу повертаємо Mesh-картинку, потім знімаємо OO-шар — зворотний
         // порядок дає видиму дірку, у яку встигають клікнути. Розмір
         // Mesh-canvas (режим 1:1) повертаємо ще раніше — до того, як Mesh малює.
@@ -1164,7 +1208,7 @@ export function createOoWebrtcLayer(o) {
         });
     }
 
-    async function start() {
+    async function start(rescue) {
         const gen = session.begin();
         abort = new AbortController();
         video = makeOverlay();
@@ -1182,7 +1226,7 @@ export function createOoWebrtcLayer(o) {
         }
 
         try {
-            await connect(gen);
+            await connect(gen, rescue);
         } catch (e) {
             if (session.isCurrent(gen)) session.fallback(gen, 'connect-failed: ' + (e && e.message ? e.message : e));
         }
@@ -1345,14 +1389,17 @@ export function createOoWebrtcLayer(o) {
         return peer;
     }
 
-    async function connect(gen) {
+    async function connect(gen, rescue) {
         const peer = await preparePeer(gen);
         if (!session.isCurrent(gen)) return;
 
         // §6.4 / BLOCKER-1,3: свіжий одноразовий ticket на цю ноду САМЕ перед
         // offer-ом (щоб не згорів по TTL, поки збирався ICE). node_id уже в
         // claims ticket-а — hub звʼяже глядача з publisher-ом цієї ноди.
-        const ticketResp = await config.requestTicket();
+        // N6-порятунок: ERP-квиток не потрібен — є одноразовий relay_ticket.
+        const ticketResp = rescue
+            ? { ticket: rescue.relayTicket, signalUrl: rescue.signalUrl, grant: rescue.grant }
+            : await config.requestTicket();
         const { ticket, signalUrl, grant: granted } = ticketResp || {};
         if (!session.isCurrent(gen)) return;
         if (!ticket || !signalUrl) throw new Error('offer/viewer: немає ticket або signalUrl');
@@ -1366,13 +1413,14 @@ export function createOoWebrtcLayer(o) {
         // N6: config.p2p (типово вимкнено) — спершу пряма нога (negotiateViewer);
         // без нього — рівно той самий postOfferWithFailover, що й раніше.
         // Додаткові монітори (F6) лишаються на relay.
-        const p2pOn = config.p2p === true && !(Number.isInteger(config.monitor) && config.monitor > 0);
+        const p2pOn = !rescue && config.p2p === true && !(Number.isInteger(config.monitor) && config.monitor > 0);
         if (p2pOn) p2pTrialPeer = peer;
         let res;
         try {
             res = await negotiateViewer({
                 p2p: p2pOn,
                 p2pUrl: config.p2pUrl,
+                relayTicket: rescue ? rescue.relayTicket : null,
                 signalUrl,
                 standby: resolveStandby(ticketResp, config),
                 ticket,
@@ -1399,6 +1447,7 @@ export function createOoWebrtcLayer(o) {
             p2pTrialPeer = null;
         }
         if (!res || !session.isCurrent(gen)) return;
+        if (res.path === PATH_DIRECT) directRescue.arm(res.relayTicket, granted, signalUrl);
 
         // Аж ТЕПЕР глушимо Mesh і армимо 8с-сторож: SDP-обмін позаду, тож
         // зрив сигналізації не встиг коштувати нікому чорного екрана.

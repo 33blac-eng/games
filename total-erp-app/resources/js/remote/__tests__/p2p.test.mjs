@@ -2,7 +2,7 @@
 import assert from 'node:assert/strict';
 import {
     p2pOfferUrl, postP2POffer, redeemRelay, waitIceOutcome, negotiateViewer, offerBody,
-    PATH_DIRECT, PATH_RELAY,
+    createDirectRescue, PATH_DIRECT, PATH_RELAY,
 } from '../desktop-oo-webrtc.js';
 import { formatPathLine } from '../desktop-oo-stats.js';
 
@@ -69,6 +69,7 @@ function base(extra) {
     assert.deepEqual(log, [[P2P, 'erp-1']]);
     assert.deepEqual(paths, ['direct-connecting', PATH_DIRECT]);
     assert.deepEqual(tickets, []); // ввід лишається з ERP-квитком (агент знімає конверт сам)
+    assert.equal(r.relayTicket, 'p2pfb.x'); // на випадок обриву вже зʼєднаної ноги
 }
 
 // 2) 409 → relay з relay_ticket тим самим offer-ом; ERP-квиток удруге не шлемо.
@@ -196,6 +197,49 @@ function base(extra) {
     const w3 = waitIceOutcome({ iceConnectionState: 'new' }, 5, { setTimeout: (f) => { fire = f; return 1; }, clearTimeout: () => {} });
     fire();
     assert.equal(await w3, 'failed');
+}
+
+// 9) Обрив УЖЕ ЗЄДНАНОЇ прямої ноги: порятунок через hub relay з relay_ticket
+//    (не Mesh). /p2p/offer і ERP-квиток не чіпаються; новий peer; 403, поки
+//    агент не звітував fallback, — обмежений повтор; ввід — на relay-квиток.
+{
+    const rescue = createDirectRescue();
+    assert.equal(rescue.take(PATH_DIRECT), null); // не озброєно — Mesh
+    // Сесія 1: пряма нога зʼєдналась -> озброюємо.
+    const log = [];
+    const first = base({ fetchFn: mkFetch({ [P2P]: [res(200, { id: 'd', sdp: 'ans-direct', relay_ticket: 'p2pfb.drop' })] }, log) });
+    const r1 = await negotiateViewer(first.o);
+    assert.equal(r1.path, PATH_DIRECT);
+    rescue.arm(r1.relayTicket, 'control', SIG);
+    assert.equal(rescue.take(PATH_RELAY), null); // впала relay-нога — це Mesh
+    assert.ok(rescue.armed());
+    // Нога впала: фолбек бере квиток рівно раз.
+    const got = rescue.take(PATH_DIRECT);
+    assert.deepEqual(got, { relayTicket: 'p2pfb.drop', grant: 'control', signalUrl: SIG });
+    assert.equal(rescue.take(PATH_DIRECT), null);
+    // Сесія 2 (нова генерація) — relay з цим квитком.
+    const log2 = [];
+    const second = base({
+        ticket: got.relayTicket, grant: got.grant, relayTicket: got.relayTicket,
+        fetchFn: mkFetch({ [SIG]: [res(403, null), res(200, { sdp: 'ans-relay' })] }, log2),
+        rebuildPeer: async () => { throw new Error('peer уже новий'); },
+    });
+    const peer2 = second.o.peer;
+    const r2 = await negotiateViewer(second.o);
+    assert.equal(r2.path, PATH_RELAY);
+    assert.equal(r2.peer, peer2);
+    assert.equal(peer2.remote.sdp, 'ans-relay');
+    assert.deepEqual(log2, [[SIG, 'p2pfb.drop'], [SIG, 'p2pfb.drop']]);
+    assert.deepEqual(second.paths, [PATH_RELAY]);
+    assert.deepEqual(second.tickets, [['p2pfb.drop', 'control']]);
+    // Relay відмовив назовсім (квиток знищено відкликанням S2) — помилка -> Mesh.
+    const log3 = [];
+    const third = base({ relayTicket: 'p2pfb.revoked', fetchFn: mkFetch({ [SIG]: [res(403, null), res(403, null)] }, log3), relayRetries: 1 });
+    await assert.rejects(negotiateViewer(third.o), /offer\/viewer 403/);
+    assert.deepEqual(log3.map(([u]) => u), [SIG, SIG]);
+    // Без relay_ticket у 200 порятунок не озброюється.
+    rescue.arm('', 'control', SIG);
+    assert.equal(rescue.take(PATH_DIRECT), null);
 }
 
 console.log('p2p.test.mjs: ok');

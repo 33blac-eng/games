@@ -10,9 +10,18 @@
 // -p2p / OO_SCREEN_P2P=1 і подає кадри (writeVideo) та ввід (onInput).
 // Дефолт — вимкнено.
 //
-// Чого пряма нога НЕ несе (лишається на relay): звук, шар курсора, текстові
-// тайли, oosc-ctl (bitrate_target хаба). Енкодер тримає ту ціль, яку хаб
-// поставив востаннє.
+// Що пряма нога несе, крім відео й вводу (N6, хвіст):
+//   - звук: та сама Opus/PCMU-доріжка, що на relay (OO_SCREEN_AUDIO), якщо
+//     браузер запропонував m=audio; кадри — ті самі, що йдуть хабу;
+//   - шар курсора: канал oosc-cursor, який відкриває браузер (config.
+//     cursorLayer), підключається до того самого cursorPub (-cursor-layer);
+//   - локальний контролер бітрейту (-p2p-bwe / OO_SCREEN_P2P_BWE=1, дефолт
+//     вимкнено): хаба між енкодером і глядачем нема, тож bitrate_target хаба
+//     сюди не доходить. internal/bwe.LegCtl на RTCP самої ноги (RR-втрати,
+//     REMB; з OO_SCREEN_DELAYBWE=1 — ще transport-cc і той самий детектор
+//     затримки, що в хабі). Без прапорця енкодер тримає останню ціль хаба.
+//
+// Чого НЕ несе: текстові тайли, додаткові монітори (F6) — лише relay.
 package main
 
 import (
@@ -28,8 +37,12 @@ import (
 	"sync"
 	"time"
 
+	"github.com/organicoils/oo-screen/internal/bwe"
+	"github.com/organicoils/oo-screen/internal/cursorproto"
 	"github.com/organicoils/oo-screen/internal/p2p"
+	"github.com/pion/interceptor"
 	"github.com/pion/rtcp"
+	"github.com/pion/sdp/v3"
 	"github.com/pion/webrtc/v4"
 	"github.com/pion/webrtc/v4/pkg/media"
 	"golang.org/x/time/rate"
@@ -44,6 +57,9 @@ const (
 type p2pLegEntry struct {
 	leg   *p2p.AgentLeg
 	track *webrtc.TrackLocalStaticSample
+	audio *webrtc.TrackLocalStaticSample // nil — без звуку
+	ctl   *bwe.LegCtl                    // nil — без локального контролера
+	twcc  *bwe.TWCC                      // nil — без transport-cc
 }
 
 type p2pAgent struct {
@@ -63,6 +79,21 @@ type p2pAgent struct {
 	onKeyframe     func()       // PLI/FIR від браузера
 	se             *webrtc.SettingEngine
 	retryMin       time.Duration
+
+	// audio — нести звук (audioEnabled); audioCap — кодек доріжки.
+	audio    bool
+	audioCap webrtc.RTPCodecCapability
+	// cursor — куди підключати oosc-cursor прямої ноги (nil — шар вимкнено).
+	cursor *cursorFan
+	// bwe — локальний контролер бітрейту прямої ноги; delayBWE — разом з
+	// transport-cc і детектором затримки. startBps/ceilBps — поточна ціль і
+	// стеля енкодера; onBitrate — нова ціль (через той самий шлях, що й
+	// bitrate_target хаба: застосовує кадровий цикл).
+	bwe       bool
+	delayBWE  bool
+	startBps  func() uint64
+	ceilBps   uint64
+	onBitrate func(bps uint64)
 
 	legs    p2p.AgentLegs
 	mu      sync.Mutex
@@ -223,10 +254,37 @@ func (a *p2pAgent) handleOffer(ctx context.Context, o p2p.Offer) {
 		return
 	}
 	id := o.ID
+	ent := p2pLegEntry{track: track}
+	tracks := []webrtc.TrackLocal{track}
+	if a.audio && offersAudio(o.SDP) {
+		at, aerr := webrtc.NewTrackLocalStaticSample(a.audioCap, "audio", "oo-screen-p2p")
+		if aerr == nil {
+			ent.audio = at
+			tracks = append(tracks, at)
+		}
+	}
+	if a.bwe {
+		start, ceil := a.ceilBps, a.ceilBps
+		if a.startBps != nil {
+			if b := a.startBps(); b > 0 {
+				start = b
+			}
+		}
+		ent.ctl = bwe.NewLegCtl(start, ceil)
+		if a.delayBWE {
+			ent.twcc = bwe.NewTWCC()
+		}
+	}
 	leg, sdp, err := p2p.NewAgentLeg(o, p2p.AgentLegOptions{
 		Config: a.cfg, SettingEngine: a.se, Consent: a.consent,
-		Tracks:  []webrtc.TrackLocal{track},
+		Tracks:  tracks,
+		Setup:   ent.setup,
 		OnInput: a.input,
+		OnDataChannel: func(dc *webrtc.DataChannel) {
+			if dc.Label() == cursorproto.ChannelLabel && a.cursor != nil {
+				a.cursor.attach(dc)
+			}
+		},
 		OnState: func(state, pair, reason string) {
 			log.Printf("oo-agent: p2p %s: %s %s %s", shortID(id), state, pair, reason)
 			if state == p2p.StateFallback || state == p2p.StateClosed {
@@ -248,10 +306,11 @@ func (a *p2pAgent) handleOffer(ctx context.Context, o p2p.Offer) {
 	// Реєстрація ДО answer: наступний poll уже має назвати ногу в active.
 	a.legs.Add(id, leg)
 	a.mu.Lock()
-	a.entries[id] = p2pLegEntry{leg: leg, track: track}
+	ent.leg = leg
+	a.entries[id] = ent
 	a.mu.Unlock()
 	for _, s := range leg.PC.GetSenders() {
-		go a.readRTCP(s)
+		go a.readRTCP(s, ent, s.Track() == webrtc.TrackLocal(track))
 	}
 	if st := a.post("/p2p/answer", p2p.AgentAnswerReq{ID: id, Node: a.node, SDP: sdp}); st == http.StatusGone || st == 0 {
 		// Хаб уже не знає сесії (таймаут/відкликання) або недосяжний.
@@ -265,21 +324,78 @@ func (a *p2pAgent) handleOffer(ctx context.Context, o p2p.Offer) {
 	}
 }
 
-func (a *p2pAgent) readRTCP(s *webrtc.RTPSender) {
+// setup — MediaEngine/interceptor-и ноги: transport-cc і запис відправок
+// лише з delayBWE (інакше SDP ноги — рівно як до N6-хвоста).
+func (e p2pLegEntry) setup(me *webrtc.MediaEngine, reg *interceptor.Registry) error {
+	if e.twcc == nil {
+		return nil
+	}
+	if err := me.RegisterHeaderExtension(webrtc.RTPHeaderExtensionCapability{URI: sdp.TransportCCURI}, webrtc.RTPCodecTypeVideo); err != nil {
+		return err
+	}
+	me.RegisterFeedback(webrtc.RTCPFeedback{Type: webrtc.TypeRTCPFBTransportCC}, webrtc.RTPCodecTypeVideo)
+	reg.Add(&bwe.RecorderFactory{TWCC: e.twcc})
+	return nil
+}
+
+// offersAudio — чи браузер запропонував m=audio (config.audio плеєра).
+func offersAudio(sdpText string) bool {
+	for _, l := range strings.Split(sdpText, "\n") {
+		if strings.HasPrefix(l, "m=audio ") {
+			return true
+		}
+	}
+	return false
+}
+
+// readRTCP — PLI/FIR -> IDR; для відео-sender-а з контролером — ще RR,
+// REMB і TWCC у bwe.LegCtl.
+func (a *p2pAgent) readRTCP(s *webrtc.RTPSender, e p2pLegEntry, video bool) {
 	for {
 		pkts, _, err := s.ReadRTCP()
 		if err != nil {
 			return
 		}
 		for _, p := range pkts {
-			switch p.(type) {
+			switch pk := p.(type) {
 			case *rtcp.PictureLossIndication, *rtcp.FullIntraRequest:
 				if a.onKeyframe != nil {
 					a.onKeyframe()
 				}
+			case *rtcp.ReceiverReport:
+				if video && e.ctl != nil {
+					a.onRR(s, e, pk)
+				}
+			case *rtcp.ReceiverEstimatedMaximumBitrate:
+				if video && e.ctl != nil {
+					a.applyBitrate(e.ctl.OnRemb(uint64(pk.Bitrate), time.Now()))
+				}
+			case *rtcp.TransportLayerCC:
+				if video && e.ctl != nil && e.twcc != nil {
+					a.applyBitrate(e.ctl.OnTWCC(e.twcc.OnFeedback(pk), time.Now()))
+				}
 			}
 		}
 	}
+}
+
+func (a *p2pAgent) onRR(s *webrtc.RTPSender, e p2pLegEntry, rr *rtcp.ReceiverReport) {
+	ssrc := map[uint32]bool{}
+	for _, enc := range s.GetParameters().Encodings {
+		ssrc[uint32(enc.SSRC)] = true
+	}
+	for _, r := range rr.Reports {
+		if ssrc[r.SSRC] {
+			a.applyBitrate(e.ctl.OnLoss(float64(r.FractionLost)/256, time.Now()))
+		}
+	}
+}
+
+func (a *p2pAgent) applyBitrate(bps uint64, changed bool) {
+	if !changed || a.onBitrate == nil {
+		return
+	}
+	a.onBitrate(bps)
 }
 
 // input — подія з oosc-input прямої ноги (grant і згоду вже перевірив
@@ -350,6 +466,22 @@ func (a *p2pAgent) writeVideo(data []byte, dur time.Duration) {
 	tracks := make([]*webrtc.TrackLocalStaticSample, 0, len(a.entries))
 	for _, e := range a.entries {
 		tracks = append(tracks, e.track)
+	}
+	a.mu.Unlock()
+	for _, t := range tracks {
+		_ = t.WriteSample(media.Sample{Data: data, Duration: dur})
+	}
+}
+
+// writeAudio — той самий звуковий кадр, що пішов на хаб, у кожну живу пряму
+// ногу зі звуком.
+func (a *p2pAgent) writeAudio(data []byte, dur time.Duration) {
+	a.mu.Lock()
+	var tracks []*webrtc.TrackLocalStaticSample
+	for _, e := range a.entries {
+		if e.audio != nil {
+			tracks = append(tracks, e.audio)
+		}
 	}
 	a.mu.Unlock()
 	for _, t := range tracks {
