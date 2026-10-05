@@ -142,6 +142,11 @@ jobs:
         run: bash deploy/test/hub-deploy-test.sh
       - name: hub-deploy security test
         run: bash deploy/test/hub-deploy-sec2-test.sh
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: agent-rollout test
+        run: bash deploy/test/agent-rollout-test.sh
 
   govulncheck:
     # Blocking. Runs on the toolchain pinned in go.mod (go1.26.8), the same one

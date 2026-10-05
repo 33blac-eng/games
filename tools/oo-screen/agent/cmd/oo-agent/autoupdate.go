@@ -10,10 +10,14 @@ package main
 // тож без оновлення це один os.Stat.
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
+	"fmt"
 	"log"
 	"net"
+	"net/http"
 	"net/url"
 	"os"
 	"os/exec"
@@ -24,6 +28,7 @@ import (
 	"time"
 
 	"github.com/organicoils/oo-screen/internal/autoupdate"
+	"github.com/organicoils/oo-screen/internal/rollout"
 )
 
 var (
@@ -115,12 +120,32 @@ func sessionHealth(hub string, connected <-chan struct{}) func(context.Context) 
 	}
 }
 
+// rolloutID — ключ кошика викатки й node у звіті здоров'я. Mesh-нода має
+// -node; legacy T1-агент (без -node) інакше мав би порожній ключ: усі такі
+// агенти падали б в один кошик Bucket("", v), а звіти з node="" хаб
+// відкидає (400) — відкати T1-флоту не доходили б до halt-гейта. Тому для
+// них беремо стабільне "host:<hostname>"; "" лише якщо й hostname невідомий.
+func rolloutID(node string) string {
+	if node != "" {
+		return node
+	}
+	return hostRolloutID(os.Hostname)
+}
+
+func hostRolloutID(hostname func() (string, error)) string {
+	h, err := hostname()
+	if err != nil || h == "" {
+		return ""
+	}
+	return "host:" + strings.ToLower(h)
+}
+
 // newUpdater збирає Updater; nil, якщо оновлення неможливе (нема ключа/exe).
 func newUpdater(manifestURL, node string) (*autoupdate.Updater, error) {
 	if startExeErr != nil {
 		return nil, startExeErr
 	}
-	u := &autoupdate.Updater{ExePath: startExe, NodeID: node, CurrentVersion: agentVersion,
+	u := &autoupdate.Updater{ExePath: startExe, NodeID: rolloutID(node), CurrentVersion: agentVersion,
 		ManifestURL: manifestURL, GOOS: runtime.GOOS, GOARCH: runtime.GOARCH}
 	if manifestURL != "" {
 		pk, err := autoupdate.ParsePublicKey(updatePubKey)
@@ -137,7 +162,7 @@ func newUpdater(manifestURL, node string) (*autoupdate.Updater, error) {
 // у горутині: агент працює під час вікна, а health чекає саме на його
 // підключення. Відкат: relaunchAfterExit + stop(); main перезапускає вже
 // відновлений старий бінарь після release м'ютекса.
-func autoUpdateStartup(ctx context.Context, hub string, window time.Duration, stop func()) {
+func autoUpdateStartup(ctx context.Context, hub string, window time.Duration, stop func(), reportURL, node string) {
 	u, err := newUpdater("", "")
 	if err != nil {
 		return
@@ -146,6 +171,14 @@ func autoUpdateStartup(ctx context.Context, hub string, window time.Duration, st
 	hctx, cancel := context.WithTimeout(ctx, window)
 	defer cancel()
 	res, err := u.Startup(hctx, sessionHealth(hub, agentConnected))
+	if r := startupVerdict(res); r != "" && reportURL != "" {
+		rctx, rcancel := context.WithTimeout(context.Background(), 10*time.Second)
+		if rerr := postHealthReport(rctx, http.DefaultClient, reportURL, os.Getenv("OO_ROLLOUT_REPORT_TOKEN"),
+			rollout.Report{Node: rolloutID(node), Version: agentVersion, Result: r, At: time.Now().UTC()}); rerr != nil {
+			log.Printf("oo-agent: autoupdate: звіт викатки: %v", rerr)
+		}
+		rcancel()
+	}
 	switch res {
 	case autoupdate.Committed:
 		log.Printf("oo-agent: autoupdate: версія %s здорова — оновлення прийнято", agentVersion)
@@ -162,6 +195,45 @@ func autoUpdateStartup(ctx context.Context, hub string, window time.Duration, st
 			log.Printf("oo-agent: autoupdate: маркер: %v", err)
 		}
 	}
+}
+
+// startupVerdict: результат Startup -> вердикт для O4-викатки ("" = не було
+// оновлення, звітувати нічого).
+func startupVerdict(res autoupdate.StartupResult) string {
+	switch res {
+	case autoupdate.Committed:
+		return rollout.ResultOK
+	case autoupdate.RolledBack, autoupdate.RollbackFailed:
+		return rollout.ResultFail
+	case autoupdate.Inconclusive:
+		return rollout.ResultInconclusive
+	}
+	return ""
+}
+
+// postHealthReport: best-effort POST вердикту на oo-rollout serve.
+func postHealthReport(ctx context.Context, c *http.Client, url, token string, r rollout.Report) error {
+	b, err := json.Marshal(r)
+	if err != nil {
+		return err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(b))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	if token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
+	}
+	resp, err := c.Do(req)
+	if err != nil {
+		return err
+	}
+	_ = resp.Body.Close()
+	if resp.StatusCode/100 != 2 {
+		return fmt.Errorf("HTTP %d", resp.StatusCode)
+	}
+	return nil
 }
 
 // runAutoUpdate — фоновий цикл перевірки маніфесту. Після успішного swap

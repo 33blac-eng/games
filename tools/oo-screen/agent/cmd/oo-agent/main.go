@@ -942,6 +942,7 @@ func main() {
 	autoUpdateHealth := flag.Duration("auto-update-health-window", 2*time.Minute, "S6: за скільки новий бінарь мусить достукатись до хаба, інакше автоматичний відкат")
 	p2pFlag := flag.Bool("p2p", false, "N6: пряма нога агент↔браузер (перекриває env OO_SCREEN_P2P=1; потрібен OO_SCREEN_P2P=1 на хабі і config.p2p у плеєрі). Типово вимкнено. Лише webrtc і з -node. Нога везе відео+ввід; звук/курсор/тайли/bitrate_target лишаються на relay. UNVERIFIED на реальних ПК/NAT")
 	p2pStun := flag.String("p2p-stun", "", "N6: STUN-сервери через кому (перекриває OO_SCREEN_P2P_STUN)")
+	autoUpdateReport := flag.String("auto-update-report-url", "", "O4: куди POST-ити вердикт здоров'я нової версії (ok/fail/inconclusive) для поетапної викатки (oo-rollout serve); порожньо = не звітувати. Токен — env OO_ROLLOUT_REPORT_TOKEN")
 	flag.Parse()
 
 	// Прапорці перекривають env з тієї ж причини, що й -token вище: агента
@@ -1088,7 +1089,7 @@ func main() {
 	// S6: щойно встановлене оновлення перевіряємо ПІСЛЯ м'ютекса одного
 	// екземпляра і паралельно з роботою агента (health = агент підключився).
 	if *multimonChild == 0 {
-		go autoUpdateStartup(ctx, *hubAddr, *autoUpdateHealth, stop)
+		go autoUpdateStartup(ctx, *hubAddr, *autoUpdateHealth, stop, *autoUpdateReport, *node)
 	}
 
 	if *autoUpdateURL != "" && *multimonChild == 0 {
