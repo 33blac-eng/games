@@ -529,6 +529,82 @@ export function offerBody(sdp, ticket, monitor) {
     return JSON.stringify({ sdp: sdp, ticket });
 }
 
+/**
+ * O2: резервний хаб для глядача. Типово ВИМКНЕНО: без config.standbySignalUrls
+ * повертає [signalUrl] — рівно одна спроба, як до O2.
+ * standbySignalUrls — масив повних URL /offer/viewer резервних хабів (ті самі
+ * ticket-секрети, див. tools/oo-screen/deploy/DEPLOY.md «O2»).
+ */
+export function signalCandidates(signalUrl, standby) {
+    const out = [signalUrl];
+    if (Array.isArray(standby)) {
+        for (const u of standby) {
+            if (typeof u === 'string' && u && !out.includes(u)) out.push(u);
+        }
+    }
+    return out;
+}
+
+/**
+ * Чи пробувати наступний хаб.
+ *  - помилка fetch: так, ЯКЩО це не teardown (tornDown). Таймаут спроби
+ *    (AbortError у фолбеку / TimeoutError у AbortSignal.timeout) — так:
+ *    blackhole/завислий хаб = найчастіший «мертвий хост».
+ *  - 502/503/504: проксі перед мертвим хабом.
+ *  - 404 «no publisher for node»: агент сидить на ІНШОМУ хабі (після failover
+ *    агент на основний сам не повертається — інакше split-brain).
+ *  - 400/401/403 (ticket, ACL) — НІ: резервний відповість так само.
+ * Наступна спроба завжди йде зі СВІЖИМ ticket-ом (postOfferWithFailover).
+ */
+export function shouldFailover(err, status, tornDown) {
+    if (err) return !tornDown;
+    return status === 404 || status === 502 || status === 503 || status === 504;
+}
+
+/**
+ * O2: POST offer по кандидатах. Кожна спроба має ВЛАСНИЙ таймаут (окремий
+ * combineAbortSignals), тож таймаут основного не вбиває спробу резервного.
+ * Кожна наступна спроба бере НОВИЙ одноразовий ticket через requestTicket():
+ * ticket, що міг бути спожитий хабом, який відповів/обірвався, повторно не
+ * надсилається (used-ticket облік у кожного хаба свій).
+ *
+ * o: { urls, ticket, requestTicket, makeBody(ticket), onTicket(ticket, grant),
+ *      teardownSignal, timeoutMs, fetchFn, combine }
+ * @returns {Promise<Response>}
+ */
+export async function postOfferWithFailover(o) {
+    const combine = o.combine || combineAbortSignals;
+    const torn = () => !!(o.teardownSignal && o.teardownSignal.aborted);
+    let ticket = o.ticket;
+    for (let i = 0; i < o.urls.length; i++) {
+        const last = i === o.urls.length - 1;
+        if (i > 0) {
+            if (torn()) throw new Error('offer/viewer: teardown');
+            const t = await o.requestTicket();
+            if (!t || !t.ticket) throw new Error('offer/viewer: немає ticket для резервного хаба');
+            ticket = t.ticket;
+            if (o.onTicket) o.onTicket(t.ticket, t.grant);
+        }
+        const c = combine(o.teardownSignal, o.timeoutMs);
+        let resp;
+        try {
+            resp = await o.fetchFn(o.urls[i], {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: o.makeBody(ticket),
+                signal: c.signal,
+            });
+        } catch (e) {
+            if (last || !shouldFailover(e, 0, torn())) throw e;
+            continue;
+        } finally {
+            c.cancel();
+        }
+        if (last || !shouldFailover(null, resp.status)) return resp;
+    }
+    throw new Error('offer/viewer: немає кандидатів');
+}
+
 export function createOoWebrtcLayer(o) {
     const opts = o || {};
     const container = opts.container;
@@ -1063,24 +1139,21 @@ export function createOoWebrtcLayer(o) {
         if (!ticket || !signalUrl) throw new Error('offer/viewer: немає ticket або signalUrl');
         armInput(gen, ticket, granted);
 
-        // §MAJOR-5: ОДИН signal — teardown-abort АБО таймаут. Раніше fetch слухав
-        // лише AbortSignal.timeout() окремо від teardown, тож знищення шару не
-        // рвало застарілий offer-fetch.
-        const combined = combineAbortSignals(abort && abort.signal, config.offerTimeoutMs || DEFAULT_OFFER_TIMEOUT_MS);
-        let resp;
-        try {
-            resp = await fetch(signalUrl, {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                // offer несе ОДНОРАЗОВИЙ ticket, не довгоживучий токен.
-                // F6: monitor>0 — потік додаткового монітора (desktop-oo-multimon.js);
-                // 0/відсутнє — поле не шлемо зовсім, offer як до F6.
-                body: offerBody(peer.localDescription.sdp, ticket, config.monitor),
-                signal: combined.signal,
-            });
-        } finally {
-            combined.cancel();
-        }
+        // §MAJOR-5: signal кожної спроби — teardown-abort АБО таймаут.
+        // O2: без config.standbySignalUrls — один кандидат, як раніше.
+        // offer несе ОДНОРАЗОВИЙ ticket, не довгоживучий токен.
+        // F6: monitor>0 — потік додаткового монітора (desktop-oo-multimon.js);
+        // 0/відсутнє — поле не шлемо зовсім, offer як до F6.
+        const resp = await postOfferWithFailover({
+            urls: signalCandidates(signalUrl, config.standbySignalUrls),
+            ticket,
+            requestTicket: config.requestTicket,
+            makeBody: (t) => offerBody(peer.localDescription.sdp, t, config.monitor),
+            onTicket: (t, g) => { if (session.isCurrent(gen)) armInput(gen, t, g); },
+            teardownSignal: abort && abort.signal,
+            timeoutMs: config.offerTimeoutMs || DEFAULT_OFFER_TIMEOUT_MS,
+            fetchFn: (u, init) => fetch(u, init),
+        });
         if (!session.isCurrent(gen)) return;
         if (!resp.ok) throw new Error('offer/viewer ' + resp.status);
         const answer = await resp.json();
