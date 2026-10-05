@@ -192,6 +192,7 @@ sudo sh -c 'umask 077; grep ^OO_SCREEN_AGENT_SECRET= /etc/oo-screen/hub.env | cu
 | `OO_SCREEN_BITRATE_FASTUP` | вимк. | `1` — швидке відновлення бітрейту |
 | `OO_SCREEN_STRICT_CODEC` | вимк. | `1`/`true` — рвати сесію при неузгодженому профілі H.264 |
 | `OO_SCREEN_AUDIO` | вимк. | `1` — аудіо-доріжка (і на агенті) |
+| `OO_SCREEN_AUDIO_CODEC` | `opus` | кодек звуку: `opus` (48 кГц стерео, F1) або `pcmu` (запасний G.711 8 кГц моно). Хаб і агент мусять мати однаковий |
 | `OO_SCREEN_INPUT` | вимк. | `1` — канал вводу (і на агенті) |
 | `OO_SCREEN_RECORD` | вимк. | `1` — запис сесій у MKV |
 | `OO_SCREEN_RECORD_DIR` | `recordings` | каталог записів (0700, файли 0600; 14 днів / 8 ГіБ) |
@@ -207,6 +208,7 @@ sudo sh -c 'umask 077; grep ^OO_SCREEN_AGENT_SECRET= /etc/oo-screen/hub.env | cu
 | `OO_AGENT_INPUT_BLOCK_KEYS` **нова** | порожньо | скан-коди через кому (`0xE05B,0xE05C`), які агент не вводить; помилка в списку = відмова |
 | `OO_SCREEN_PACER` **нова** | вимк. | `1` = рівномірна відправка RTP (~2× цілі бітрейту, черга ≤ 75 мс); допомагає під стелею каналу ~8 Мбіт/с, додає до 75 мс затримки |
 | `OO_SCREEN_AUDIO` | вимк. | `1` = `-audio` |
+| `OO_SCREEN_AUDIO_CODEC` | `opus` | `opus` (48 кГц стерео) або `pcmu` (запасний); має збігатися з хабом |
 | `OO_SCREEN_INPUT` | вимк. | `1` = `-input` |
 
 Стендові: `OO_SCREEN_HUB_URL` (corpus-player), `OO_SCREEN_T1_TOKEN` у `hub-wt`/`loadgen`.

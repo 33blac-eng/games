@@ -333,6 +333,28 @@ export function labelFor(mode) {
 
 const ICE_URL_RE = /^(stun|stuns|turn|turns):[^\s]+$/i;
 
+// opusStereoSdp — F1 (Opus 48 кГц стерео). Chrome за замовчуванням оголошує
+// Opus без stereo=1, а декодер приймача створюється з кількістю каналів із
+// цього fmtp — тобто без правки стерео від хаба зводиться в моно. Дописуємо
+// stereo=1;sprop-stereo=1 у fmtp кожного opus-PT нашого ж offer-а. Інші
+// рядки не чіпаємо; повторний виклик нічого не змінює.
+export function opusStereoSdp(sdp) {
+    if (typeof sdp !== 'string') return sdp;
+    const pts = [];
+    const re = /^a=rtpmap:(\d+) opus\/48000/gim;
+    let m;
+    while ((m = re.exec(sdp)) !== null) pts.push(m[1]);
+    if (!pts.length) return sdp;
+    return sdp.split(/\r\n/).map((line) => {
+        const f = /^a=fmtp:(\d+) (.*)$/.exec(line);
+        if (!f || !pts.includes(f[1])) return line;
+        let params = f[2];
+        if (!/(^|;)\s*stereo=/.test(params)) params += ';stereo=1';
+        if (!/(^|;)\s*sprop-stereo=/.test(params)) params += ';sprop-stereo=1';
+        return 'a=fmtp:' + f[1] + ' ' + params;
+    }).join('\r\n');
+}
+
 // iceUrlRank — порядок у списку: UDP-варіанти першими, turns (TLS) останнім.
 // На пріоритет кандидатів це не впливає (його рахує ICE), але Chrome опитує
 // сервери по черзі, і так дешеві запити йдуть раніше.
@@ -968,7 +990,11 @@ export function createOoWebrtcLayer(o) {
         };
 
         const offer = await peer.createOffer();
-        await peer.setLocalDescription(offer);
+        // Звук (F1): правка SDP лише коли звук просили — без config.audio
+        // offer бітово той самий, що й до Opus.
+        await peer.setLocalDescription(config.audio
+            ? { type: offer.type, sdp: opusStereoSdp(offer.sdp) }
+            : offer);
         await waitIceGathering(peer);
         if (!session.isCurrent(gen)) return;
 

@@ -12,6 +12,7 @@ import (
 	"github.com/pion/webrtc/v4"
 	"github.com/pion/webrtc/v4/pkg/media"
 
+	"github.com/organicoils/oo-screen/internal/opusenc"
 	"github.com/organicoils/oo-screen/internal/pcmu"
 )
 
@@ -91,6 +92,14 @@ func mediaPorts(sdp, kind string) []string {
 	return out
 }
 
+// withHubAudioCodec — кодек звуку хаба на час тесту (OO_SCREEN_AUDIO_CODEC).
+func withHubAudioCodec(t *testing.T, c opusenc.Codec) {
+	t.Helper()
+	prev := hubAudioCodec()
+	hubCodecV.Store(c)
+	t.Cleanup(func() { hubCodecV.Store(prev) })
+}
+
 // withAudioFlag ставить прапорець на час тесту і повертає його назад, разом зі
 // свіжим реєстром — щоб ноги одного тесту не потрапляли в інший.
 func withAudioFlag(t *testing.T, on bool) {
@@ -137,7 +146,7 @@ func TestAudioFlagOffChangesNothing(t *testing.T) {
 	if n := len(mediaPorts(videoOnly, "video")); n != 1 {
 		t.Fatalf("m=video у answer: %d, want 1:\n%s", n, videoOnly)
 	}
-	if strings.Contains(strings.ToUpper(videoOnly), "PCMU") {
+	if up := strings.ToUpper(videoOnly); strings.Contains(up, "PCMU") || strings.Contains(up, "OPUS") {
 		t.Fatalf("PCMU у answer при вимкненому прапорці:\n%s", videoOnly)
 	}
 
@@ -149,7 +158,7 @@ func TestAudioFlagOffChangesNothing(t *testing.T) {
 	if ports[0] != "0" {
 		t.Fatalf("m=audio port=%s при вимкненому прапорці, want 0 (доріжку мали відхилити):\n%s", ports[0], withAudio)
 	}
-	if strings.Contains(strings.ToUpper(withAudio), "PCMU") {
+	if up := strings.ToUpper(withAudio); strings.Contains(up, "PCMU") || strings.Contains(up, "OPUS") {
 		t.Fatalf("PCMU у answer при вимкненому прапорці:\n%s", withAudio)
 	}
 
@@ -170,6 +179,7 @@ func TestAudioFlagOffChangesNothing(t *testing.T) {
 // Publisher-а тут немає навмисно — джерелом лишається запасний тон, і саме це
 // робить тест перевіркою ТРУБИ, а не джерела.
 func TestAudioFlagOnDeliversPackets(t *testing.T) {
+	withHubAudioCodec(t, opusenc.CodecPCMU)
 	withAudioFlag(t, true)
 
 	_, sdp, tracks := dialViewerLeg(t, true)
@@ -206,6 +216,7 @@ func TestAudioFlagOnDeliversPackets(t *testing.T) {
 // ТІЛЬКИ якщо вони справді проїхали від агента через readAgentAudio ->
 // forwardAudioToViewers -> audioPump, а не народились у хабі.
 func TestAgentAudioReachesViewer(t *testing.T) {
+	withHubAudioCodec(t, opusenc.CodecPCMU)
 	withAudioFlag(t, true)
 
 	// Агент і глядач мусять потрапити в ОДНУ ноду: у static-token режимі
@@ -267,6 +278,7 @@ func TestAgentAudioReachesViewer(t *testing.T) {
 // ПК без звукової карти), досі отримує тон. Це і є та перевірка тракту, заради
 // якої тон свого часу й писався.
 func TestAgentWithoutAudioFallsBackToTone(t *testing.T) {
+	withHubAudioCodec(t, opusenc.CodecPCMU)
 	withAudioFlag(t, true)
 
 	dialAgentLegWith(t, agentNodeIDEnv, false)
@@ -298,6 +310,7 @@ func TestAgentWithoutAudioFallsBackToTone(t *testing.T) {
 // тон раптом стане постійним кадром, TestAgentAudioReachesViewer почне брехати
 // («агент дійшов», хоча то тон). Дешевше перевірити тут, ніж ловити потім.
 func TestToneIsNotConstant(t *testing.T) {
+	withHubAudioCodec(t, opusenc.CodecPCMU)
 	var tone audioTone
 	for i := 0; i < 10; i++ {
 		f := tone.next()

@@ -484,6 +484,15 @@ func dialWebRTC(hubURL string, frameInterval time.Duration, onKeyframeRequest fu
 		_ = pc.Close()
 		return nil, fmt.Errorf("decode answer: %w", err)
 	}
+	// Хаб без OO_SCREEN_AUDIO відхиляє m=audio (порт 0). Opus-доріжку треба
+	// зняти ДО SetRemoteDescription, інакше pion валить усе зʼєднання (а з ним
+	// і відео) помилкою «codec is not supported by remote» — див. audio.go.
+	if atrk != nil && audioRejected(ans.SDP) {
+		if err := detachAudioTrack(pc, atrk); err != nil {
+			log.Printf("oo-agent: хаб відхилив звук, зняти доріжку не вдалось: %v", err)
+		}
+		atrk = nil
+	}
 	if err := pc.SetRemoteDescription(webrtc.SessionDescription{Type: webrtc.SDPTypeAnswer, SDP: ans.SDP}); err != nil {
 		_ = pc.Close()
 		return nil, fmt.Errorf("set remote description: %w", err)
