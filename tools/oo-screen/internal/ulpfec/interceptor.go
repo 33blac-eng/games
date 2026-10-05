@@ -42,6 +42,12 @@ type Config struct {
 	// (або потребує не менше FEC, ніж 2D-сітка), група кодується 2D-парністю
 	// (Encode2D). Типово вимкнено (OO_SCREEN_FEC_LAYOUT=2d на хабі).
 	Layout2D bool
+	// MaxRate2D — стеля m/k саме для 2D-сітки (лише з Layout2D; береться
+	// max(MaxRate, MaxRate2D)). Малі кадри (k≈10–17) мають сітку cols+rows
+	// > k/2, і з MaxRate 0.5 падали в 1D, що на 1–2 % втрат лишало кадр на
+	// NACK (RTT 200 мс = фриз). N2-стенд: 0.7 знижує фризи 2.4→0.8 (1 %) і
+	// 4.2→0.9 (2 %) с/хв ціною +2..15 % смуги.
+	MaxRate2D float64 // 0.7
 	// Window — вікно, за яке рахується частка NACK-нутих пакетів.
 	Window time.Duration // 500 мс
 	// Decay — множник оцінки за вікно, коли нові втрати менші (повільний спад:
@@ -56,6 +62,9 @@ func (c *Config) defaults() {
 	}
 	if c.MaxRate <= 0 {
 		c.MaxRate = 0.5
+	}
+	if c.MaxRate2D <= 0 {
+		c.MaxRate2D = 0.7
 	}
 	if c.Window <= 0 {
 		c.Window = 500 * time.Millisecond
@@ -285,7 +294,7 @@ func (i *Interceptor) encodeChunk(s *stream, now time.Time) {
 	}
 	p := math.Max(s.est, i.cfg.MinLoss)
 	m := FECCount(k, p, i.cfg.Target, i.cfg.MaxRate)
-	if m > 0 && i.cfg.Layout2D && use2D(k, m, p, i.cfg.Target, i.cfg.MaxRate) {
+	if m > 0 && i.cfg.Layout2D && use2D(k, m, p, i.cfg.Target, math.Max(i.cfg.MaxRate, i.cfg.MaxRate2D)) {
 		s.pending = append(s.pending, Encode2D(s.group)...)
 		s.stats.Groups2D++
 	} else if m > 0 {

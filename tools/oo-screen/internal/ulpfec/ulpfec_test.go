@@ -268,3 +268,13 @@ func TestUse2D(t *testing.T) {
 		t.Fatal("cheap 1D that meets target must stay 1D")
 	}
 }
+
+// N2: малий кадр (k=15, сітка 4+4) у 1D-стелю 0.5 не влазить, а в MaxRate2D 0.7 — так.
+func TestUse2DSmallFrameRate2D(t *testing.T) {
+	if use2D(15, 7, 0.02, 0.001, 0.5) {
+		t.Fatal("k=15: сітка 8 > 7 при стелі 0.5")
+	}
+	if !use2D(15, 7, 0.02, 0.001, 0.7) {
+		t.Fatal("k=15: сітка 8 <= 10 при стелі 0.7 має йти 2D")
+	}
+}
