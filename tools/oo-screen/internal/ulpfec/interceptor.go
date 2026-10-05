@@ -200,11 +200,14 @@ func (i *Interceptor) BindLocalStream(info *interceptor.StreamInfo, w intercepto
 			s.mu.Unlock()
 			return w.Write(h, payload, a)
 		}
+		late := s.haveIn && s.unwrap(h.SequenceNumber) <= s.lastIn
 		out := i.process(s, h, payload)
 		if s.p.HighestOut != nil {
 			s.p.HighestOut.Store(uint32(s.lastOut))
 		}
-		if s.p.OutCount != nil {
+		// Пізній/повторний вхід (ретрансмісія, дубль проби) займає вже наявний
+		// вихідний seq — у наповнення буфера NACK і preLoss його не рахуємо.
+		if s.p.OutCount != nil && !late {
 			s.p.OutCount.Add(uint64(len(out)))
 		}
 		s.mu.Unlock()
