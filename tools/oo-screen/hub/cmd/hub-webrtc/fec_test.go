@@ -34,7 +34,7 @@ func TestFECOffByDefault(t *testing.T) {
 		t.Skip("OO_SCREEN_FEC set in env")
 	}
 	m := &webrtc.MediaEngine{}
-	if err := registerFECCodecs(m); err != nil {
+	if err := registerFECCodecs(m, ""); err != nil {
 		t.Fatal(err)
 	}
 	i := &interceptor.Registry{}

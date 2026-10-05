@@ -111,6 +111,18 @@ struct oos_cap {
     int64_t cpu_maps;     /* how many times we mapped NV12 on the CPU */
 
     HRESULT last_hr;
+
+    /* Windows 7: no Desktop Duplication (IDXGIOutput1, Win8+) and no D3D11
+     * video processor. gdi_only = the whole pipeline is BitBlt -> CPU
+     * BGRA->NV12, no D3D device at all (oos_device returns NULL, so the
+     * encoder takes its software/CPU path). See gdi_only_open. */
+    int32_t gdi_only;
+    RECT gdi_desk;          /* output rectangle in virtual-desktop coords */
+    uint8_t *gdi_bgra;      /* current BitBlt image (top-down, w*4 pitch) */
+    uint8_t *gdi_prev;      /* previous one: unchanged screen -> OOS_TIMEOUT */
+    uint8_t *gdi_nv12;      /* Y plane, then interleaved UV (pitch = gdi_pitch) */
+    int32_t gdi_pitch;
+    ULONGLONG gdi_last_ms;  /* GetTickCount64 of the last grab (frame pacing) */
 };
 
 static void set_err(char *err, int32_t n, const char *what, HRESULT hr)
@@ -350,13 +362,158 @@ int oos_output_rect(int32_t idx, int32_t *left, int32_t *top, int32_t *right, in
     return OOS_OK;
 }
 
+static int gdi_draw_cursor(oos_cap *c, HDC dc, const RECT *desk);
+
+/* BT.709 limited range, the same colorimetry the DXGI video processor path
+ * advertises, so a Windows 7 PC does not look different from the others. */
+static void gdi_bgra_to_nv12(oos_cap *c)
+{
+    int32_t w = c->width, h = c->height, pitch = c->gdi_pitch, x, y;
+    int32_t ah = (h + 1) & ~1;
+    uint8_t *Y = c->gdi_nv12, *UV = c->gdi_nv12 + (size_t)pitch * (size_t)ah;
+    const uint8_t *src = c->gdi_bgra;
+    for (y = 0; y < h; y++) {
+        const uint8_t *s = src + (size_t)y * (size_t)w * 4;
+        uint8_t *d = Y + (size_t)y * (size_t)pitch;
+        for (x = 0; x < w; x++, s += 4)
+            d[x] = (uint8_t)((47 * s[2] + 157 * s[1] + 16 * s[0] + 128) / 256 + 16);
+    }
+    for (y = 0; y < ah / 2; y++) {
+        int32_t y0 = 2 * y, y1 = (2 * y + 1 < h) ? 2 * y + 1 : 2 * y;
+        const uint8_t *r0 = src + (size_t)y0 * (size_t)w * 4, *r1 = src + (size_t)y1 * (size_t)w * 4;
+        uint8_t *d = UV + (size_t)y * (size_t)pitch;
+        for (x = 0; x < w; x += 2) {
+            int32_t x1 = (x + 1 < w) ? x + 1 : x;
+            int bb = r0[x*4] + r0[x1*4] + r1[x*4] + r1[x1*4];
+            int gg = r0[x*4+1] + r0[x1*4+1] + r1[x*4+1] + r1[x1*4+1];
+            int rr = r0[x*4+2] + r0[x1*4+2] + r1[x*4+2] + r1[x1*4+2];
+            d[x]     = (uint8_t)((-26 * rr - 87 * gg + 112 * bb + 512) / 1024 + 128);
+            d[x + 1] = (uint8_t)((112 * rr - 102 * gg - 10 * bb + 512) / 1024 + 128);
+        }
+    }
+}
+
+static int gdi_only_open(oos_cap *c, char *err, int32_t err_len)
+{
+    IDXGIAdapter1 *a = NULL;
+    IDXGIOutput *o = NULL;
+    DXGI_OUTPUT_DESC od;
+    size_t n;
+    /* DXGI 1.1 enumeration exists on Windows 7: same indices as oos_open. */
+    memset(&od, 0, sizeof(od));
+    if (FAILED(default_adapter(&a)) ||
+        a->lpVtbl->EnumOutputs(a, (UINT)c->output_idx, &o) != S_OK ||
+        FAILED(o->lpVtbl->GetDesc(o, &od))) {
+        SAFE_RELEASE(o); SAFE_RELEASE(a);
+        if (c->output_idx != 0) { set_err(err, err_len, "gdi: EnumOutputs", E_FAIL); return OOS_ERROR; }
+        od.DesktopCoordinates.left = 0;
+        od.DesktopCoordinates.top = 0;
+        od.DesktopCoordinates.right = GetSystemMetrics(SM_CXSCREEN);
+        od.DesktopCoordinates.bottom = GetSystemMetrics(SM_CYSCREEN);
+    }
+    SAFE_RELEASE(o); SAFE_RELEASE(a);
+    c->gdi_desk = od.DesktopCoordinates;
+    c->width = (int32_t)(od.DesktopCoordinates.right - od.DesktopCoordinates.left);
+    c->height = (int32_t)(od.DesktopCoordinates.bottom - od.DesktopCoordinates.top);
+    if (c->width <= 0 || c->height <= 0) { set_err(err, err_len, "gdi: empty output", E_FAIL); return OOS_ERROR; }
+    c->gdi_pitch = (c->width + 15) & ~15;
+    n = (size_t)c->width * (size_t)c->height * 4;
+    c->gdi_bgra = (uint8_t *)malloc(n);
+    c->gdi_prev = (uint8_t *)calloc(1, n);
+    c->gdi_nv12 = (uint8_t *)calloc(1, (size_t)c->gdi_pitch * (size_t)((c->height + 1) & ~1) * 3 / 2);
+    if (!c->gdi_bgra || !c->gdi_prev || !c->gdi_nv12) { set_err(err, err_len, "gdi: malloc", E_OUTOFMEMORY); return OOS_ERROR; }
+    c->gdi_only = 1;
+    return OOS_OK;
+}
+
+/* One BitBlt of this output into gdi_bgra (pointer drawn unless cursor layer). */
+static int gdi_grab(oos_cap *c, char *err, int32_t err_len)
+{
+    BITMAPINFO bi;
+    HDC screen, mem;
+    HBITMAP bmp, old;
+    void *bits = NULL;
+    int ok = 0;
+    screen = GetDC(NULL);
+    if (!screen) { set_err(err, err_len, "gdi: GetDC", E_FAIL); return OOS_ACCESS_LOST; }
+    mem = CreateCompatibleDC(screen);
+    memset(&bi, 0, sizeof(bi));
+    bi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+    bi.bmiHeader.biWidth = c->width;
+    bi.bmiHeader.biHeight = -c->height;
+    bi.bmiHeader.biPlanes = 1;
+    bi.bmiHeader.biBitCount = 32;
+    bi.bmiHeader.biCompression = BI_RGB;
+    bmp = mem ? CreateDIBSection(mem, &bi, DIB_RGB_COLORS, &bits, NULL, 0) : NULL;
+    if (bmp && bits) {
+        old = (HBITMAP)SelectObject(mem, bmp);
+        if (BitBlt(mem, 0, 0, c->width, c->height, screen,
+                   c->gdi_desk.left, c->gdi_desk.top, SRCCOPY | CAPTUREBLT)) {
+            if (!c->cursor_layer) gdi_draw_cursor(c, mem, &c->gdi_desk);
+            GdiFlush();
+            memcpy(c->gdi_bgra, bits, (size_t)c->width * (size_t)c->height * 4);
+            ok = 1;
+        } else {
+            set_err(err, err_len, "gdi: BitBlt", HRESULT_FROM_WIN32(GetLastError()));
+        }
+        SelectObject(mem, old);
+    } else {
+        set_err(err, err_len, "gdi: CreateDIBSection", E_FAIL);
+    }
+    if (bmp) DeleteObject(bmp);
+    if (mem) DeleteDC(mem);
+    ReleaseDC(NULL, screen);
+    /* A secure desktop (UAC, lock screen) makes BitBlt fail: same contract as
+     * DXGI ACCESS_LOST, the Go side recreates and retries. */
+    return ok ? OOS_OK : OOS_ACCESS_LOST;
+}
+
+static void gdi_fill_frame(oos_cap *c, oos_frame *frame)
+{
+    memset(frame, 0, sizeof(*frame));
+    frame->y = c->gdi_nv12;
+    frame->y_pitch = c->gdi_pitch;
+    frame->uv = c->gdi_nv12 + (size_t)c->gdi_pitch * (size_t)((c->height + 1) & ~1);
+    frame->uv_pitch = c->gdi_pitch;
+    frame->width = c->width;
+    frame->height = c->height;
+    frame->cursor_visible = c->cur_visible;
+    frame->cursor_composited = c->cursor_in_bgra;
+    frame->cursor_shape_type = OOS_CUR_NONE;
+    frame->cursor_x = c->cur_x;
+    frame->cursor_y = c->cur_y;
+    frame->dirty_area = (int64_t)c->width * (int64_t)c->height;
+    c->cursor_in_bgra = 0;
+    c->have_image = 1;
+}
+
+/* oos_next for gdi_only: pace to timeout_ms (the agent's frame budget), grab,
+ * and report an unchanged screen as OOS_TIMEOUT so the CPU encoder is not fed
+ * the same picture 30 times a second (the agent's keepalive covers silence). */
+static int gdi_only_next(oos_cap *c, uint32_t timeout_ms, oos_frame *frame, char *err, int32_t err_len)
+{
+    ULONGLONG now = GetTickCount64();
+    size_t n = (size_t)c->width * (size_t)c->height * 4;
+    int st;
+    if (c->gdi_last_ms && now - c->gdi_last_ms < timeout_ms)
+        Sleep((DWORD)(timeout_ms - (now - c->gdi_last_ms)));
+    c->gdi_last_ms = GetTickCount64();
+    st = gdi_grab(c, err, err_len);
+    if (st != OOS_OK) return st;
+    if (c->have_image && memcmp(c->gdi_bgra, c->gdi_prev, n) == 0) return OOS_TIMEOUT;
+    memcpy(c->gdi_prev, c->gdi_bgra, n);
+    gdi_bgra_to_nv12(c);
+    gdi_fill_frame(c, frame);
+    return OOS_OK;
+}
+
 int oos_open(int32_t output_idx, oos_cap **out, char *err, int32_t err_len)
 {
     static const D3D_FEATURE_LEVEL levels[] = {
         D3D_FEATURE_LEVEL_11_1, D3D_FEATURE_LEVEL_11_0, D3D_FEATURE_LEVEL_10_1,
     };
     oos_cap *c;
-    HRESULT hr;
+    HRESULT hr = E_FAIL;
     IDXGIAdapter1 *adap = NULL;
     IDXGIOutput *o = NULL;
     ID3D10Multithread *mt = NULL;
@@ -366,6 +523,15 @@ int oos_open(int32_t output_idx, oos_cap **out, char *err, int32_t err_len)
     c = (oos_cap *)calloc(1, sizeof(oos_cap));
     if (!c) { set_err(err, err_len, "calloc", E_OUTOFMEMORY); return OOS_ERROR; }
     c->output_idx = output_idx;
+
+    /* Test/rollback switch: force the Windows 7 GDI-only pipeline anywhere. */
+    {
+        char fg[4] = {0};
+        if (GetEnvironmentVariableA("OO_SCREEN_FORCE_GDI", fg, sizeof fg) && fg[0] == '1') {
+            if (gdi_only_open(c, err, err_len) == OOS_OK) { *out = c; return OOS_OK; }
+            goto fail;
+        }
+    }
 
     hr = default_adapter(&adap);
     if (FAILED(hr)) { set_err(err, err_len, "EnumAdapters1", hr); goto fail; }
@@ -378,9 +544,12 @@ int oos_open(int32_t output_idx, oos_cap **out, char *err, int32_t err_len)
                            levels, (UINT)(sizeof(levels) / sizeof(levels[0])),
                            D3D11_SDK_VERSION, &c->dev, &got, &c->ctx);
     if (FAILED(hr)) {
+        /* Windows 7: VIDEO_SUPPORT / feature level 11_1 -> DXGI_ERROR_UNSUPPORTED
+         * or E_INVALIDARG. No duplication there anyway: GDI-only pipeline. */
+        SAFE_RELEASE(adap);
+        if (gdi_only_open(c, err, err_len) == OOS_OK) { *out = c; return OOS_OK; }
         c->last_hr = hr;
         set_err(err, err_len, "D3D11CreateDevice", hr);
-        SAFE_RELEASE(adap);
         goto fail;
     }
 
@@ -397,7 +566,12 @@ int oos_open(int32_t output_idx, oos_cap **out, char *err, int32_t err_len)
     if (FAILED(hr)) { set_err(err, err_len, "EnumOutputs", hr); goto fail; }
     hr = o->lpVtbl->QueryInterface(o, &OOS_IID_IDXGIOutput1, (void **)&c->out1);
     SAFE_RELEASE(o);
-    if (FAILED(hr)) { set_err(err, err_len, "QI IDXGIOutput1", hr); goto fail; }
+    if (FAILED(hr)) {
+        /* No IDXGIOutput1 = no Desktop Duplication (pre-Windows 8). */
+        SAFE_RELEASE(c->ctx); SAFE_RELEASE(c->dev);
+        if (gdi_only_open(c, err, err_len) == OOS_OK) { *out = c; return OOS_OK; }
+        set_err(err, err_len, "QI IDXGIOutput1", hr); goto fail;
+    }
 
     hr = make_dupl(c);
     if (FAILED(hr)) {
@@ -668,6 +842,7 @@ int oos_next(oos_cap *c, uint32_t timeout_ms, oos_frame *frame,
     int st;
 
     if (!c) { set_err(err, err_len, "no capture", E_POINTER); return OOS_ERROR; }
+    if (c->gdi_only) return gdi_only_next(c, timeout_ms, frame, err, err_len);
     if (!c->dupl) {
         /* A-17: resuming after oos_suspend — one DuplicateOutput on the SAME
          * device instead of a full pipeline (device+MFT) rebuild per resume. */
@@ -884,6 +1059,14 @@ int oos_gdi_next(oos_cap *c, oos_frame *frame, char *err, int32_t err_len)
     void *bits = NULL;
     int st = OOS_ERROR;
 
+    if (c && c->gdi_only) {
+        int gst = gdi_grab(c, err, err_len);
+        if (gst != OOS_OK) return gst;
+        memcpy(c->gdi_prev, c->gdi_bgra, (size_t)c->width * (size_t)c->height * 4);
+        gdi_bgra_to_nv12(c);
+        gdi_fill_frame(c, frame);
+        return OOS_OK;
+    }
     if (!c || !c->bgra || !c->out1) {
         set_err(err, err_len, "no pipeline", E_POINTER);
         return OOS_ERROR;
@@ -964,6 +1147,11 @@ int oos_read_bgra(oos_cap *c, uint8_t *dst, int32_t dst_pitch, char *err, int32_
     HRESULT hr;
     int32_t y;
 
+    if (c && c->gdi_only && c->have_image && dst && dst_pitch >= c->width * 4) {
+        for (y = 0; y < c->height; y++)
+            memcpy(dst + (size_t)y * (size_t)dst_pitch, c->gdi_prev + (size_t)y * (size_t)c->width * 4, (size_t)c->width * 4);
+        return OOS_OK;
+    }
     if (!c || !c->bgra || !c->have_image || !dst || dst_pitch < c->width * 4) {
         set_err(err, err_len, "read_bgra: no image", E_POINTER);
         return OOS_ERROR;
@@ -1024,6 +1212,9 @@ void oos_close(oos_cap *c)
     if (c->shape) free(c->shape);
     free(c->cur_tmp);
     if (c->meta) free(c->meta);
+    free(c->gdi_bgra);
+    free(c->gdi_prev);
+    free(c->gdi_nv12);
     free(c);
 }
 

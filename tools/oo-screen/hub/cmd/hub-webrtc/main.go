@@ -759,13 +759,13 @@ func advertiseICETCPPort(sdp string) string {
 // newAPI будує API для ОДНІЄЇ ноги. profile — profile-level-id, який ця нога
 // оголошує ("" = дефолт h264FmtpLine). Хаб не перекодовує, тож глядачеві ноди
 // оголошується рівно те, чим кодує агент САМЕ ЦІЄЇ ноди.
-func newAPI(profile string) (*webrtc.API, error) {
+func newAPI(profile string, offerSDP ...string) (*webrtc.API, error) {
 	m := &webrtc.MediaEngine{}
 	if err := m.RegisterCodec(webrtc.RTPCodecParameters{
 		RTPCodecCapability: webrtc.RTPCodecCapability{
 			MimeType:    webrtc.MimeTypeH264,
 			ClockRate:   90000,
-			SDPFmtpLine: h264FmtpFor(profile),
+			SDPFmtpLine: fecH264Fmtp(profile, strings.Join(offerSDP, "")),
 			// Без цього interceptor-ланцюг Pion не будує NACK/PLI generator+responder
 			// для нашого кастомного PT 102 — RTCPFeedback з RTPCodecParameters мапиться
 			// напряму в interceptor.RTPCodecCapability (mediaengine.go RegisterCodec ->
@@ -795,7 +795,7 @@ func newAPI(profile string) (*webrtc.API, error) {
 		return nil, err
 	}
 	// red+ulpfec — лише під OO_SCREEN_FEC (fec.go).
-	if err := registerFECCodecs(m); err != nil {
+	if err := registerFECCodecs(m, strings.Join(offerSDP, "")); err != nil {
 		return nil, err
 	}
 
@@ -1072,7 +1072,7 @@ func handleOffer(leg string) http.HandlerFunc {
 			}
 		}
 
-		api, err := newAPI(legProfile)
+		api, err := newAPI(legProfile, req.SDP)
 		if err != nil {
 			internalError(w, "newAPI", err)
 			return
@@ -1099,7 +1099,7 @@ func handleOffer(leg string) http.HandlerFunc {
 			}
 		case "viewer":
 			var err error
-			if sessionID, err = setupViewerLeg(ns, pc, viewerClaims, viewerTicket, legProfile); err != nil {
+			if sessionID, err = setupViewerLeg(ns, pc, viewerClaims, viewerTicket, legProfile, req.SDP); err != nil {
 				if errors.Is(err, errViewerCap) {
 					http.Error(w, "too many viewers for node", http.StatusTooManyRequests)
 					return
@@ -1529,7 +1529,7 @@ func setupAgentLeg(ns *nodeSession, pc *webrtc.PeerConnection) error {
 // ticket — одноразовий квиток ЦІЄЇ ноги; ним підписане кожне повідомлення
 // каналу вводу (input.go). Порожній (T1 static-token режим) = каналу вводу в
 // цієї ноги немає взагалі.
-func setupViewerLeg(ns *nodeSession, pc *webrtc.PeerConnection, claims *hub.TicketClaims, ticket, profile string) (string, error) {
+func setupViewerLeg(ns *nodeSession, pc *webrtc.PeerConnection, claims *hub.TicketClaims, ticket, profile string, offerSDP ...string) (string, error) {
 	// node-binding вже застосовано у handleOffer (вибір ns за node тікета);
 	// тут лише запам'ятовуємо user_id для runtime-revoke за user (kind="user").
 	viewerUserID := ""
@@ -1540,7 +1540,7 @@ func setupViewerLeg(ns *nodeSession, pc *webrtc.PeerConnection, claims *hub.Tick
 	trk, err := webrtc.NewTrackLocalStaticRTP(webrtc.RTPCodecCapability{
 		MimeType:    webrtc.MimeTypeH264,
 		ClockRate:   90000,
-		SDPFmtpLine: h264FmtpFor(profile),
+		SDPFmtpLine: fecH264Fmtp(profile, strings.Join(offerSDP, "")),
 	}, "video", "oo-screen-hub")
 	if err != nil {
 		return "", err

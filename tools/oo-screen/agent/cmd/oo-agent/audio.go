@@ -283,7 +283,13 @@ type audioCapturer interface {
 }
 
 // audioOpen — шов для тесту. У бою це рівно audio.New.
-var audioOpen = func() (audioCapturer, error) { return audio.New() }
+var audioOpen = func() (audioCapturer, error) {
+	c, err := audio.New()
+	if err != nil {
+		return nil, err
+	}
+	return wrapResample(c), nil // Windows 7: рідна частота пристрою -> 48 кГц
+}
 
 // runAudio — увесь життєвий цикл звуку агента. Кличеться однією горутиною з
 // main() і повертається лише разом із ctx.

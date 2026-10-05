@@ -19,6 +19,7 @@ import (
 	"os"
 	"os/signal"
 	"runtime"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -631,6 +632,31 @@ func nativeSize(c *capture.Capturer, outIdx int) (int, int) {
 		return outs[outIdx].Width, outs[outIdx].Height
 	}
 	return 1920, 1080
+}
+
+// idrUnsupported — енкодер не вміє примусовий IDR (hr=E_NOTIMPL, Windows 7).
+func idrUnsupported(err error) bool {
+	return err != nil && strings.Contains(err.Error(), "0x80004001")
+}
+
+// rebuildEncoder відкриває енкодер наново на тому самому капчері: перший кадр
+// нового енкодера — IDR. Лише з кадрового циклу (як syncEncoderToCapture).
+func (s *stream) rebuildEncoder(why string) error {
+	dev, gen := s.cap.Device(), s.cap.Generation()
+	srcW, srcH := s.cap.Size()
+	enc, w, h, sw, err := s.openEncoder(dev, gen, srcW, srcH)
+	if err != nil {
+		return err
+	}
+	if old := s.enc.Swap(enc); old != nil {
+		old.Close()
+	}
+	s.encW, s.encH, s.software = w, h, sw
+	s.applyReadback()
+	s.lastFrame = nil
+	epoch := bumpEpoch()
+	log.Printf("oo-agent: encoder rebuilt (%s): encode %dx%d, epoch=%d", why, w, h, epoch)
+	return nil
 }
 
 // syncEncoderToCapture перебудовує енкодер, якщо капчер після ACCESS_LOST
@@ -1796,6 +1822,15 @@ loop:
 		if s.wantIDR.Swap(false) && time.Since(lastIDRAt) >= idrDebounce {
 			if err := s.encoder().ForceIDR(); err != nil {
 				log.Printf("oo-agent: ForceIDR (request): %v", err)
+				// Windows 7: програмний H.264 MFT не має AVEncVideoForceKeyFrame
+				// (E_NOTIMPL). Без IDR новий глядач не дочекається першого кадру
+				// (8 с і назад у Mesh — H-PC 06.10.2026). Перший кадр щойно
+				// відкритого енкодера завжди IDR, тож перевідкриваємо його.
+				if idrUnsupported(err) {
+					if rerr := s.rebuildEncoder("IDR не підтримується енкодером"); rerr != nil {
+						log.Printf("oo-agent: rebuild encoder for IDR: %v", rerr)
+					}
+				}
 			}
 			lastIDRAt = time.Now()
 		}

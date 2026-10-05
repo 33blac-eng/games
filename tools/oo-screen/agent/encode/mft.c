@@ -36,6 +36,34 @@
 #include <strmif.h>
 #include <codecapi.h>
 #include <d3d11.h>
+
+/* Windows 7: mfplat.dll has no MFCreateDXGIDeviceManager /
+ * MFCreateDXGISurfaceBuffer (Windows 8+). A static import makes the whole
+ * agent fail to load there (STATUS_ENTRYPOINT_NOT_FOUND), so resolve them at
+ * run time; when absent the zero-copy path reports an error and the caller
+ * falls back to the CPU NV12 path. */
+typedef HRESULT (WINAPI *pfnMFCreateDXGIDeviceManager)(UINT *, IMFDXGIDeviceManager **);
+typedef HRESULT (WINAPI *pfnMFCreateDXGISurfaceBuffer)(REFIID, IUnknown *, UINT, BOOL, IMFMediaBuffer **);
+static HRESULT oos_MFCreateDXGIDeviceManager(UINT *tok, IMFDXGIDeviceManager **mgr)
+{
+    static pfnMFCreateDXGIDeviceManager fn;
+    if (!fn) {
+        HMODULE m = GetModuleHandleW(L"mfplat.dll");
+        if (!m) m = LoadLibraryW(L"mfplat.dll");
+        if (m) fn = (pfnMFCreateDXGIDeviceManager)(void *)GetProcAddress(m, "MFCreateDXGIDeviceManager");
+    }
+    return fn ? fn(tok, mgr) : E_NOTIMPL;
+}
+static HRESULT oos_MFCreateDXGISurfaceBuffer(REFIID riid, IUnknown *surf, UINT idx, BOOL bottomUp, IMFMediaBuffer **out)
+{
+    static pfnMFCreateDXGISurfaceBuffer fn;
+    if (!fn) {
+        HMODULE m = GetModuleHandleW(L"mfplat.dll");
+        if (!m) m = LoadLibraryW(L"mfplat.dll");
+        if (m) fn = (pfnMFCreateDXGISurfaceBuffer)(void *)GetProcAddress(m, "MFCreateDXGISurfaceBuffer");
+    }
+    return fn ? fn(riid, surf, idx, bottomUp, out) : E_NOTIMPL;
+}
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -1177,9 +1205,14 @@ int oos_enc_open(const oos_enc_cfg *cfg, oos_enc **out, char *err, int32_t err_l
             SAFE_RELEASE(mt);
         }
 
-        hr = MFCreateDXGIDeviceManager(&e->reset_token, &e->devmgr);
+        hr = oos_MFCreateDXGIDeviceManager(&e->reset_token, &e->devmgr);
         if (FAILED(hr)) { set_err(err, err_len, "MFCreateDXGIDeviceManager", hr);
-                          oos_enc_close(e); return OOS_ENC_ERROR; }
+                          oos_enc_close(e);
+                          /* Windows 7: no DXGI device manager at all, so the
+                           * hardware (D3D11-aware) path cannot exist here —
+                           * NOHW makes the agent take the software MFT instead
+                           * of retrying the same hardware open forever. */
+                          return hr == E_NOTIMPL ? OOS_ENC_NOHW : OOS_ENC_ERROR; }
         hr = IMFDXGIDeviceManager_ResetDevice(e->devmgr, (IUnknown *)e->dev,
                                               e->reset_token);
         if (FAILED(hr)) { set_err(err, err_len, "ResetDevice", hr);
@@ -1367,7 +1400,7 @@ int oos_enc_submit_texture(oos_enc *e, uintptr_t tex, uint64_t gen,
     }
 
     IMFMediaBuffer *mb = NULL;
-    HRESULT hr = MFCreateDXGISurfaceBuffer(&IID_ID3D11Texture2D,
+    HRESULT hr = oos_MFCreateDXGISurfaceBuffer(&IID_ID3D11Texture2D,
                                            (IUnknown *)slot, 0, FALSE, &mb);
     if (FAILED(hr)) { set_err(err, err_len, "MFCreateDXGISurfaceBuffer", hr);
                       return OOS_ENC_ERROR; }

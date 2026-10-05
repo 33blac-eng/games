@@ -23,6 +23,7 @@ package main
 
 import (
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -42,19 +43,98 @@ var (
 	fecLegs    sync.Map // media SSRC -> ulpfec.Params
 )
 
-func registerFECCodecs(m *webrtc.MediaEngine) error {
+func registerFECCodecs(m *webrtc.MediaEngine, offerSDP string) error {
 	if !fecEnabled {
 		return nil
 	}
+	// PT беремо з offer глядача. Статичні 116/117 збігались із PT, під якими
+	// Chrome пропонує rtx/H.264 (117 = H.264 4d001f): pion при неточному
+	// збігу профілю ноди (4d40xx) з профілем Chrome викидав H.264 з answer —
+	// глядач діставав 415 no_h264 (прод 05.10.2026, TestFECAnswerKeepsH264ForRealChromeOffer).
+	redPT, fecPT := fecPTsFromOffer(offerSDP)
 	for _, c := range []webrtc.RTPCodecParameters{
-		{RTPCodecCapability: webrtc.RTPCodecCapability{MimeType: "video/red", ClockRate: 90000}, PayloadType: fecRedPT},
-		{RTPCodecCapability: webrtc.RTPCodecCapability{MimeType: webrtc.MimeTypeUlpFEC, ClockRate: 90000}, PayloadType: fecUlpfecPT},
+		{RTPCodecCapability: webrtc.RTPCodecCapability{MimeType: "video/red", ClockRate: 90000}, PayloadType: redPT},
+		{RTPCodecCapability: webrtc.RTPCodecCapability{MimeType: webrtc.MimeTypeUlpFEC, ClockRate: 90000}, PayloadType: fecPT},
 	} {
 		if err := m.RegisterCodec(c, webrtc.RTPCodecTypeVideo); err != nil {
 			return err
 		}
 	}
 	return nil
+}
+
+// fecPTsFromOffer — PT red/ulpfec відеосекції offer-а; якщо їх нема (нога
+// агента, старий клієнт) — запасні fecRedPT/fecUlpfecPT.
+func fecPTsFromOffer(sdp string) (red, fec webrtc.PayloadType) {
+	red, fec = fecRedPT, fecUlpfecPT
+	inVideo := false
+	for _, raw := range strings.Split(sdp, "\n") {
+		line := strings.TrimSpace(raw)
+		if strings.HasPrefix(line, "m=") {
+			inVideo = strings.HasPrefix(line, "m=video")
+			continue
+		}
+		if !inVideo || !strings.HasPrefix(line, "a=rtpmap:") {
+			continue
+		}
+		pt, codec, ok := strings.Cut(strings.TrimPrefix(line, "a=rtpmap:"), " ")
+		if !ok {
+			continue
+		}
+		n, err := strconv.Atoi(pt)
+		if err != nil || n < 0 || n > 127 {
+			continue
+		}
+		switch strings.ToLower(codec) {
+		case "red/90000":
+			red = webrtc.PayloadType(n)
+		case "ulpfec/90000":
+			fec = webrtc.PayloadType(n)
+		}
+	}
+	return red, fec
+}
+
+// fecH264Fmtp — fmtp H.264, який хаб оголошує нозі під FEC. pion бере кодеки
+// з ТОЧНИМ збігом fmtp, а частковий (профіль ноди 4d40xx проти 4d001f Chrome)
+// лише коли точних нема. Без FEC точних нема — працює частковий; з FEC
+// red/ulpfec збігаються точно і H.264 зникає з answer (415 no_h264, прод
+// 05.10.2026). Тому під FEC беремо РЯДОК САМОГО offer-а (packetization-mode=1,
+// h264ProfileCompatible з профілем ноди): збіг точний, потік той самий —
+// глядач з тими ж/меншими constraint-прапорцями його декодує (див.
+// h264ProfileCompatible), рівень покриває level-asymmetry-allowed.
+// Без FEC, без offer-а чи без сумісного запису — h264FmtpFor(profile), як було.
+func fecH264Fmtp(profile, offerSDP string) string {
+	if !fecEnabled || offerSDP == "" {
+		return h264FmtpFor(profile)
+	}
+	want := effectiveProfile(profile)
+	rtp, fmtps, inVideo := map[string]bool{}, map[string]string{}, false
+	var order []string
+	for _, raw := range strings.Split(offerSDP, "\n") {
+		line := strings.TrimSpace(raw)
+		switch {
+		case strings.HasPrefix(line, "m="):
+			inVideo = strings.HasPrefix(line, "m=video")
+		case !inVideo:
+		case strings.HasPrefix(line, "a=rtpmap:"):
+			if pt, c, ok := strings.Cut(strings.TrimPrefix(line, "a=rtpmap:"), " "); ok && strings.HasPrefix(strings.ToUpper(c), "H264/") {
+				rtp[pt] = true
+				order = append(order, pt)
+			}
+		case strings.HasPrefix(line, "a=fmtp:"):
+			if pt, f, ok := strings.Cut(strings.TrimPrefix(line, "a=fmtp:"), " "); ok {
+				fmtps[pt] = f
+			}
+		}
+	}
+	for _, pt := range order {
+		f := fmtps[pt]
+		if fmtpParam(f, "packetization-mode") == "1" && h264ProfileCompatible(fmtpParam(f, "profile-level-id"), want) {
+			return f
+		}
+	}
+	return h264FmtpFor(profile)
 }
 
 func addFECInterceptor(i *interceptor.Registry) {
