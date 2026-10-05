@@ -161,6 +161,9 @@ type viewerLeg struct {
 	// tilesLossy — з останнього TypeKeep глядач втратив хоч один тайл: його
 	// сховище може не мати тайлів, які агент вважає утриманими (tiles.go).
 	tilesLossy atomic.Bool
+
+	// probe — поточна проба смуги цієї ноги (probe.go); nil — проби немає.
+	probe atomic.Pointer[legProbe]
 }
 
 // addViewer реєструє нову viewer-ногу ноди й піднімає її pump. Нога ще НЕ live:
@@ -536,14 +539,105 @@ func legCongestion(ns *nodeSession, vl *viewerLeg, now time.Time) congSignals {
 // стояв у циклі форвардингу. Помилка запису = ця нога мертва: рвемо ЇЇ, джерело
 // й інші глядачі не зачіпаються.
 func (vl *viewerLeg) pump(ns *nodeSession) {
+	var (
+		ring    [probeRing]*rtp.Packet // останні відправлені — джерело дублів проби
+		ringN   int
+		pc      pacer
+		paceAt  time.Time
+		ticker  *time.Ticker
+		tickC   <-chan time.Time
+		padNext int
+	)
+	defer func() {
+		if ticker != nil {
+			ticker.Stop()
+		}
+	}()
+	write := func(pkt *rtp.Packet) bool {
+		if err := vl.trk.WriteRTP(pkt); err != nil {
+			dropViewer(ns, vl, "WriteRTP: "+err.Error())
+			return false
+		}
+		return true
+	}
+	// pad дописує дублі до швидкості проби. Дублі — не «відправлені» для
+	// vl.sent (preLoss B4 і NACK_recovered_ratio рахують унікальні пакети).
+	pad := func(now time.Time) bool {
+		p := vl.probe.Load()
+		if p == nil || now.Before(p.start) || !now.Before(p.end) || p.aborted.Load() || ringN == 0 {
+			return true
+		}
+		owed := padOwed(p.bps, p.start, now, p.sentBytes.Load())
+		// Не більше за ~2 тики наперед: дублі мають іти рівно, а не сплеском.
+		maxBurst := int64(float64(p.bps) / 8 * (2 * probeTick).Seconds())
+		if owed > maxBurst {
+			owed = maxBurst
+		}
+		n := ringN
+		if n > probeRing {
+			n = probeRing
+		}
+		for owed > 0 {
+			// Найсвіжіші пакети по колу: дубль свіжого ще й страхує його втрату.
+			idx := (ringN - 1 - padNext%n) % probeRing
+			if idx < 0 {
+				idx += probeRing
+			}
+			padNext++
+			dup := ring[idx]
+			if !write(dup) {
+				return false
+			}
+			sz := uint64(pktSize(dup))
+			p.sentBytes.Add(sz)
+			p.padBytes.Add(sz)
+			owed -= int64(sz)
+		}
+		return true
+	}
 	for {
+		probeOn := vl.probe.Load() != nil
+		if probeOn && ticker == nil {
+			ticker = time.NewTicker(probeTick)
+			tickC = ticker.C
+		} else if !probeOn && ticker != nil {
+			ticker.Stop()
+			ticker, tickC = nil, nil
+		}
 		select {
 		case <-vl.done:
 			return
-		case pkt := <-vl.out:
-			if err := vl.trk.WriteRTP(pkt); err != nil {
-				dropViewer(ns, vl, "WriteRTP: "+err.Error())
+		case now := <-tickC:
+			if !pad(now) {
 				return
+			}
+		case pkt := <-vl.out:
+			if paceEnabled && len(vl.out) < paceBacklog && time.Since(vl.born) > paceWarmup {
+				now := time.Now()
+				if now.Sub(paceAt) >= paceRefreshInt {
+					pc.setRate(bitrateTarget(ns))
+					paceAt = now
+				}
+				if d := pc.wait(pktSize(pkt), now); d > 0 {
+					t := time.NewTimer(d)
+					select {
+					case <-vl.done:
+						t.Stop()
+						return
+					case <-t.C:
+					}
+				}
+			}
+			if !write(pkt) {
+				return
+			}
+			ring[ringN%probeRing] = pkt
+			ringN++
+			if p := vl.probe.Load(); p != nil {
+				now := time.Now()
+				if !now.Before(p.start) && now.Before(p.end) {
+					p.sentBytes.Add(uint64(pktSize(pkt)))
+				}
 			}
 			// lastSeq — найновіший seq у буфері ретрансмісії ЦІЄЇ ноги: рівно
 			// те, що pion назве highestAdded. Пишемо тут, а не в

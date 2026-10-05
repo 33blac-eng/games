@@ -494,6 +494,20 @@ type bitrateCtl struct {
 	// textMode — ЗАГЛУШКА під контентно-залежну стелю (contentCeiling). Нічим не
 	// виставляється й у step() не входить; агента не чіпаємо.
 	textMode bool
+
+	// --- P1: проба смуги дублікатами (probe.go) ---
+	// probeOn — режим увімкнено (OO_SCREEN_PROBE=1, дефолт вимкнено);
+	// probing/probeBps — проба йде і на яку швидкість; probeFails — невдалих
+	// поспіль (менший крок і довша пауза); probeNextAt — раніше не пробуємо;
+	// probeMuteUntil — до цього моменту сигнали затору (втрати/RTT/B4) — це
+	// наслідок НАШОЇ проби, а не відео: зрізів по них не робимо.
+	probeOn        bool
+	probing        bool
+	probeBps       uint64
+	probeFails     int
+	probeLastOK    bool // остання проба вдалась (наступна ×2); скидає зріз
+	probeNextAt    time.Time
+	probeMuteUntil time.Time
 }
 
 // Ручки швидкого відновлення. Свідомо консервативні щодо задокументованих
@@ -663,7 +677,7 @@ func contentCeiling(textMode bool, targetBps, ceilBps uint64, fps int) contentDe
 }
 
 func newBitrateCtl(startBps uint64) bitrateCtl {
-	return bitrateCtl{target: startBps, startBps: startBps, fastUp: fastRecoveryDefault}
+	return bitrateCtl{target: startBps, startBps: startBps, fastUp: fastRecoveryDefault, probeOn: probeEnabled}
 }
 
 // ceilingBps — стеля адаптації ЦІЄЇ ноди: фактичний стартовий бітрейт агента з
@@ -796,6 +810,15 @@ func (c bitrateCtl) stepSig(lossFrac float64, rttExcess time.Duration, sig congS
 		c.lossyRuns = 0
 	}
 	cong, congF := congestion(qx, sig, lowRising || c.lossyRuns >= congRises)
+	if now.Before(c.probeMuteUntil) {
+		// Проба (probe.go) щойно сама переповнила чергу: втрати, NACK і приріст
+		// RTT у цьому вікні — наші, не відео. Різати по них = платити за пробу
+		// двічі. Підйом теж не пускаємо (див. гілку «чисто» — lossFrac/excess).
+		cong, rttRising, rttHigh = false, false, false
+		if lossFrac > lossHighFrac {
+			lossFrac = lossLowFrac + 0.001 // сіра зона: тримаємо ціль
+		}
+	}
 	if cong {
 		c.congAt = now
 	}
@@ -934,6 +957,7 @@ func (c bitrateCtl) stepSig(lossFrac float64, rttExcess time.Duration, sig congS
 		}
 	} else if next < c.target {
 		c.upRun = 0
+		c.probeLastOK = false
 		c.cutFrom = c.target // рівень, де був затор: межа швидкого режиму
 		c.probeLvl = c.target
 		// Перший зріз епізоду: наступні в межах congRebaseAfter вікно не
@@ -1049,6 +1073,7 @@ func onReceiverReportSig(ns *nodeSession, lossFrac float64, jitterTicks uint32, 
 	ns.mu.Unlock()
 	if !send {
 		tryVideoBoost(ns, now)
+		maybeProbe(ns, now)
 		return
 	}
 	sendBitrateTarget(ns, next.target, lossFrac*100, jitterTicks, rttExcess, false)
