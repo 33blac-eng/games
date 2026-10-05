@@ -223,3 +223,48 @@ func TestNackDrivesEstimate(t *testing.T) {
 	}
 	t.Logf("est=%.3f overhead=%.1f%%", st.Loss, 100*float64(st.FEC)/float64(st.Media))
 }
+
+// 2D-парність рятує будь-які 2 втрати в групі (1D з тим самим бюджетом — ні).
+func TestEncode2DAnyTwoLosses(t *testing.T) {
+	r := rand.New(rand.NewSource(7))
+	const k = 25
+	var pkts [][]byte
+	for i := 0; i < k; i++ {
+		pkts = append(pkts, mkPkt(t, uint16(1000+i), 90000, i == k-1, 200+r.Intn(900), r))
+	}
+	fecs := Encode2D(pkts)
+	if c, rw := Grid2D(k); len(fecs) != c+rw {
+		t.Fatalf("fec=%d want %d", len(fecs), c+rw)
+	}
+	for a := 0; a < k; a++ {
+		for b := a + 1; b < k; b++ {
+			d := NewDecoder(0xabc)
+			for i, p := range pkts {
+				if i != a && i != b {
+					d.AddMedia(p)
+				}
+			}
+			for _, f := range fecs {
+				d.AddFEC(f)
+			}
+			if d.Recovered != 2 {
+				t.Fatalf("lost %d,%d: recovered %d", a, b, d.Recovered)
+			}
+			if string(d.media[uint16(1000+a)]) != string(pkts[a]) || string(d.media[uint16(1000+b)]) != string(pkts[b]) {
+				t.Fatalf("lost %d,%d: bytes differ", a, b)
+			}
+		}
+	}
+}
+
+func TestUse2D(t *testing.T) {
+	if use2D(3, 1, 0.02, 0.01, 0.5) {
+		t.Fatal("k<4 must stay 1D")
+	}
+	if !use2D(25, 12, 0.02, 0.01, 0.5) {
+		t.Fatal("capped 1D at 2% must switch to 2D")
+	}
+	if use2D(25, 1, 0.0001, 0.01, 0.5) {
+		t.Fatal("cheap 1D that meets target must stay 1D")
+	}
+}

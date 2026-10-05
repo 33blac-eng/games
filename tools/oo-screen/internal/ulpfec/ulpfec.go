@@ -10,6 +10,7 @@
 //
 // Маска — до 48 пакетів від SN base (L=1). Розкладка «інтерлівінг»: медіапакет
 // i групи покриває FEC (i mod m). Один FEC рятує одну втрату у своїй підгрупі.
+// Опційно (Encode2D) — 2D-парність стовпці+рядки з перекриттям масок.
 package ulpfec
 
 import (
@@ -37,12 +38,64 @@ func Encode(pkts [][]byte, m int) [][]byte {
 	if m > k {
 		m = k
 	}
-	base := binary.BigEndian.Uint16(pkts[0][2:4])
-	out := make([][]byte, 0, m)
+	covers := make([][]int, m)
 	for f := 0; f < m; f++ {
+		for i := f; i < k; i += m {
+			covers[f] = append(covers[f], i)
+		}
+	}
+	return encodeCovers(pkts, covers)
+}
+
+// Grid2D — розмір сітки для Encode2D: cols стовпців, rows рядків, cols+rows
+// FEC-пакетів на k медіа.
+func Grid2D(k int) (cols, rows int) {
+	if k <= 0 {
+		return 0, 0
+	}
+	cols = int(math.Ceil(math.Sqrt(float64(k))))
+	rows = (k + cols - 1) / cols
+	return cols, rows
+}
+
+// Encode2D — 2D-парність (OO_SCREEN_FEC_LAYOUT=2d): медіапакет i покриває
+// FEC-стовпець (i mod cols) І FEC-рядок (i / cols). Маски перекриваються,
+// тож декодер, що відновлює ітеративно (libwebrtc, Decoder.attempt), рятує
+// будь-які 2 втрати в групі і більшість 3+, на відміну від 1D-інтерлівінгу,
+// де 2 втрати в одній підгрупі — вже NACK. Повертає cols+rows payload-ів:
+// спершу стовпці, потім рядки.
+func Encode2D(pkts [][]byte) [][]byte {
+	k := len(pkts)
+	cols, rows := Grid2D(k)
+	if k == 0 {
+		return nil
+	}
+	covers := make([][]int, 0, cols+rows)
+	for c := 0; c < cols; c++ {
+		var cv []int
+		for i := c; i < k; i += cols {
+			cv = append(cv, i)
+		}
+		covers = append(covers, cv)
+	}
+	for r := 0; r < rows; r++ {
+		var cv []int
+		for i := r * cols; i < k && i < (r+1)*cols; i++ {
+			cv = append(cv, i)
+		}
+		covers = append(covers, cv)
+	}
+	return encodeCovers(pkts, covers)
+}
+
+// encodeCovers — по одному FEC-payload-у на кожен набір індексів covers.
+func encodeCovers(pkts [][]byte, covers [][]int) [][]byte {
+	base := binary.BigEndian.Uint16(pkts[0][2:4])
+	out := make([][]byte, 0, len(covers))
+	for _, idx := range covers {
 		var maxLen int
 		var cover [][]byte
-		for i := f; i < k; i += m {
+		for _, i := range idx {
 			cover = append(cover, pkts[i])
 			if l := len(pkts[i]) - rtpHeader; l > maxLen {
 				maxLen = l
@@ -264,15 +317,25 @@ func FECCount(k int, p, target, maxRate float64) int {
 		limit = k
 	}
 	for m := 1; m <= limit; m++ {
-		ok := 1.0
-		for f := 0; f < m; f++ {
-			n := (k-f+m-1)/m + 1 // медіа підгрупи + сам FEC
-			// P(≤1 втрат з n)
-			ok *= math.Pow(1-p, float64(n)) + float64(n)*p*math.Pow(1-p, float64(n-1))
-		}
-		if 1-ok <= target {
+		if Fail1D(k, p, m) <= target {
 			return m
 		}
 	}
 	return limit
+}
+
+// Fail1D — імовірність, що 1D-інтерлівінг з m FEC на k медіа не врятує
+// групу (у якійсь підгрупі ≥ 2 втрат, рахуючи сам FEC) при незалежних
+// втратах p.
+func Fail1D(k int, p float64, m int) float64 {
+	if m <= 0 {
+		return 1 - math.Pow(1-p, float64(k))
+	}
+	ok := 1.0
+	for f := 0; f < m; f++ {
+		n := (k-f+m-1)/m + 1 // медіа підгрупи + сам FEC
+		// P(≤1 втрат з n)
+		ok *= math.Pow(1-p, float64(n)) + float64(n)*p*math.Pow(1-p, float64(n-1))
+	}
+	return 1 - ok
 }

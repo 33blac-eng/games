@@ -38,6 +38,10 @@ type Config struct {
 	// MinLoss — підлога оцінки втрат: >0 тримає FEC увімкненим і на чистій
 	// лінії (захист від першої секунди нових втрат ціною накладних).
 	MinLoss float64 // 0
+	// Layout2D — коли 1D-інтерлівінг у межах MaxRate не дотягує до Target
+	// (або потребує не менше FEC, ніж 2D-сітка), група кодується 2D-парністю
+	// (Encode2D). Типово вимкнено (OO_SCREEN_FEC_LAYOUT=2d на хабі).
+	Layout2D bool
 	// Window — вікно, за яке рахується частка NACK-нутих пакетів.
 	Window time.Duration // 500 мс
 	// Decay — множник оцінки за вікно, коли нові втрати менші (повільний спад:
@@ -97,6 +101,7 @@ func (f *Factory) Last() *Interceptor {
 type Stats struct {
 	Media, FEC uint64
 	Loss       float64 // поточна оцінка втрат
+	Groups2D   uint64  // груп, закодованих 2D-парністю (Layout2D)
 }
 
 type Interceptor struct {
@@ -278,8 +283,12 @@ func (i *Interceptor) encodeChunk(s *stream, now time.Time) {
 	if k == 0 {
 		return
 	}
-	m := FECCount(k, math.Max(s.est, i.cfg.MinLoss), i.cfg.Target, i.cfg.MaxRate)
-	if m > 0 {
+	p := math.Max(s.est, i.cfg.MinLoss)
+	m := FECCount(k, p, i.cfg.Target, i.cfg.MaxRate)
+	if m > 0 && i.cfg.Layout2D && use2D(k, m, p, i.cfg.Target, i.cfg.MaxRate) {
+		s.pending = append(s.pending, Encode2D(s.group)...)
+		s.stats.Groups2D++
+	} else if m > 0 {
 		s.pending = append(s.pending, Encode(s.group, m)...)
 	}
 	s.group = s.group[:0]
@@ -382,4 +391,17 @@ func (i *Interceptor) BindRTCPReader(r interceptor.RTCPReader) interceptor.RTCPR
 		}
 		return n, attr, err
 	})
+}
+
+// use2D — чи кодувати групу з k медіа 2D-сіткою замість 1D з m FEC: сітка
+// має влазити в MaxRate, а 1D або не дотягує до target, або коштує не менше.
+func use2D(k, m int, p, target, maxRate float64) bool {
+	if k < 4 {
+		return false
+	}
+	c, r := Grid2D(k)
+	if float64(c+r) > math.Max(1, math.Floor(float64(k)*maxRate)) {
+		return false
+	}
+	return m >= c+r || Fail1D(k, p, m) > target
 }
