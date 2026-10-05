@@ -240,7 +240,7 @@ func TestLegCongestionPreLoss(t *testing.T) {
 	a.lastRR, b.lastRR = now, now
 
 	atomic.StoreUint64(&a.sent, 100)
-	legCongestion(ns, a, now) // відкрили інтервал
+	legCongestion(ns, a, 0, now) // відкрили інтервал
 	atomic.StoreUint64(&a.sent, 200)
 	ns.mu.Lock()
 	a.noteNackSeqs([]uint16{1, 2, 3, 4, 5})
@@ -248,7 +248,7 @@ func TestLegCongestionPreLoss(t *testing.T) {
 	ns.mu.Unlock()
 	notePLI(ns, a)
 	notePLI(ns, a)
-	sig := legCongestion(ns, a, now)
+	sig := legCongestion(ns, a, 0, now)
 	if sig.preLoss < 0.049 || sig.preLoss > 0.051 || sig.plis != 2 {
 		t.Fatalf("sig=%+v, want preLoss 0.05 plis 2", sig)
 	}
@@ -257,16 +257,16 @@ func TestLegCongestionPreLoss(t *testing.T) {
 	ns.mu.Lock()
 	a.noteNackSeqs([]uint16{5, 6})
 	ns.mu.Unlock()
-	if sig = legCongestion(ns, a, now); sig.preLoss < 0.009 || sig.preLoss > 0.011 || sig.plis != 0 {
+	if sig = legCongestion(ns, a, 0, now); sig.preLoss < 0.009 || sig.preLoss > 0.011 || sig.plis != 0 {
 		t.Fatalf("sig=%+v, want preLoss 0.01", sig)
 	}
 	// Найгірша нога веде: b бачить 0.01 від a.
 	atomic.StoreUint64(&b.sent, 10) // < legMinSent: інтервал b не закривається
-	if sig = legCongestion(ns, b, now); sig.preLoss < 0.009 {
+	if sig = legCongestion(ns, b, 0, now); sig.preLoss < 0.009 {
 		t.Fatalf("worst leg не врахована: %+v", sig)
 	}
 	// Протухла нога не тягне.
-	if sig = legCongestion(ns, b, now.Add(viewerRRStale+time.Second)); sig.preLoss != 0 {
+	if sig = legCongestion(ns, b, 0, now.Add(viewerRRStale+time.Second)); sig.preLoss != 0 {
 		t.Fatalf("протухла нога врахована: %+v", sig)
 	}
 }

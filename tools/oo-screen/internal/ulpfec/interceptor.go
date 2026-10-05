@@ -18,6 +18,9 @@ type Params struct {
 	// FEC-вставок він випереджає вхідний, і хто судить про буфер NACK
 	// responder-а за seq (hub nack.go), мусить дивитись сюди.
 	HighestOut *atomic.Uint32
+	// OutCount (опційно) — скільки пакетів (медіа + FEC) пішло у вихідний
+	// просторі seq: це наповнення буфера NACK responder-а, а не лише медіа.
+	OutCount *atomic.Uint64
 }
 
 // Config — налаштування генератора. Нульові поля — дефолти.
@@ -200,6 +203,9 @@ func (i *Interceptor) BindLocalStream(info *interceptor.StreamInfo, w intercepto
 		out := i.process(s, h, payload)
 		if s.p.HighestOut != nil {
 			s.p.HighestOut.Store(uint32(s.lastOut))
+		}
+		if s.p.OutCount != nil {
+			s.p.OutCount.Add(uint64(len(out)))
 		}
 		s.mu.Unlock()
 		var n int

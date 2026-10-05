@@ -503,10 +503,16 @@ func notePLI(ns *nodeSession, vl *viewerLeg) {
 // НАЙГІРШІ preLoss/plis серед свіжих ніг — те саме правило, що worstViewerRR.
 // preLoss = унікальні NACK-нуті seq / відправлені за інтервал: втрати ДО
 // ретрансмісії, яких RR FractionLost не показує (див. bitrate.go, B4).
-func legCongestion(ns *nodeSession, vl *viewerLeg, now time.Time) congSignals {
-	sent := atomic.LoadUint64(&vl.sent)
+//
+// mediaSSRC — щоб із FEC знаменник був у тому ж вихідному просторі seq, що й
+// NACK-нуті seq (legOutSent), інакше preLoss завищено на частку FEC.
+func legCongestion(ns *nodeSession, vl *viewerLeg, mediaSSRC uint32, now time.Time) congSignals {
+	sent := legOutSent(vl, mediaSSRC)
 	ns.mu.Lock()
 	defer ns.mu.Unlock()
+	if sent < vl.sentAtRR {
+		vl.sentAtRR = sent // лічильник змінився (FEC стартував) — новий відлік
+	}
 	if d := sent - vl.sentAtRR; d >= legMinSent {
 		vl.preLoss = float64(len(vl.nackSeen)) / float64(d)
 		if vl.preLoss > 1 {

@@ -1626,7 +1626,7 @@ func setupViewerLeg(ns *nodeSession, pc *webrtc.PeerConnection, claims *hub.Tick
 						loss, jitter, rttExcess := worstViewerRR(ns, vl, float64(rr.FractionLost)/256, rr.Jitter, rtt, now)
 						prev := bitrateTarget(ns)
 						// B4: втрати до ретрансмісії та PLI — RR їх не бачить.
-						sig := legCongestion(ns, vl, now)
+						sig := legCongestion(ns, vl, rr.SSRC, now)
 						onReceiverReportSig(ns, loss, jitter, rttExcess, sig, now)
 						metricsNoteBitrate(ns, prev, bitrateReason(ns), loss)
 					}

@@ -117,7 +117,9 @@ func onNack(ns *nodeSession, vl *viewerLeg, n *rtcp.TransportLayerNack, now time
 	if h, ok := fecHighestSeq(n.MediaSSRC); ok {
 		highest = h // FEC (fec.go) зсунув вихідні seq уперед
 	}
-	window := nackWindowFor(sent)
+	// Вікно — у тому ж просторі seq, що й highest: з FEC буфер responder-а
+	// тримає і медіа, і FEC, тож міряємо вихідним лічильником, не vl.sent.
+	window := nackWindowFor(legOutSent(vl, n.MediaSSRC))
 
 	var req, hit uint64
 	var seqs []uint16

@@ -107,6 +107,7 @@ func bindViewerFEC(pc *webrtc.PeerConnection) {
 			continue
 		}
 		p.HighestOut = new(atomic.Uint32)
+		p.OutCount = new(atomic.Uint64)
 		fecLegs.Store(uint32(prm.Encodings[0].SSRC), p)
 	}
 }
@@ -127,4 +128,20 @@ func fecHighestSeq(mediaSSRC uint32) (uint16, bool) {
 	}
 	x := h.Load()
 	return uint16(x), x != 0
+}
+
+// legOutSent — скільки пакетів нога реально віддала у ВИХІДНОМУ просторі seq:
+// з FEC це медіа + вставлені FEC (саме їх тримає буфер NACK responder-а і
+// саме в цьому просторі глядач шле NACK), без FEC — vl.sent.
+func legOutSent(vl *viewerLeg, mediaSSRC uint32) uint64 {
+	if fecEnabled {
+		if v, ok := fecLegs.Load(mediaSSRC); ok {
+			if c := v.(ulpfec.Params).OutCount; c != nil {
+				if n := c.Load(); n != 0 {
+					return n
+				}
+			}
+		}
+	}
+	return atomic.LoadUint64(&vl.sent)
 }
