@@ -420,3 +420,75 @@ TURN-TLS — лише якщо браузер сам піде через про�
 `deploy/monitoring/oo-screen-alerts.yml` — `rule_files` у prometheus.yml; scrape job має називатись `oo-screen-hub`
 (target = `OO_SCREEN_METRICS_ADDR`). Перевірка: `promtool check rules deploy/monitoring/oo-screen-alerts.yml`.
 Пороги — стартові, підібрати після тижня реального трафіку.
+
+## O2: резервний хаб (standby) і перемикання
+
+Стан: код агента й плеєра є, типово **вимкнено**. Перевірено лише юніт-тестами
+(Go: `agent/cmd/oo-agent/failover_test.go`; JS: `__tests__/standby.test.mjs`).
+На реальних ПК, у Chrome і з двома живими хабами **НЕ перевірялось**.
+Сесії НЕ переносяться: коли основний хаб падає, глядачі й агенти
+перепідключаються до резервного (новий ICE, новий IDR), тож обрив триває секунди.
+
+### 1. Резервний хаб
+Друга машина з тим самим `hub-webrtc` і **тими самими** секретами, інакше
+резерв відкине і агентів, і ticket-и глядачів:
+`OO_SCREEN_HUB_KEY`, `OO_SCREEN_AGENT_SECRET` (і схема токенів агентів),
+`OO_SCREEN_AGENT_AUTH`, `OO_SCREEN_ERP_BASE` (відкликання), `OO_SCREEN_RECORD_KEY`
+(якщо запис увімкнено). Власний `OO_SCREEN_PUBLIC_IP`. Хаб запущений
+постійно (warm standby): `/healthz` має віддавати `{"ok":true}`.
+
+### 2. Агент
+```
+oo-agent -hub https://hub-a.example/offer/agent ^
+         -hub-standby https://hub-b.example/offer/agent ^
+         -failover-after 3
+```
+або env `OO_HUB_STANDBY` (кілька адрес через кому). Після `-failover-after`
+невдалих dial поспіль агент робить `GET /healthz` резерву (таймаут 3 с) і
+переходить на перший здоровий. Якщо здорових нема, лишається на поточному.
+Автоматичного повернення на основний, поки резерв живий, нема (зайвий обрив);
+повернення відбувається при збої резерву. Лише `-transport webrtc`. `-multimon`
+передає прапорець дочірнім процесам.
+
+### 3. Глядач (ERP)
+У конфіг шару `createOoWebrtcLayer` додати
+`standbySignalUrls: ['https://hub-b.example/offer/viewer']`. Без нього
+робиться одна спроба, як раніше. Наступний URL пробується лише при мережевій
+помилці fetch або 502/503/504; при 4xx (ticket/ACL) — ні.
+
+### 4. nginx (варіант без змін клієнтів)
+Один публічний сигнальний вхід, nginx сам іде на резерв. Медіа (UDP/ICE-TCP)
+йде напряму на IP хаба з його SDP-кандидатів, тому проксіюється лише HTTP.
+```nginx
+upstream oo_hub {
+    server 10.0.0.11:4470 max_fails=2 fail_timeout=10s;
+    server 10.0.0.12:4470 backup;
+}
+server {
+    listen 443 ssl;
+    server_name hub.example;
+    location /offer/ {
+        proxy_pass http://oo_hub;
+        proxy_next_upstream error timeout http_502 http_503 http_504 non_idempotent;
+        proxy_next_upstream_tries 2;
+        proxy_set_header X-Forwarded-For $remote_addr;
+    }
+    location = /healthz { proxy_pass http://oo_hub; }
+}
+```
+`non_idempotent` потрібен, бо offer — це POST (без нього nginx не повторює POST
+на backup). Безпечно: відмовлений хаб ticket не спожив. Активних health-check
+у open-source nginx нема (лише пасивні `max_fails`). Додайте IP nginx у
+`OO_SCREEN_TRUSTED_PROXIES` на обох хабах.
+
+### 5. DNS (варіант без nginx)
+Один запис `hub.example` з низьким TTL (30–60 с); перемикає зовнішній
+health-checker (напр. Route53/Cloudflare health check по `/healthz`).
+Мінус: кешовані резолвери тримають старий IP довше за TTL, тому агенту краще
+явний `-hub-standby` на окремий запис `hub-b.example`.
+
+### 6. Перевірка на стенді (не виконувалась)
+1. Обидва хаби запущені, агент з `-hub-standby`, глядач підключений.
+2. `systemctl stop` основного → у лозі агента `failover: A -> B`, глядач
+   перепідключається (через `standbySignalUrls` або nginx backup).
+3. `curl https://hub-b.example/healthz` → `agents` ≥ 1.

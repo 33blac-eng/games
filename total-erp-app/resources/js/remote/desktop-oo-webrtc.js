@@ -529,6 +529,32 @@ export function offerBody(sdp, ticket, monitor) {
     return JSON.stringify({ sdp: sdp, ticket });
 }
 
+/**
+ * O2: резервний хаб для глядача. Типово ВИМКНЕНО: без config.standbySignalUrls
+ * повертає [signalUrl] — рівно одна спроба, як до O2.
+ * standbySignalUrls — масив повних URL /offer/viewer резервних хабів (ті самі
+ * ticket-секрети, див. tools/oo-screen/deploy/DEPLOY.md «O2»).
+ */
+export function signalCandidates(signalUrl, standby) {
+    const out = [signalUrl];
+    if (Array.isArray(standby)) {
+        for (const u of standby) {
+            if (typeof u === 'string' && u && !out.includes(u)) out.push(u);
+        }
+    }
+    return out;
+}
+
+/**
+ * Чи пробувати наступний хаб: мережева помилка (не Abort) або 502/503/504 від
+ * проксі перед мертвим хабом. 4xx (ticket, ACL) — НІ: резервний відповість так
+ * само.
+ */
+export function shouldFailover(err, status) {
+    if (err) return err.name !== 'AbortError';
+    return status === 502 || status === 503 || status === 504;
+}
+
 export function createOoWebrtcLayer(o) {
     const opts = o || {};
     const container = opts.container;
@@ -1069,15 +1095,26 @@ export function createOoWebrtcLayer(o) {
         const combined = combineAbortSignals(abort && abort.signal, config.offerTimeoutMs || DEFAULT_OFFER_TIMEOUT_MS);
         let resp;
         try {
-            resp = await fetch(signalUrl, {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                // offer несе ОДНОРАЗОВИЙ ticket, не довгоживучий токен.
-                // F6: monitor>0 — потік додаткового монітора (desktop-oo-multimon.js);
-                // 0/відсутнє — поле не шлемо зовсім, offer як до F6.
-                body: offerBody(peer.localDescription.sdp, ticket, config.monitor),
-                signal: combined.signal,
-            });
+            // O2: без config.standbySignalUrls — один кандидат, як раніше.
+            const urls = signalCandidates(signalUrl, config.standbySignalUrls);
+            for (let i = 0; i < urls.length; i++) {
+                const last = i === urls.length - 1;
+                try {
+                    resp = await fetch(urls[i], {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        // offer несе ОДНОРАЗОВИЙ ticket, не довгоживучий токен.
+                        // F6: monitor>0 — потік додаткового монітора (desktop-oo-multimon.js);
+                        // 0/відсутнє — поле не шлемо зовсім, offer як до F6.
+                        body: offerBody(peer.localDescription.sdp, ticket, config.monitor),
+                        signal: combined.signal,
+                    });
+                } catch (e) {
+                    if (last || !shouldFailover(e, 0)) throw e;
+                    continue;
+                }
+                if (last || !shouldFailover(null, resp.status)) break;
+            }
         } finally {
             combined.cancel();
         }

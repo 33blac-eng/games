@@ -913,6 +913,8 @@ func main() {
 	width := flag.Int("width", 0, "ширина вихідного кадру; 0 = рідна роздільність виводу (енкодер масштабує з нативної)")
 	height := flag.Int("height", 0, "висота вихідного кадру; 0 = рідна роздільність виводу")
 	output := flag.Int("output", 0, "індекс DXGI-виводу (монітора) на старті; неіснуючий клампиться до 0")
+	hubStandby := flag.String("hub-standby", os.Getenv("OO_HUB_STANDBY"), "O2: резервні hub-и через кому (webrtc, той самий формат що -hub). Порожньо = OFF (дефолт). Після -failover-after невдалих dial агент перевіряє GET /healthz резерву і переходить на здоровий. UNVERIFIED на реальних ПК")
+	failoverAfter := flag.Int("failover-after", defaultFailoverAfter, "O2: скільки невдалих dial поспіль до перевірки резервного hub-а")
 	node := flag.String("node", "", "mesh node_id цього ПК (webrtc): hub реєструє publisher-а під ним і маршрутизує viewer-ів сюди; порожнє = старий T1-режим (node з env на hub)")
 	forceSoftware := flag.Bool("force-software", false, "пропустити апаратний енум і взяти софтверний Microsoft H264 MFT (CPU NV12 sync-шлях) — для відтворення софт-шляху на машині з hw-енкодером")
 	tokenFlag := flag.String("token", "", "ЗАСТАРІЛО (видно в командному рядку): hub-токен агента; замість нього -token-file або env OO_AGENT_TOKEN")
@@ -1024,6 +1026,13 @@ func main() {
 			*hubAddr = "http://127.0.0.1:4470/offer/agent"
 		}
 	}
+
+	standbyList := *hubStandby
+	if *transportKind != "webrtc" && standbyList != "" {
+		log.Printf("oo-agent: -hub-standby підтримано лише для webrtc — ігнорую")
+		standbyList = ""
+	}
+	hubSel := newHubSelector(*hubAddr, standbyList, *failoverAfter, httpHealth)
 
 	// A-04: під -H windowsgui os.Stderr не існує — уся капчер-діагностика
 	// (recreate failed, access lost) губилась навіть із -log. Один сток.
@@ -1325,7 +1334,14 @@ func main() {
 	}
 
 	tp, err := retryUntil(ctx, "initial dial "+*hubAddr, func() (transport, error) {
-		return dial(*transportKind, *hubAddr, frameInterval, onKeyframeRequest, onGate, onBitrateTarget, onSelectOutput, onDown)
+		t, err := dial(*transportKind, hubSel.current(), frameInterval, onKeyframeRequest, onGate, onBitrateTarget, onSelectOutput, onDown)
+		if err != nil {
+			hubSel.failed(ctx)
+			return nil, err
+		}
+		hubSel.ok()
+		*hubAddr = hubSel.current()
+		return t, nil
 	})
 	if err != nil {
 		return
@@ -1529,8 +1545,11 @@ func main() {
 			tp.close()
 			tpMu.Unlock()
 
-			newTp, err := dial(*transportKind, *hubAddr, frameInterval, onKeyframeRequest, onGate, onBitrateTarget, onSelectOutput, onDown)
+			newTp, err := dial(*transportKind, hubSel.current(), frameInterval, onKeyframeRequest, onGate, onBitrateTarget, onSelectOutput, onDown)
 			if err != nil {
+				if hubSel.failed(ctx) {
+					backoff = reconnectBackoffMin // новий хаб здоровий — пробуємо одразу з короткою витримкою
+				}
 				wait := jitterBackoff(backoff)
 				log.Printf("oo-agent: reconnect failed, retry in %s: %v", wait.Round(time.Millisecond), err)
 				select {
@@ -1541,6 +1560,8 @@ func main() {
 				backoff = nextBackoff(backoff)
 				continue
 			}
+			hubSel.ok()
+			*hubAddr = hubSel.current()
 			tpMu.Lock()
 			tp = newTp
 			tpMu.Unlock()
