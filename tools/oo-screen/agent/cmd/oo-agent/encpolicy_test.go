@@ -1,0 +1,99 @@
+package main
+
+import (
+	"os"
+	"path/filepath"
+	"testing"
+	"time"
+
+	"github.com/organicoils/oo-screen/agent/encode"
+	"github.com/organicoils/oo-screen/internal/h264"
+	"github.com/organicoils/oo-screen/internal/refine"
+)
+
+func envMap(m map[string]string) func(string) string {
+	return func(k string) string { return m[k] }
+}
+
+func TestRCPolicyFromEnv(t *testing.T) {
+	if p := rcPolicyFromEnv(envMap(nil)); !p.RefineAfterIDR || p.RefineQPAware {
+		t.Fatalf("дефолт: %+v (refine після IDR — увімкнено, QP-aware — ні)", p)
+	}
+	if p := rcPolicyFromEnv(envMap(map[string]string{"OO_SCREEN_REFINE_AFTER_IDR": "0"})); p.RefineAfterIDR {
+		t.Fatal("OO_SCREEN_REFINE_AFTER_IDR=0 не вимкнув")
+	}
+	p := rcPolicyFromEnv(envMap(map[string]string{
+		"OO_SCREEN_REFINE_AFTER_IDR": "1", "OO_SCREEN_REFINE_QP_AWARE": "on",
+	}))
+	if !p.RefineAfterIDR || !p.RefineQPAware {
+		t.Fatalf("увімкнення: %+v", p)
+	}
+	if envBool(envMap(map[string]string{"X": "garbage"}), "X", true) != true {
+		t.Fatal("сміття має давати дефолт")
+	}
+	if envInt(envMap(map[string]string{"X": "60"}), "X", 7, 0, 51) != 7 {
+		t.Fatal("поза межами має давати дефолт")
+	}
+	if envInt(envMap(map[string]string{"X": "40"}), "X", 7, 0, 51) != 40 {
+		t.Fatal("ціле в межах")
+	}
+}
+
+func TestAUKindsPipelined(t *testing.T) {
+	var k auKinds
+	k.note(1, refine.Frame{Motion: true})
+	k.note(2, refine.Frame{Refine: 22})
+	if f, ok := k.take(2); !ok || f.Refine != 22 {
+		t.Fatalf("take(2) = %+v %v", f, ok)
+	}
+	if f, ok := k.take(1); !ok || !f.Motion {
+		t.Fatalf("take(1) = %+v %v", f, ok)
+	}
+	if _, ok := k.take(1); ok {
+		t.Fatal("повторний take")
+	}
+	for i := 0; i < 100; i++ {
+		k.note(time.Duration(i), refine.Frame{})
+	}
+	if len(k.m) != auKindsMax || len(k.order) != auKindsMax {
+		t.Fatalf("не обмежено: %d/%d", len(k.m), len(k.order))
+	}
+	if _, ok := k.take(0); ok {
+		t.Fatal("найстаріший не витіснено")
+	}
+}
+
+// Наскрізно: справжній потік x264 (internal/h264/testdata), AU приходять із
+// запізненням на кадр, як з апаратного MFT; refine бачить QP і пропускає
+// крок QP 22 після IDR, кращого за нього.
+func TestObserveAUsDrivesRefine(t *testing.T) {
+	b, err := os.ReadFile(filepath.Join("..", "..", "..", "internal", "h264", "testdata", "qp-abr-main.h264"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := h264.SplitAUs(b)
+	t0 := time.Unix(0, 0)
+	r := refine.New(refine.Config{QPAware: true, AfterKeyframe: true})
+	var k auKinds
+	qpr := h264.NewQPReader()
+	// Кадр 0 (IDR, QP 24) подали як рух, AU повертається з наступним Encode.
+	r.Motion(t0)
+	k.note(0, refine.Frame{Motion: true})
+	observeAUs(nil, &k, qpr, r, t0)
+	k.note(time.Second, refine.Frame{})
+	observeAUs([]encode.AU{{Data: h[0].Data, Keyframe: h[0].Keyframe, PTS: 0}}, &k, qpr, r, t0)
+	if r.WorstQP() != 24 {
+		t.Fatalf("worst %d після IDR QP 24", r.WorstQP())
+	}
+	qp, ok := r.Due(t0.Add(refine.DefaultIdle))
+	if !ok || qp != 22 {
+		t.Fatalf("refine %d %v: 22 < 24, крок потрібен", qp, ok)
+	}
+	// AU 5 — P-кадр із примусовим QP 18, поданий як refine 18.
+	k.note(5, refine.Frame{Refine: 18})
+	observeAUs([]encode.AU{{Data: h[1].Data, PTS: 99}, {Data: h[5].Data, PTS: 5}}, &k, qpr, r, t0)
+	// Невідомий PTS (99, QP 31) — рух: worst 31, далі refine 18 -> 18.
+	if r.WorstQP() != 18 {
+		t.Fatalf("worst %d після refine 18", r.WorstQP())
+	}
+}

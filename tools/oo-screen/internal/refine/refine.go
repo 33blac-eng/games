@@ -22,6 +22,18 @@ type Config struct {
 	// MinGap — мінімальна пауза між refine-кадрами (не частіше за кадровий
 	// інтервал).
 	MinGap time.Duration
+
+	// AfterKeyframe — ключовий кадр від rate control (періодичний GOP
+	// енкодера, keyframe_request нового глядача, PLI) на НЕРУХОМОМУ екрані
+	// перезаписує вже дошліфоване зображення якістю rate control, а руху, що
+	// завів би refine, нема — текст лишався мильним до наступної зміни. З
+	// прапорцем такий IDR заводить refine заново (TASK.md крок 4).
+	AfterKeyframe bool
+	// QPAware — пропускати кроки refine, що не кращі за найгірший QP, який
+	// зараз лишився на екрані (Coded стежить за ним за QP кадрів з потоку).
+	// Refine QP 22 поверх кадру з QP 16 не покращує нічого, лише коштує біт.
+	// Невідомий QP (0) — кроки не пропускаються, як без прапорця.
+	QPAware bool
 }
 
 // DefaultIdle — 200 мс простою до першого refine.
@@ -40,6 +52,19 @@ type State struct {
 	done   int       // скільки refine-кадрів уже пішло після останнього руху
 	nextAt time.Time // не раніше цього моменту — наступний refine
 	dirty  bool      // енкодер зараз у refine-налаштуваннях, їх треба зняти
+	// worst — найгірший QP, що лишився на екрані після останнього IDR /
+	// refine (0 — невідомо). Лише для QPAware.
+	worst int
+}
+
+// Frame — закодований кадр, як його бачить refine. Апаратний MFT конвеєрний:
+// AU повертається пізніше за свій кадр, тож агент зіставляє його з видом
+// кадру за PTS (agent/cmd/oo-agent, auKinds).
+type Frame struct {
+	Key    bool // AU — IDR
+	Refine int  // >0: refine-кадр, закодований із цим QP
+	Motion bool // новий вміст; false і Refine==0 — keepalive-повтор без змін
+	QP     int  // QP кадру з потоку (internal/h264.QPReader); 0 — невідомий
 }
 
 // New будує автомат; порожні поля Config беруть дефолти.
@@ -81,13 +106,58 @@ func (s *State) Wait(now time.Time, def time.Duration) time.Duration {
 	return d
 }
 
-// Due повертає QP refine-кадру, якщо саме час його кодувати.
+// Due повертає QP refine-кадру, якщо саме час його кодувати. З QPAware
+// кроки, що не кращі за найгірший QP на екрані, тут же пропускаються (без
+// кадру); якщо пропущено всі — refine завершено (Complete).
 func (s *State) Due(now time.Time) (qp int, ok bool) {
-	if !s.armed || s.done >= len(s.cfg.QPs) || now.Before(s.nextAt) {
-		return 0, false
+	for s.armed && s.done < len(s.cfg.QPs) && !now.Before(s.nextAt) {
+		q := s.cfg.QPs[s.done]
+		if s.cfg.QPAware && s.worst > 0 && q >= s.worst {
+			s.done++
+			continue
+		}
+		return q, true
 	}
-	return s.cfg.QPs[s.done], true
+	if s.done >= len(s.cfg.QPs) {
+		s.armed = false
+	}
+	return 0, false
 }
+
+// Coded — енкодер віддав AU кадру f. Оновлює найгірший QP на екрані і, з
+// AfterKeyframe, заводить refine після IDR від rate control.
+func (s *State) Coded(now time.Time, f Frame) {
+	switch {
+	case f.Key:
+		// IDR перезаписує весь екран: найгірший QP — його власний.
+		s.worst = f.QP
+		if f.Refine > 0 && f.QP == 0 {
+			s.worst = f.Refine
+		}
+		if s.cfg.AfterKeyframe && f.Refine == 0 {
+			s.armed, s.done = true, 0
+			s.nextAt = now.Add(s.cfg.Idle)
+		}
+	case f.Refine > 0:
+		q := f.Refine
+		if f.QP > 0 {
+			q = f.QP // MFT міг проігнорувати QP семпла — віримо потоку
+		}
+		if s.worst == 0 || q < s.worst {
+			s.worst = q
+		}
+	case f.Motion:
+		// Нові ділянки не кращі за свій QP; невідомий QP — невідомий і екран.
+		if f.QP == 0 {
+			s.worst = 0
+		} else if s.worst > 0 && f.QP > s.worst {
+			s.worst = f.QP
+		}
+	}
+}
+
+// WorstQP — найгірший QP на екрані за оцінкою Coded (0 — невідомо).
+func (s *State) WorstQP() int { return s.worst }
 
 // Postpone відкладає refine (транспорт зайнятий) на d, не витрачаючи кадр.
 func (s *State) Postpone(now time.Time, d time.Duration) {

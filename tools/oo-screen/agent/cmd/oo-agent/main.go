@@ -36,6 +36,7 @@ import (
 	"github.com/organicoils/oo-screen/internal/contentmode"
 	"github.com/organicoils/oo-screen/internal/control"
 	"github.com/organicoils/oo-screen/internal/cursorproto"
+	"github.com/organicoils/oo-screen/internal/h264"
 	"github.com/organicoils/oo-screen/internal/pacer"
 	"github.com/organicoils/oo-screen/internal/refine"
 	"github.com/organicoils/oo-screen/internal/swlimit"
@@ -451,6 +452,7 @@ type stream struct {
 	fps           int
 	gopSeconds    int // ТЗ 1.4: інтервал IDR у секундах (GOP = gopSeconds*fps)
 	forceSoftware bool
+	rc            rcPolicy // TASK.md крок 4: політики rate control (env, encpolicy.go)
 	logger        *slog.Logger
 
 	// Стан, який чіпає ЛИШЕ кадровий цикл (і SwitchOutput, який кличе той самий
@@ -1061,7 +1063,9 @@ func main() {
 		reqW: *width, reqH: *height, fps: effectiveFPS, gopSeconds: *gopSeconds,
 		forceSoftware: *forceSoftware, logger: logger,
 		cap: cap_, output: outIdx,
+		rc: rcPolicyFromEnv(os.Getenv),
 	}
+	log.Printf("oo-agent: rate-control policy %+v", s.rc)
 	s.bitrateBps.Store(int64(bitrateBps))
 	paceTargetBps.Store(uint64(bitrateBps))
 	// nil-guard: на паузі капчер звільнено (releaseCapture), тож на виході з
@@ -1411,6 +1415,8 @@ func main() {
 		seq uint64
 	}
 
+	rcPol := s.rc
+
 	var (
 		seq        uint64       // envelope/output frame sequence (wt only; monotonic per AU sent)
 		captureSeq uint64       // input frame counter, drives encoder PTS independent of drops/output seq
@@ -1422,7 +1428,12 @@ func main() {
 		refines    int // скільки refine-кадрів закодовано (ТЗ P4)
 		// refiner — автомат refine (internal/refine): коли рух стих, ще раз
 		// кодуємо останній кадр із нижчим QP. Лише апаратний D3D-шлях.
-		refiner = refine.New(refine.Config{MinGap: frameInterval})
+		refiner = refine.New(refine.Config{MinGap: frameInterval,
+			AfterKeyframe: rcPol.RefineAfterIDR, QPAware: rcPol.RefineQPAware})
+		// TASK.md крок 4: вид кожного поданого кадру за PTS і QP з потоку —
+		// щоб refine знав, що лишилось на екрані (encpolicy.go).
+		auKind = &auKinds{}
+		auQP   = h264.NewQPReader()
 		// Gap #2: сигнал «текстовий режим» з площі dirty/move rects. Споживач —
 		// стеля FPS (-text-fps, textfps.go): у текстовому режимі кодуємо не
 		// частіше за textModeGap; затриманий кадр дошлемо, щойно щілина
@@ -2128,8 +2139,10 @@ loop:
 				refineErrLog.Do(func() { log.Printf("oo-agent: refine restore: %v", rerr) })
 			}
 		}
+		auKind.note(encFrame.PTS, refine.Frame{Refine: refineQP, Motion: !still && refineQP == 0})
 		encStart := time.Now()
 		aus, err := s.encoder().Encode(encFrame)
+		observeAUs(aus, auKind, auQP, refiner, time.Now())
 		if err == nil && !still {
 			encSecEWMA = encEWMA(encSecEWMA, time.Since(encStart))
 		}
