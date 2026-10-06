@@ -241,6 +241,9 @@ UNVERIFIED на проді: чекліст пройдено лише юніт-т
 | `OO_SCREEN_HUB_KEY` | порожньо | ключ хаба для ERP |
 | `OO_SCREEN_REVOKE_STALE_AFTER` | `90s` | скільки терпіти недоступність ERP, перш ніж рвати сесії (fail-closed) |
 | `OO_SCREEN_REVOKE_TIMEOUT` | `8s` | таймаут одного запиту відкликань до ERP |
+| `OO_SCREEN_AUDIT_LOG` | порожньо (вимк.) | S4: журнал аудиту JSONL з хеш-ланцюгом |
+| `OO_SCREEN_AUDIT_TOKEN` | порожньо | Bearer для `GET /admin/audit` (без нього ендпоінт — 404) |
+| `OO_SCREEN_AUDIT_ANCHOR` | порожньо (вимк.) | S4: файл якоря хвоста (seq+hash останнього запису); обрізаний/переписаний журнал = хаб не стартує. Класти на інше монтування, ніж журнал |
 | `OO_SCREEN_ICE_PORT` | = `OO_SCREEN_UDP_PORT_MIN` або `4544` | єдиний UDP-порт ICE-mux |
 | `OO_SCREEN_UDP_PORT_MIN` | `4544` | легасі, дефолт для ICE_PORT |
 | `OO_SCREEN_ICE_TCP_PORT` | `0` (вимк.) | порт ICE-TCP |

@@ -3,6 +3,7 @@ package hub
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -149,5 +150,75 @@ func BenchmarkAuditAppend(b *testing.B) {
 	defer a.Close()
 	for b.Loop() {
 		_ = a.Append(AuditRecord{Event: "session_end", Node: "pc1", User: "u", Counts: map[string]int64{"input_accepted": 10}})
+	}
+}
+
+// S4, wave 8: the tail anchor catches what the chain alone cannot — a
+// truncated tail, a log rewritten from the anchor on, or a deleted log.
+func TestAuditAnchorDetectsTruncation(t *testing.T) {
+	dir := t.TempDir()
+	p, anc := filepath.Join(dir, "audit.jsonl"), filepath.Join(dir, "anchor.json")
+	var seen []uint64
+	on := func(seq uint64, _ string) { seen = append(seen, seq) }
+	a, err := OpenAuditLogAnchored(p, anc, on)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 3; i++ {
+		if err := a.Append(AuditRecord{Event: "session_start", Node: "pc1"}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	a.Close()
+	got, err := ReadAuditAnchor(anc)
+	if err != nil || got.Seq != 3 || len(seen) != 3 {
+		t.Fatalf("anchor=%+v err=%v seen=%v", got, err, seen)
+	}
+	// Clean reopen continues and moves the anchor (also re-announced on start).
+	a, err = OpenAuditLogAnchored(p, anc, on)
+	if err != nil {
+		t.Fatalf("clean reopen: %v", err)
+	}
+	_ = a.Append(AuditRecord{Event: "session_end", Node: "pc1"})
+	a.Close()
+	if got, _ := ReadAuditAnchor(anc); got.Seq != 4 {
+		t.Fatalf("anchor after reopen: %+v", got)
+	}
+	data, _ := os.ReadFile(p)
+	lines := bytes.SplitAfter(data, []byte("\n"))
+
+	// 1) Truncated tail: the chain alone still verifies.
+	if err := os.WriteFile(p, bytes.Join(lines[:2], nil), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := VerifyAuditFile(p); err != nil {
+		t.Fatalf("precondition: truncated chain must still self-verify: %v", err)
+	}
+	if _, err := OpenAuditLogAnchored(p, anc, nil); !errors.Is(err, ErrAuditTruncated) {
+		t.Fatalf("truncated tail not detected: %v", err)
+	}
+	// 2) Rewritten from the anchor on: same length, different tail.
+	_ = os.WriteFile(p, bytes.Join(lines[:3], nil), 0o600)
+	b, _ := OpenAuditLog(p)
+	_ = b.Append(AuditRecord{Event: "session_end", Node: "forged"})
+	b.Close()
+	if _, err := OpenAuditLogAnchored(p, anc, nil); !errors.Is(err, ErrAuditTruncated) {
+		t.Fatalf("rewritten tail not detected: %v", err)
+	}
+	// 3) Log deleted.
+	_ = os.Remove(p)
+	if _, err := OpenAuditLogAnchored(p, anc, nil); !errors.Is(err, ErrAuditTruncated) {
+		t.Fatalf("deleted log not detected: %v", err)
+	}
+	// Garbage anchor = error, not a silent reset.
+	_ = os.WriteFile(anc, []byte("{}"), 0o600)
+	if _, err := OpenAuditLogAnchored(p, anc, nil); err == nil {
+		t.Fatal("broken anchor accepted")
+	}
+	// No anchor configured: behaviour of OpenAuditLog.
+	if a, err := OpenAuditLogAnchored(filepath.Join(dir, "x.jsonl"), "", nil); err != nil || a.anchor != "" {
+		t.Fatalf("no-anchor mode: %v", err)
+	} else {
+		a.Close()
 	}
 }

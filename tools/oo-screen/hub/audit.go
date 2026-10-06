@@ -3,8 +3,15 @@
 // попереднього) і hash = sha256(prev || JSON запису з порожнім hash).
 // Переписати/видалити/вставити рядок посередині файлу можна, але Verify це
 // побачить на першому ж зламаному рядку. Обрізання ХВОСТА ланцюг сам по собі
-// не ловить — для цього адмін зберігає останній hash/seq деінде (ponytail:
-// періодичний якір у зовнішнє сховище).
+// не ловить — для цього ЯКІР (хвиля 8, OO_SCREEN_AUDIT_ANCHOR=<файл>, дефолт
+// вимкнено): після кожного запису хаб атомарно (tmp+rename, fsync) пише в
+// окремий файл {"seq","hash"} останнього запису і той самий рядок — у журнал
+// процесу (journald — друге, незалежне від файлу аудиту сховище). На старті
+// ланцюг мусить ДОСЯГАТИ seq якоря і мати на ньому той самий hash, інакше
+// хаб не стартує: обрізаний хвіст (або переписаний з того місця журнал)
+// виявляється. Якір варто класти на інший диск/монтування, ніж журнал; той,
+// хто може переписати обидва файли, якір обходить — тоді лишається журнал
+// процесу (порівняти вручну: `journalctl | grep "audit anchor"`).
 //
 // Увімкнення: OO_SCREEN_AUDIT_LOG=<шлях> (дефолт — вимкнено, як і решта нових
 // функцій). Читання: GET /admin/audit з Authorization: Bearer
@@ -70,6 +77,111 @@ type AuditLog struct {
 	seq  uint64
 	last string
 	now  func() time.Time
+	// anchor — файл якоря ("" — вимкнено); onAnchor — куди ще віддати якір
+	// (журнал процесу), nil — нікуди.
+	anchor   string
+	onAnchor func(seq uint64, hash string)
+}
+
+// AuditAnchor — якір хвоста ланцюга.
+type AuditAnchor struct {
+	Seq  uint64 `json:"seq"`
+	Hash string `json:"hash"`
+}
+
+// ErrAuditTruncated — ланцюг коротший за якір або розходиться з ним.
+var ErrAuditTruncated = errors.New("audit: ланцюг не досягає якоря (обрізано хвіст або переписано)")
+
+// ReadAuditAnchor читає якір; файлу нема — нульовий якір без помилки.
+func ReadAuditAnchor(path string) (AuditAnchor, error) {
+	var a AuditAnchor
+	b, err := os.ReadFile(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return a, nil
+	}
+	if err != nil {
+		return a, err
+	}
+	if err := json.Unmarshal(b, &a); err != nil {
+		return a, fmt.Errorf("audit anchor %s: %w", path, err)
+	}
+	if a.Seq == 0 || len(a.Hash) != len(AuditGenesis) {
+		return a, fmt.Errorf("audit anchor %s: порожній або битий", path)
+	}
+	return a, nil
+}
+
+// writeAuditAnchor — атомарно (tmp у тому ж каталозі + fsync + rename).
+func writeAuditAnchor(path string, a AuditAnchor) error {
+	b, err := json.Marshal(a)
+	if err != nil {
+		return err
+	}
+	tmp := path + ".tmp"
+	f, err := os.OpenFile(tmp, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600)
+	if err != nil {
+		return err
+	}
+	if _, err := f.Write(append(b, '\n')); err != nil {
+		f.Close()
+		return err
+	}
+	if err := f.Sync(); err != nil {
+		f.Close()
+		return err
+	}
+	if err := f.Close(); err != nil {
+		return err
+	}
+	return os.Rename(tmp, path)
+}
+
+// OpenAuditLogAnchored — OpenAuditLog плюс якір хвоста anchorPath ("" —
+// як OpenAuditLog). Ланцюг, що не досягає якоря або має на його seq інший
+// hash, — ErrAuditTruncated. Немає файлу якоря — перший запуск з якорем:
+// якір ставиться на поточний хвіст (і віддається onAnchor).
+func OpenAuditLogAnchored(path, anchorPath string, onAnchor func(seq uint64, hash string)) (*AuditLog, error) {
+	if anchorPath == "" {
+		return OpenAuditLog(path)
+	}
+	anc, err := ReadAuditAnchor(anchorPath)
+	if err != nil {
+		return nil, err
+	}
+	if anc.Seq > 0 {
+		var at string
+		f, err := os.Open(path)
+		if err != nil {
+			return nil, fmt.Errorf("%w: якір seq %d, журналу нема: %v", ErrAuditTruncated, anc.Seq, err)
+		}
+		seq, _, verr := verifyAudit(f, func(s uint64, h string) {
+			if s == anc.Seq {
+				at = h
+			}
+		})
+		f.Close()
+		if verr != nil {
+			return nil, verr
+		}
+		if seq < anc.Seq || subtle.ConstantTimeCompare([]byte(at), []byte(anc.Hash)) != 1 {
+			return nil, fmt.Errorf("%w: якір seq %d, у журналі %d записів", ErrAuditTruncated, anc.Seq, seq)
+		}
+	}
+	a, err := OpenAuditLog(path)
+	if err != nil {
+		return nil, err
+	}
+	a.anchor, a.onAnchor = anchorPath, onAnchor
+	if a.seq > 0 {
+		if err := writeAuditAnchor(anchorPath, AuditAnchor{Seq: a.seq, Hash: a.last}); err != nil {
+			a.Close()
+			return nil, err
+		}
+		if onAnchor != nil {
+			onAnchor(a.seq, a.last)
+		}
+	}
+	return a, nil
 }
 
 // OpenAuditLog відкриває (або створює) журнал і перевіряє весь наявний
@@ -118,6 +230,16 @@ func (a *AuditLog) Append(r AuditRecord) error {
 		return err
 	}
 	a.seq, a.last = r.Seq, h
+	if a.anchor != "" {
+		// Запис уже на диску; якір відстає щонайбільше на цей рядок, і
+		// старт це переживе (ланцюг довший за якір — норма).
+		if err := writeAuditAnchor(a.anchor, AuditAnchor{Seq: r.Seq, Hash: h}); err != nil {
+			return err
+		}
+		if a.onAnchor != nil {
+			a.onAnchor(r.Seq, h)
+		}
+	}
 	return nil
 }
 
@@ -141,6 +263,11 @@ func VerifyAuditFile(path string) (uint64, string, error) {
 
 // VerifyAudit — те саме над довільним потоком.
 func VerifyAudit(rd io.Reader) (uint64, string, error) {
+	return verifyAudit(rd, nil)
+}
+
+// verifyAudit — VerifyAudit з колбеком на кожен перевірений запис.
+func verifyAudit(rd io.Reader, each func(seq uint64, hash string)) (uint64, string, error) {
 	sc := bufio.NewScanner(rd)
 	sc.Buffer(make([]byte, 64*1024), 1<<20)
 	prev, seq := AuditGenesis, uint64(0)
@@ -169,6 +296,9 @@ func VerifyAudit(rd io.Reader) (uint64, string, error) {
 			return seq, prev, fmt.Errorf("audit line %d: hash mismatch (record altered)", line)
 		}
 		prev, seq = r.Hash, r.Seq
+		if each != nil {
+			each(seq, prev)
+		}
 	}
 	if err := sc.Err(); err != nil {
 		return seq, prev, err

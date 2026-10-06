@@ -23,7 +23,11 @@ func startAudit(mux *http.ServeMux) {
 	if path == "" {
 		return
 	}
-	a, err := hub.OpenAuditLog(path)
+	// Хвиля 8: якір хвоста (OO_SCREEN_AUDIT_ANCHOR) — обрізаний журнал =
+	// хаб не стартує; кожен якір ще й рядком у журнал процесу.
+	a, err := hub.OpenAuditLogAnchored(path, os.Getenv("OO_SCREEN_AUDIT_ANCHOR"), func(seq uint64, hash string) {
+		log.Printf("audit anchor seq=%d hash=%s", seq, hash)
+	})
 	if err != nil {
 		log.Fatalf("hub-webrtc: audit log %s: %v", path, err)
 	}
