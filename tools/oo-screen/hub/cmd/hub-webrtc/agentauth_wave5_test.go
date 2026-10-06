@@ -19,7 +19,7 @@ func clearAgentAuthEnv(t *testing.T) {
 func TestWave5SecretFile(t *testing.T) {
 	clearAgentAuthEnv(t)
 	p := filepath.Join(t.TempDir(), "master")
-	if err := os.WriteFile(p, []byte("file-master-0123456789\n"), 0o600); err != nil {
+	if err := os.WriteFile(p, []byte("file-master-0123456789-abcdef0123456789\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	t.Setenv("OO_SCREEN_AGENT_SECRET_FILE", p)
@@ -27,7 +27,7 @@ func TestWave5SecretFile(t *testing.T) {
 	if err := agentAuthConfigError(); err != nil {
 		t.Fatalf("валідна конфігурація: %v", err)
 	}
-	if !agentAuthorized("pc1", hub.NodeToken("file-master-0123456789", "pc1")) {
+	if !agentAuthorized("pc1", hub.NodeToken("file-master-0123456789-abcdef0123456789", "pc1")) {
 		t.Fatal("токен від master-файлу відхилено")
 	}
 	if agentAuthorized("pc1", token) {

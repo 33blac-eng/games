@@ -135,6 +135,36 @@ sudo sh -c 'umask 077; grep ^OO_SCREEN_AGENT_SECRET= /etc/oo-screen/hub.env | cu
 `OO_SCREEN_AGENT_SECRET` (або з ним == `OO_SCREEN_T1_TOKEN`) токени нод НЕ приймає
 (ERROR у журналі) — крок 1 обовʼязковий.
 
+### 6.1 S1: чекліст увімкнення strict на проді (хвиля 8)
+
+Хаб сам перевіряє більшість пунктів на старті (`log.Fatal` у strict, WARNING
+без нього); `hub-webrtc -check-config` робить ту саму перевірку з поточним env
+і виходить (код 0 — хаб стартує, 1 — ні), нічого не слухаючи.
+
+| # | Що | Як перевірити | Хаб сам |
+|---|---|---|---|
+| 1 | Окремий master ≥ 32 символи, згенерований | `oo-node-token -gen-secret > /etc/oo-screen/agent-master` (64 hex) | strict: < 32 символів або == T1 — не стартує; інакше WARNING |
+| 2 | Master файлом, не env | `OO_SCREEN_AGENT_SECRET_FILE=/etc/oo-screen/agent-master`, `OO_SCREEN_AGENT_SECRET` прибрано з `hub.env` | strict + env — WARNING (видно в `/proc/<pid>/environ`) |
+| 3 | Права файлу master | `chown oo-hub: …; chmod 600 …` | strict: група/всі можуть читати — не стартує; інакше WARNING; нечитний — не стартує |
+| 4 | Токени всім нодам | `oo-node-token -secret-file … -nodes-file nodes.txt > tokens.tsv` (битий id — код 1); вибірково `-verify` | — |
+| 5 | Легасі зник | `journalctl -u oo-hub --since -24h \| grep -c "легасі-токені"` = 0 | WARNING раз на ноду |
+| 6 | Перевірка конфігурації ДО рестарту | `sudo -u oo-hub env $(cat /etc/oo-screen/hub.env \| xargs) OO_SCREEN_AGENT_AUTH=strict ./hub-webrtc -check-config` | той самий код, що на старті |
+| 7 | Увімкнути | `OO_SCREEN_AGENT_AUTH=strict` у `hub.env`, `systemctl restart oo-hub`; у журналі `agent-auth: strict (лише токени нод); master=окремий` і жодного `WARNING agent-auth:` | рядок режиму на старті |
+| 8 | Після | `/nodes` — усі ноди на місці; `OO_SCREEN_LEGACY_AGENT_TOKEN` у `hub.env` нема | strict + `_LEGACY_AGENT_TOKEN=1` — WARNING |
+| 9 | Ротація master (за потреби) | новий файл master, старий → `OO_SCREEN_AGENT_SECRET_PREV`; перевипуск токенів; прибрати `_PREV`, коли зникнуть WARNING «СТАРОГО master» | `_PREV` == master — WARNING |
+| 10 | Відкликання одного ПК (вкрадений/списаний) | рядок `node_id` у файлі `OO_SCREEN_AGENT_REVOKED_FILE` (по одному на рядок, `#` — коментар) | перечитується на зміну за ≤ 2 с без рестарту; не читається/битий на старті — хаб не стартує; зіпсувався під час роботи — лишається попередній список (ERROR) |
+
+Про пункт 10: токен ноди детермінований (`HMAC(master, node_id)`), тож
+відкликання діє на node_id, а не на окремий токен: повернути ПК у парк — новий
+`node_id` (або прибрати рядок, якщо ПК довірений). Відкликання не рве вже живу
+агентську ногу — для негайного обриву є runtime-revoke ERP `kind="node"`.
+Потоки додаткових моніторів (`<node>#m<i>`) і P2P-пол агента авторизуються
+тією самою нодою, тож відкликаються разом із нею.
+
+UNVERIFIED на проді: чекліст пройдено лише юніт-тестами
+(`agentauth_harden_test.go`, `agentauth_wave5_test.go`) і `-check-config` на
+стенді; на живому парку strict не вмикався.
+
 ### 4.1 O4: поетапна викатка через автооновлення (канарка, ворота, зупинка)
 
 Альтернатива ручному `agent-deploy.ps1` для агентів, зібраних з
@@ -203,6 +233,9 @@ sudo sh -c 'umask 077; grep ^OO_SCREEN_AGENT_SECRET= /etc/oo-screen/hub.env | cu
 | `OO_SCREEN_AGENT_SECRET` **нова** | = `OO_SCREEN_T1_TOKEN` | master для токенів нод (HMAC) |
 | `OO_SCREEN_AGENT_AUTH` **нова** | (не strict) | `strict` — лише токени нод, легасі-токен відхиляється |
 | `OO_SCREEN_LEGACY_AGENT_TOKEN` **нова** | вимк. | `1` — дозволити легасі-токен навіть при strict (аварійно) |
+| `OO_SCREEN_AGENT_SECRET_FILE` | порожньо | master файлом (читається раз на старті; права 0600 — у strict обовʼязково) |
+| `OO_SCREEN_AGENT_SECRET_PREV` | порожньо | старий master на час ротації (його токени приймаються з WARNING) |
+| `OO_SCREEN_AGENT_REVOKED_FILE` | порожньо | список відкликаних node_id (§6.1 п.10) |
 | `OO_SCREEN_AGENT_NODE_ID` | порожньо | node для старого агента без `-node` |
 | `OO_SCREEN_ERP_BASE` | порожньо | URL ERP; непорожній вмикає ticket-режим для глядачів |
 | `OO_SCREEN_HUB_KEY` | порожньо | ключ хаба для ERP |

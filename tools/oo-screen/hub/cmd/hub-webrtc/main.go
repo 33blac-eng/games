@@ -2462,6 +2462,16 @@ func main() {
 		log.Fatal("hub-webrtc: ", err)
 	}
 	log.Print(agentAuthModeSummary())
+	for _, w := range agentAuthWarnings() {
+		log.Print("WARNING agent-auth: ", w)
+	}
+	// S1 (хвиля 8): `hub-webrtc -check-config` — та сама перевірка, що й на
+	// старті (токен, strict, master, права, файл відкликань), без слухачів:
+	// код 0 — хаб із цим env стартує; помилка — log.Fatal вище (код 1).
+	if len(os.Args) > 1 && os.Args[1] == "-check-config" {
+		log.Print("hub-webrtc: check-config OK")
+		return
+	}
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	startRevokeSubscription(ctx)
