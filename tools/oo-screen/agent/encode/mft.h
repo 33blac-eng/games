@@ -139,6 +139,7 @@ void oos_enc_headers(oos_enc *e, const uint8_t **out, int32_t *len);
 /* Diagnostics for the gate report. */
 const char *oos_enc_name(oos_enc *e);     /* MFT friendly name */
 const char *oos_enc_cfg_report(oos_enc *e); /* A-14: knobs the MFT refused ("" = none) */
+const char *oos_enc_caps_report(oos_enc *e); /* C2: "Name=M|S|-" per probed CODECAPI property */
 int32_t oos_enc_is_async(oos_enc *e);     /* 1 when async MFT */
 int32_t oos_enc_is_hardware(oos_enc *e);  /* 1 when a hardware MFT (MFTEnumEx HARDWARE) */
 int32_t oos_enc_is_d3d(oos_enc *e);       /* 1 when the DXGI zero-copy path is live */

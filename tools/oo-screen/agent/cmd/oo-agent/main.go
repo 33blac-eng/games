@@ -1443,13 +1443,20 @@ func main() {
 		keepalives int // скільки разів переслали останній кадр (нерухомий екран)
 		refines    int // скільки refine-кадрів закодовано (ТЗ P4)
 		// refiner — автомат refine (internal/refine): коли рух стих, ще раз
-		// кодуємо останній кадр із нижчим QP. Лише апаратний D3D-шлях.
-		refiner = refine.New(refine.Config{MinGap: frameInterval,
-			AfterKeyframe: rcPol.RefineAfterIDR, QPAware: rcPol.RefineQPAware})
+		// кодуємо останній кадр із нижчим QP. Апаратний шлях; софтверний — лише з
+		// OO_SCREEN_REFINE_SOFTWARE (Q-10, refineAllowed).
+		refiner = refine.New(refineConfig(rcPol, frameInterval, int(s.bitrateBps.Load())))
+		// C3: правило великого кадру — які межі QP зараз стоять на якому
+		// енкодері (largeQP 0 — межі політики).
+		largeQP    int
+		largeQPEnc *encode.Encoder
 		// TASK.md крок 4: вид кожного поданого кадру за PTS і QP з потоку —
 		// щоб refine знав, що лишилось на екрані (encpolicy.go).
 		auKind = &auKinds{}
 		auQP   = h264.NewQPReader()
+		// C2: QP кадрів за вікно статистики -> enc_stats хабу (nil — вимкнено).
+		encQPW      *qpWindow
+		encStatsSeq uint64
 		// OO_SCREEN_IDLE_IDR: періодичний IDR — у тиші, а не посеред руху
 		// (internal/keyframe). nil — вимкнено, IDR ставить GOP MFT як раніше.
 		kfPol *keyframe.Policy
@@ -1501,6 +1508,10 @@ func main() {
 		tpMu        sync.Mutex // guards tp across reconnects; the single ordered sender goroutine reads it under this lock
 		sendQueue   = make(chan sendJob, 8)
 	)
+	if rcPol.EncTelemetry {
+		encQPW = &qpWindow{}
+		log.Printf("oo-agent: enc telemetry on: CODECAPI %s", s.encoder().CodecAPICaps())
+	}
 	if rcPol.IdleIDR {
 		kfPol = keyframe.New(keyframe.Config{GOPFrames: gopFrames(s.gopSeconds, s.fps)})
 	}
@@ -1893,7 +1904,13 @@ loop:
 		//
 		// Refine (ТЗ P4) лише вкорочує цей дедлайн: якщо рух стих, прокидаємось
 		// у мить, коли час refine, а не через повний keepaliveAfter.
-		refineOn := *refineFlag && !s.software && !gatePaused.Load() && s.lastFrame != nil
+		// Q-10: на софтверному MFT — лише з OO_SCREEN_REFINE_SOFTWARE і поки
+		// swlimit має запас CPU (refineAllowed).
+		swLoad, haveSWLoad := 0.0, false
+		if swPol != nil && swPolEnc == s.encoder() {
+			swLoad, haveSWLoad = swPol.Load(), true
+		}
+		refineOn := *refineFlag && refineAllowed(rcPol, s.software, swLoad, haveSWLoad) && !gatePaused.Load() && s.lastFrame != nil
 		if !refineOn {
 			refiner.Disarm()
 		}
@@ -2161,6 +2178,27 @@ loop:
 			// СТАРІЙ текстурі, якщо перебудований капчер отримав ту саму адресу.
 			encFrame.TextureGen = frame.TextureGen
 		}
+		// C3: великий кадр на вузькому каналі — одразу високий MinQP (дешевий
+		// кадр без стрибка HRD), якість доведе refine. Будь-який інший кадр
+		// повертає межі політики ДО SetRefineQP (той відновлює MinQP саме з них).
+		if rcPol.LargeFrameQP > 0 {
+			if largeQPEnc != s.encoder() {
+				largeQPEnc, largeQP = s.encoder(), 0
+			}
+			lmin, lmax, large := largeFrameBounds(rcPol, !still && refineQP == 0, textCF, int(s.bitrateBps.Load()), s.encW*s.encH)
+			want := lmin
+			if !large {
+				want = 0
+				lmin, lmax, _ = qpBounds(rcPol)
+			}
+			if want != largeQP {
+				if lerr := s.encoder().SetQPBounds(lmin, lmax); lerr != nil {
+					log.Printf("oo-agent: large-frame QP: %v — правило вимкнено", lerr)
+					rcPol.LargeFrameQP = 0
+				}
+				largeQP = want
+			}
+		}
 		if refineQP > 0 {
 			if rerr := s.encoder().SetRefineQP(refineQP); rerr != nil {
 				// MaxQP відмовлено — per-sample QP усе одно стоїть; логуємо раз.
@@ -2196,7 +2234,7 @@ loop:
 		auKind.note(encFrame.PTS, refine.Frame{Refine: refineQP, Motion: !still && refineQP == 0})
 		encStart := time.Now()
 		aus, err := s.encoder().Encode(encFrame)
-		observeAUs(aus, auKind, auQP, refiner, kfPol, time.Now())
+		observeAUs(aus, auKind, auQP, refiner, kfPol, time.Now(), encQPW)
 		if timeGOP != nil {
 			timeGOP.Coded(time.Now(), hasKeyframe(aus))
 		}
@@ -2261,6 +2299,16 @@ loop:
 		}
 
 		if time.Since(lastLog) >= 5*time.Second {
+			if encQPW != nil {
+				encStatsSeq++
+				m := encQPW.encStatsMsg(encStatsSeq, s.encoder().Name(), s.software, s.encoder().CodecAPICaps())
+				tpMu.Lock()
+				cur := tp
+				tpMu.Unlock()
+				if cs, ok := cur.(ctlSender); ok {
+					_ = cs.sendCtl(m)
+				}
+			}
 			log.Printf("oo-agent: sent=%d dropped=%d keepalives=%d refines=%d throttled=%d", sent.Load(), dropped.Load(), keepalives, refines, throttled)
 			dropped.Store(0)
 			lastLog = time.Now()

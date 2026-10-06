@@ -5,6 +5,7 @@ import (
 	"time"
 
 	"github.com/organicoils/oo-screen/agent/encode"
+	"github.com/organicoils/oo-screen/internal/control"
 	"github.com/organicoils/oo-screen/internal/h264"
 	"github.com/organicoils/oo-screen/internal/keyframe"
 	"github.com/organicoils/oo-screen/internal/refine"
@@ -41,6 +42,28 @@ type rcPolicy struct {
 	// — справжнім IDR. Типово вимкнено: чи вміє це конкретний MFT і як Chrome
 	// стартує з такого потоку — UNVERIFIED.
 	IntraRefresh int
+	// EncTelemetry — C2: раз на вікно статистики слати хабу enc_stats (ім'я
+	// MFT, підтримка CODECAPI-властивостей, QP кадрів з потоку).
+	// OO_SCREEN_ENC_TELEMETRY, типово вимкнено.
+	EncTelemetry bool
+	// RefineConverge — C3: top-off до збіжності (refine.Config.Converge):
+	// після кроків 22/18 слати ще refine-кадри з RefineTargetQP, доки QP з
+	// потоку гірший за ціль (до 4 кадрів, бюджет RefineBudget байтів на
+	// епізод). OO_SCREEN_REFINE_CONVERGE, типово вимкнено.
+	RefineConverge bool
+	// RefineTargetQP — ціль збіжності. OO_SCREEN_REFINE_TARGET_QP (дефолт 16).
+	RefineTargetQP int
+	// RefineBudgetKB — бюджет епізоду, КБ; 0 — одна секунда -bitrate.
+	// OO_SCREEN_REFINE_BUDGET_KB.
+	RefineBudgetKB int
+	// LargeFrameQP — C3, правило великого кадру (refine.LargeFrameMinQP): MinQP
+	// для кадру, що змінив ≥ половини екрана при малому HRD-бюджеті; якість
+	// потім доводить refine. OO_SCREEN_LARGE_FRAME_QP, 0 — вимкнено (типово).
+	LargeFrameQP int
+	// RefineSoftware — Q-10: refine і на софтверному MFT, поки EWMA
+	// internal/swlimit має запас (refineAllowed). OO_SCREEN_REFINE_SOFTWARE,
+	// типово вимкнено: CPU на 2–4 ядрах ще треба заміряти.
+	RefineSoftware bool
 }
 
 // envBool: "1"/"true"/"on" — так, "0"/"false"/"off" — ні, інше — def.
@@ -74,6 +97,12 @@ func rcPolicyFromEnv(getenv func(string) string) rcPolicy {
 		QPMin:          envInt(getenv, "OO_SCREEN_QP_MIN", 0, 0, 51),
 		QPMax:          envInt(getenv, "OO_SCREEN_QP_MAX", 0, 0, 51),
 		IntraRefresh:   envInt(getenv, "OO_SCREEN_INTRA_REFRESH", 0, 0, 3600),
+		EncTelemetry:   envBool(getenv, "OO_SCREEN_ENC_TELEMETRY", false),
+		RefineConverge: envBool(getenv, "OO_SCREEN_REFINE_CONVERGE", false),
+		RefineTargetQP: envInt(getenv, "OO_SCREEN_REFINE_TARGET_QP", refine.DefaultTargetQP, 1, 51),
+		RefineBudgetKB: envInt(getenv, "OO_SCREEN_REFINE_BUDGET_KB", 0, 0, 1<<20),
+		LargeFrameQP:   envInt(getenv, "OO_SCREEN_LARGE_FRAME_QP", 0, 0, 51),
+		RefineSoftware: envBool(getenv, "OO_SCREEN_REFINE_SOFTWARE", false),
 	}
 }
 
@@ -141,7 +170,7 @@ func (k *auKinds) take(pts time.Duration) (refine.Frame, bool) {
 // (за PTS), чи це IDR і його QP з потоку. Невідомий PTS (кадр до перебудови
 // енкодера) рахується рухом — так безпечніше: невідомий QP не дає
 // QPAware пропустити refine.
-func observeAUs(aus []encode.AU, kinds *auKinds, qpr *h264.QPReader, r *refine.State, kf *keyframe.Policy, now time.Time) {
+func observeAUs(aus []encode.AU, kinds *auKinds, qpr *h264.QPReader, r *refine.State, kf *keyframe.Policy, now time.Time, qpw *qpWindow) {
 	for _, au := range aus {
 		if kf != nil {
 			kf.Coded(au.Keyframe)
@@ -153,7 +182,87 @@ func observeAUs(aus []encode.AU, kinds *auKinds, qpr *h264.QPReader, r *refine.S
 		f.Key = au.Keyframe
 		if q, ok := qpr.Observe(au.Data); ok {
 			f.QP = q
+			qpw.add(q)
 		}
 		r.Coded(now, f)
 	}
+}
+
+// qpWindow — QP кадрів з потоку (h264.QPReader) за вікно статистики (C2).
+// nil — телеметрію вимкнено, add нічого не робить.
+type qpWindow struct {
+	last, min, max, n int
+}
+
+func (w *qpWindow) add(q int) {
+	if w == nil || q <= 0 {
+		return
+	}
+	if w.n == 0 || q < w.min {
+		w.min = q
+	}
+	if q > w.max {
+		w.max = q
+	}
+	w.last = q
+	w.n++
+}
+
+// encStatsMsg — enc_stats за вікно і скидання вікна (last лишається:
+// нерухомий екран без нових AU усе одно показує QP, що на ньому стоїть).
+func (w *qpWindow) encStatsMsg(seq uint64, encoder string, software bool, caps string) control.Msg {
+	m := control.Msg{V: control.Version, Type: control.TypeEncStats, Seq: seq,
+		Encoder: encoder, Software: software, EncCaps: caps,
+		QPLast: w.last, QPMin: w.min, QPMax: w.max, QPFrames: w.n}
+	w.min, w.max, w.n = 0, 0, 0
+	return m
+}
+
+// refineConfig — refine.Config з політики (C3). bitrateBps — стартовий
+// -bitrate: з нього бюджет епізоду, коли OO_SCREEN_REFINE_BUDGET_KB не задано.
+func refineConfig(p rcPolicy, minGap time.Duration, bitrateBps int) refine.Config {
+	c := refine.Config{MinGap: minGap, AfterKeyframe: p.RefineAfterIDR, QPAware: p.RefineQPAware}
+	if p.RefineConverge {
+		c.Converge, c.TargetQP = true, p.RefineTargetQP
+		c.ByteBudget = p.RefineBudgetKB * 1000
+		if c.ByteBudget == 0 && bitrateBps > 0 {
+			c.ByteBudget = bitrateBps / 8
+		}
+	}
+	return c
+}
+
+// largeFrameBounds — межі QP для кадру з часткою зміни changed (C3, правило
+// великого кадру): ok=false — правило не діє, лишаються межі політики
+// (qpBounds). Стеля нижча за MinQP правила — конфлікт налаштувань, правило
+// поступається.
+func largeFrameBounds(p rcPolicy, motion bool, changed float64, bitrateBps, pixels int) (minQP, maxQP int, ok bool) {
+	if !motion {
+		return 0, 0, false
+	}
+	lf := refine.LargeFrameMinQP(changed, bitrateBps, pixels, p.LargeFrameQP)
+	if lf == 0 || (p.QPMax > 0 && p.QPMax < lf) {
+		return 0, 0, false
+	}
+	return lf, p.QPMax, true
+}
+
+// refineSWLoadMax — стеля згладженого завантаження софт-енкодера (частка
+// інтервалу кадру, swlimit.Policy.Load), до якої refine на софті дозволено.
+// Refine — 1–2 (з Converge до 6) кадрів на одну зупинку руху, коли нових
+// кадрів нема; половина інтервалу лишає місце для них і для застосунків.
+const refineSWLoadMax = 0.5
+
+// refineAllowed — Q-10 (QUALITY-AUDIT): чи можна refine на цьому енкодері.
+// Апаратний — завжди; софтверний — лише з OO_SCREEN_REFINE_SOFTWARE і поки
+// swlimit має запас (haveLoad=false — політики ще нема: -force-software або
+// перший кадр, тоді вирішує прапорець).
+func refineAllowed(p rcPolicy, software bool, swLoad float64, haveLoad bool) bool {
+	if !software {
+		return true
+	}
+	if !p.RefineSoftware {
+		return false
+	}
+	return !haveLoad || swLoad < refineSWLoadMax
 }

@@ -233,6 +233,10 @@ type offerReq struct {
 	// Monitor — F6 (multimon.go, лише viewer//control): який монітор ноди
 	// дивитись. 0/відсутнє = як раніше. Нода — з квитка, монітор лише звужує.
 	Monitor int `json:"monitor,omitempty"`
+	// Caps — C1 (caps.go): що браузер глядача оголошує в
+	// RTCRtpReceiver.getCapabilities('video'). Лише телеметрія, на переговори
+	// не впливає; рахується тільки з OO_SCREEN_CAPS_TELEMETRY=1.
+	Caps *viewerCaps `json:"caps,omitempty"`
 }
 
 // outputInfo — монітор ПК агента. Форма 1-в-1 з capture.OutputInfo, але
@@ -1004,6 +1008,7 @@ func handleOffer(leg string) http.HandlerFunc {
 			}
 			// SEC: стеля глядачів на ноду. Без неї кожна viewer-нога = PeerConnection,
 			// черга й дві горутини без жодної межі (DoS памʼяттю/CPU хаба).
+			recordViewerCaps(req.Caps)
 			if viewerCapReached(ns) {
 				http.Error(w, "too many viewers for node", http.StatusTooManyRequests)
 				return

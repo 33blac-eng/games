@@ -61,6 +61,10 @@ const (
 	// "text", "normal"). У "video" hub може підняти ціль бітрейту, але лише в
 	// межах власної стелі ноди і поки мережа чиста (hub/cmd/hub-webrtc).
 	TypeContentMode = "content_mode"
+	// TypeEncStats — агент -> hub (C2, OO_SCREEN_ENC_TELEMETRY): ім'я MFT,
+	// звіт CODECAPI-властивостей (EncCaps, ParseEncCaps) і QP кадрів з потоку
+	// за вікно (QPLast/QPMin/QPMax; 0 — невідомо). Лише телеметрія.
+	TypeEncStats = "enc_stats"
 )
 
 var knownTypes = map[string]bool{
@@ -76,6 +80,7 @@ var knownTypes = map[string]bool{
 	TypeShutdown:        true,
 	TypeAck:             true,
 	TypeContentMode:     true,
+	TypeEncStats:        true,
 }
 
 // IsKnownType повідомляє, чи цей пакет розпізнає даний тип повідомлення.
@@ -103,6 +108,15 @@ type Msg struct {
 	Fps int `json:"fps,omitempty"`
 	// Mode — режим вмісту для content_mode ("video" | "text" | "normal").
 	Mode string `json:"mode,omitempty"`
+
+	// enc_stats (C2).
+	Encoder  string `json:"encoder,omitempty"`
+	Software bool   `json:"software,omitempty"`
+	EncCaps  string `json:"enc_caps,omitempty"`
+	QPLast   int    `json:"qp_last,omitempty"`
+	QPMin    int    `json:"qp_min,omitempty"`
+	QPMax    int    `json:"qp_max,omitempty"`
+	QPFrames int    `json:"qp_frames,omitempty"`
 }
 
 // --- Конструктори по одному на тип повідомлення ---

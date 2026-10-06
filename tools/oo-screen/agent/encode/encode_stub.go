@@ -63,4 +63,5 @@ func (e *Encoder) SetRefineQP(int) error      { return ErrNoHardware }
 func (e *Encoder) Flush() error               { return ErrNoHardware }
 func (e *Encoder) SetQPBounds(int, int) error { return ErrNoHardware }
 func (e *Encoder) IntraRefresh() bool         { return false }
+func (e *Encoder) CodecAPICaps() string       { return "" }
 func (e *Encoder) Close() error               { return nil }
