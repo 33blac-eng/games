@@ -178,3 +178,30 @@ func TestCursorGrantConcurrentOrder(t *testing.T) {
 		}
 	}
 }
+
+// F9 дефолт ON: аварійний вимикач хаба OO_SCREEN_CURSOR_LAYER=0
+// (cursorLayerAllowed=false) — дозволу нема навіть коли всі глядачі вміють шар.
+func TestCursorGrantKillSwitch(t *testing.T) {
+	prevRec, prevAllow := recordEnabled.Load(), cursorLayerAllowed
+	recordEnabled.Store(false)
+	t.Cleanup(func() { recordEnabled.Store(prevRec); cursorLayerAllowed = prevAllow })
+
+	ns := &nodeSession{nodeID: "n-kill"}
+	t.Cleanup(func() { forgetRelays(ns) })
+	r := relayFor(ns, cursorRelayConfig())
+	r.setAgent(newSink())
+	pc := &webrtc.PeerConnection{}
+	ns.mu.Lock()
+	ns.viewers = map[*webrtc.PeerConnection]*viewerLeg{pc: {pc: pc}}
+	ns.mu.Unlock()
+	r.addViewerOwned(pc, newSink())
+
+	cursorLayerAllowed = true
+	if !cursorGrantWanted(ns, r) {
+		t.Fatal("усі глядачі з шаром, запису нема: дозвіл очікувався")
+	}
+	cursorLayerAllowed = false
+	if cursorGrantWanted(ns, r) {
+		t.Fatal("OO_SCREEN_CURSOR_LAYER=0: дозволу бути не мусить")
+	}
+}

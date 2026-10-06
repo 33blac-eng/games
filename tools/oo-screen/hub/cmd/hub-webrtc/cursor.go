@@ -28,6 +28,7 @@ package main
 
 import (
 	"log"
+	"os"
 	"sync"
 	"time"
 
@@ -269,10 +270,16 @@ func (r *dcRelay) coversAll(owners []any) bool {
 	return true
 }
 
+// cursorLayerAllowed — аварійний вимикач F9 на хабі (шар типово ON з хвилі
+// 10): OO_SCREEN_CURSOR_LAYER=0 — хаб ніколи не дозволяє шар (шле агенту
+// KindMode=0), тож усі агенти вмальовують вказівник у кадр, як до F9.
+// Ретрансляція каналу лишається (без дозволу Publisher агента мовчить).
+var cursorLayerAllowed = os.Getenv("OO_SCREEN_CURSOR_LAYER") != "0"
+
 // cursorGrantWanted — правило F9: шар лише коли сесія не пишеться в MKV і
 // всі глядачі ноги вміють шар.
 func cursorGrantWanted(ns *nodeSession, r *dcRelay) bool {
-	if recordEnabled.Load() {
+	if !cursorLayerAllowed || recordEnabled.Load() {
 		return false
 	}
 	ns.mu.Lock()

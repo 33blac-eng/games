@@ -1,4 +1,5 @@
-// Шар курсора на боці агента (-cursor-layer, ТИПОВО ВИМКНЕНО).
+// Шар курсора на боці агента (-cursor-layer, з хвилі 10 ТИПОВО ON;
+// вимикачі: -cursor-layer=false або env OO_SCREEN_CURSOR_LAYER=0).
 //
 // F9, ПЕРЕГОВОРИ: прапорець лише дозволяє шар. Агент вмальовує вказівник у
 // кадр, доки хаб не пришле по тому ж каналу cursorproto.KindMode=1 — а хаб
@@ -35,6 +36,18 @@ import (
 	"github.com/organicoils/oo-screen/internal/cursorproto"
 	"github.com/pion/webrtc/v4"
 )
+
+// resolveCursorLayer — F9 дефолт ON. Явний -cursor-layer (будь-яке
+// значення) перекриває середовище; без нього OO_SCREEN_CURSOR_LAYER=0 вимикає
+// шар (аварійний вимикач без перевстановлення задачі), інакше — ON. Навіть
+// ON — лише ДОЗВІЛ: вказівник прибирається з кадру тільки після KindMode=1
+// від хаба й відкритих каналів прямих ніг (cursorGate).
+func resolveCursorLayer(flagSet, flagVal bool, getenv func(string) string) bool {
+	if flagSet {
+		return flagVal
+	}
+	return getenv("OO_SCREEN_CURSOR_LAYER") != "0"
+}
 
 // cursorLayerEnabled — прапорець -cursor-layer. Ставиться в main до dial.
 var cursorLayerEnabled bool
