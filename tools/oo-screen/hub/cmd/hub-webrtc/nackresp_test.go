@@ -15,7 +15,7 @@ import (
 // Кільце віддає рівно той пакет, що був записаний, і не віддає витіснений
 // або застарілий після обертання seq.
 func TestNackRingGetEvictWrap(t *testing.T) {
-	r := &nackRing{}
+	r := newNackRing(sharedNackSize)
 	pay := func(i int) []byte { return []byte{byte(i), byte(i >> 8)} }
 	start := uint16(65000) // перехід через 0 посеред історії
 	for i := 0; i < 3000; i++ {
@@ -48,7 +48,7 @@ func TestNackRingGetEvictWrap(t *testing.T) {
 // Заголовок копіюється: pion передає вказівник на ПУЛЬНИЙ пакет, і його
 // перезапис (разом з елементами Extensions) не має псувати кільце.
 func TestNackRingHeaderIsCopied(t *testing.T) {
-	r := &nackRing{}
+	r := newNackRing(sharedNackSize)
 	h := &rtp.Header{SequenceNumber: 7, Extension: true, ExtensionProfile: 0xBEDE}
 	_ = h.SetExtension(1, []byte{0xAA})
 	r.add(h, []byte{1})
@@ -151,5 +151,44 @@ func benchNackResp(b *testing.B, f interceptor.Factory) {
 	for i := 0; i < b.N; i++ {
 		h.SequenceNumber = uint16(i)
 		_, _ = w.Write(h, payload, nil)
+	}
+}
+
+// Q-12: кільце за бітрейтом × вікно, степінь двійки (uint16 seq по модулю
+// має ділити 65536), у межах [1024, 8192].
+func TestNackRingSize(t *testing.T) {
+	for _, c := range []struct {
+		bps    uint64
+		window time.Duration
+		min    int
+		max    int
+	}{
+		{30_000_000, time.Second, 2048, 4096},
+		{8_000_000, time.Second, 1024, 1024},
+		{1_000_000_000, 2 * time.Second, 8192, 8192},
+		{0, time.Second, 1024, 1024},
+	} {
+		n := nackRingSize(c.bps, c.window)
+		if n < c.min || n > c.max || n&(n-1) != 0 {
+			t.Fatalf("nackRingSize(%d, %v) = %d, хочу степінь двійки в [%d, %d]", c.bps, c.window, n, c.min, c.max)
+		}
+	}
+}
+
+// Кільце на 4096 тримає пакет, старший за 2000 seq (з 1024 — уже витіснено).
+func TestNackRingSized(t *testing.T) {
+	r := newNackRing(4096)
+	for i := 0; i < 5000; i++ {
+		r.add(&rtp.Header{SequenceNumber: uint16(65000 + i)}, []byte{byte(i)})
+	}
+	var h rtp.Header
+	var ext []rtp.Extension
+	start, want := uint16(65000), 2999
+	last := start + 4999
+	if p, ok := r.get(last-2000, &h, &ext); !ok || h.SequenceNumber != last-2000 || p[0] != byte(want) {
+		t.Fatalf("пакет 2000 seq тому в кільці на 4096 не віддано: ok=%v", ok)
+	}
+	if _, ok := r.get(last-4096, &h, &ext); ok {
+		t.Fatal("витіснений пакет віддано")
 	}
 }

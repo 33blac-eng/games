@@ -1,8 +1,10 @@
 package main
 
 import (
+	"math"
 	"os"
 	"sync"
+	"time"
 
 	"github.com/pion/interceptor"
 	"github.com/pion/rtcp"
@@ -37,6 +39,45 @@ import (
 
 const sharedNackSize = 1024 // як дефолт pion: ~1,4 с історії на 8 Мбіт/с
 
+// Q-12: межі кільця, якщо його розмір рахується з бітрейту.
+const (
+	nackRingMax     = 8192 // ×8 памʼяті заголовків на ногу; payload спільний
+	nackPacketBytes = 1200 // типовий RTP-пакет відео (MTU мінус SRTP/ext)
+)
+
+// nackRingSize — Q-12: скільки пакетів тримати, щоб покрити window історії
+// на bps. 1024 на 30 Мбіт/с — лише ~0,3 с: NACK на RTT > 300 мс уже марний.
+// Округлення вгору до степеня двійки: seq uint16 по модулю розміру має
+// ділити 65536, інакше слот після обертання seq зсувається. Межі
+// [sharedNackSize, nackRingMax].
+func nackRingSize(bps uint64, window time.Duration) int {
+	if bps == 0 || window <= 0 {
+		return sharedNackSize
+	}
+	need := int(math.Ceil(float64(bps) * window.Seconds() / 8 / nackPacketBytes))
+	n := sharedNackSize
+	for n < need && n < nackRingMax {
+		n <<= 1
+	}
+	return n
+}
+
+// nackRingSlots — розмір кілець ніг. OO_SCREEN_NACK_WINDOW=<тривалість>
+// (напр. 1s) вмикає розмір за бітрейтом; вхід — спільна стеля хаба
+// startBitrateBps (фабрика інтерсепторів не знає ноди). Типово ВИМКНЕНО:
+// 1024, як у pion.
+var nackRingSlots = nackRingSlotsFromEnv(os.Getenv("OO_SCREEN_NACK_WINDOW"), startBitrateBps)
+
+func nackRingSlotsFromEnv(v string, bps uint64) int {
+	w, err := time.ParseDuration(v)
+	if v == "" || err != nil || w <= 0 {
+		return sharedNackSize
+	}
+	return nackRingSize(bps, w)
+}
+
+func newNackRing(size int) *nackRing { return &nackRing{slots: make([]nackSlot, size)} }
+
 var nackResponderPion = os.Getenv("OO_SCREEN_NACK_RESPONDER") == "pion"
 
 type nackSlot struct {
@@ -48,7 +89,7 @@ type nackSlot struct {
 
 type nackRing struct {
 	mu      sync.Mutex
-	slots   [sharedNackSize]nackSlot
+	slots   []nackSlot // len — степінь двійки (nackRingSize)
 	highest uint16
 	started bool
 	w       interceptor.RTPWriter
@@ -56,7 +97,7 @@ type nackRing struct {
 
 func (r *nackRing) add(h *rtp.Header, payload []byte) {
 	r.mu.Lock()
-	s := &r.slots[h.SequenceNumber%sharedNackSize]
+	s := &r.slots[int(h.SequenceNumber)%len(r.slots)]
 	s.ext = append(s.ext[:0], h.Extensions...)
 	s.hdr = *h
 	s.hdr.Extensions = s.ext
@@ -72,10 +113,10 @@ func (r *nackRing) add(h *rtp.Header, payload []byte) {
 func (r *nackRing) get(seq uint16, h *rtp.Header, ext *[]rtp.Extension) ([]byte, bool) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if !r.started || r.highest-seq >= sharedNackSize {
+	if !r.started || int(r.highest-seq) >= len(r.slots) {
 		return nil, false
 	}
-	s := &r.slots[seq%sharedNackSize]
+	s := &r.slots[int(seq)%len(r.slots)]
 	if !s.ok || s.hdr.SequenceNumber != seq {
 		return nil, false
 	}
@@ -141,7 +182,8 @@ func (n *sharedNackResponder) BindLocalStream(info *interceptor.StreamInfo, w in
 	if !streamHasNack(info) || info.SSRCRetransmission != 0 {
 		return w
 	}
-	r := &nackRing{w: w}
+	r := newNackRing(nackRingSlots)
+	r.w = w
 	n.mu.Lock()
 	n.streams[info.SSRC] = r
 	n.mu.Unlock()
