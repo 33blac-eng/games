@@ -399,6 +399,10 @@ func writeMetrics(out io.Writer, nodes []*nodeSession, now time.Time) error {
 		fmt.Fprintf(p.w, "%s_count%s %d\n", h, promLabels("node", s.node), s.ttffCount)
 	}
 
+	if capsTelemetryEnabled {
+		viewerCapsStats.write(p)
+	}
+
 	// egress (egress.go): спільний на процес, без мітки ноди.
 	var depth, capa int
 	var full, errs uint64

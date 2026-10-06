@@ -36,6 +36,7 @@ import {
     findMeshCanvas,
 } from './desktop-oo.js';
 import { createTileOverlay, TILES_LABEL } from './oo-text-tiles.js';
+import { rtpVideoCaps } from './desktop-oo-codec444.js';
 import { INPUT_CHANNEL_LABEL, inputEnabledFor, createInputSender, attachInputDom } from './desktop-oo-input.js';
 import { createStatsOverlay, createFrameTimingMeter } from './desktop-oo-stats.js';
 import {
@@ -1067,10 +1068,13 @@ export function mapRemoteToClient(x, y, rect, srcW, srcH) {
 }
 
 /** offerBody — тіло /offer/viewer. monitor лише ціле >0 (F6, config.monitor:
- *  потік "<node>#m<i>" на хабі), інакше поля немає — offer як до F6. */
-export function offerBody(sdp, ticket, monitor) {
-    if (Number.isInteger(monitor) && monitor > 0) return JSON.stringify({ sdp: sdp, ticket, monitor });
-    return JSON.stringify({ sdp: sdp, ticket });
+ *  потік "<node>#m<i>" на хабі), інакше поля немає — offer як до F6.
+ *  caps — C1: rtpVideoCaps() (config.reportCaps), лише телеметрія хаба. */
+export function offerBody(sdp, ticket, monitor, caps) {
+    const body = { sdp: sdp, ticket };
+    if (Number.isInteger(monitor) && monitor > 0) body.monitor = monitor;
+    if (caps && typeof caps === 'object') body.caps = caps;
+    return JSON.stringify(body);
 }
 
 /**
@@ -2421,7 +2425,7 @@ export function createOoWebrtcLayer(o) {
                     return np;
                 },
                 waitIce: (p) => waitIceOutcome(p, config.p2pConnectTimeoutMs || DEFAULT_P2P_CONNECT_MS),
-                makeBody: (sdp, t) => offerBody(sdp, t, config.monitor),
+                makeBody: (sdp, t) => offerBody(sdp, t, config.monitor, config.reportCaps ? rtpVideoCaps() : null),
                 onTicket: (t, g) => { if (session.isCurrent(gen)) { ooTicket = t; armInput(gen, t, g); } },
                 onPath: (p) => { if (session.isCurrent(gen)) transportPath = p; },
                 isCurrent: () => session.isCurrent(gen),
