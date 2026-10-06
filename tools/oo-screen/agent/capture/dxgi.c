@@ -468,6 +468,25 @@ static int gdi_grab(oos_cap *c, char *err, int32_t err_len)
     return ok ? OOS_OK : OOS_ACCESS_LOST;
 }
 
+/* Finishes a GDI-only oos_open with one real grab. A secure desktop (lock
+ * screen, UAC) makes BitBlt fail; without this check gdi_only_open "succeeded"
+ * there, the first oos_next reported ACCESS_LOST, and the Go reinit reopened
+ * every MinBackoff (10 ms) — two log lines and ~19 MB of buffers per round —
+ * for as long as the PC stayed locked, never giving up the way it does for
+ * DXGI. Same contract as DuplicateOutput's E_ACCESSDENIED: OOS_ACCESS_LOST
+ * from oos_open, and the caller backs off. The grabbed image is not reported:
+ * have_image stays 0, so the first oos_next still returns a frame. */
+static int gdi_only_start(oos_cap *c, oos_cap **out, char *err, int32_t err_len)
+{
+    int st = gdi_grab(c, err, err_len);
+    if (st != OOS_OK) {
+        oos_close(c);
+        return st;
+    }
+    *out = c;
+    return OOS_OK;
+}
+
 static void gdi_fill_frame(oos_cap *c, oos_frame *frame)
 {
     memset(frame, 0, sizeof(*frame));
@@ -528,7 +547,7 @@ int oos_open(int32_t output_idx, oos_cap **out, char *err, int32_t err_len)
     {
         char fg[4] = {0};
         if (GetEnvironmentVariableA("OO_SCREEN_FORCE_GDI", fg, sizeof fg) && fg[0] == '1') {
-            if (gdi_only_open(c, err, err_len) == OOS_OK) { *out = c; return OOS_OK; }
+            if (gdi_only_open(c, err, err_len) == OOS_OK) return gdi_only_start(c, out, err, err_len);
             goto fail;
         }
     }
@@ -547,7 +566,7 @@ int oos_open(int32_t output_idx, oos_cap **out, char *err, int32_t err_len)
         /* Windows 7: VIDEO_SUPPORT / feature level 11_1 -> DXGI_ERROR_UNSUPPORTED
          * or E_INVALIDARG. No duplication there anyway: GDI-only pipeline. */
         SAFE_RELEASE(adap);
-        if (gdi_only_open(c, err, err_len) == OOS_OK) { *out = c; return OOS_OK; }
+        if (gdi_only_open(c, err, err_len) == OOS_OK) return gdi_only_start(c, out, err, err_len);
         c->last_hr = hr;
         set_err(err, err_len, "D3D11CreateDevice", hr);
         goto fail;
@@ -569,7 +588,7 @@ int oos_open(int32_t output_idx, oos_cap **out, char *err, int32_t err_len)
     if (FAILED(hr)) {
         /* No IDXGIOutput1 = no Desktop Duplication (pre-Windows 8). */
         SAFE_RELEASE(c->ctx); SAFE_RELEASE(c->dev);
-        if (gdi_only_open(c, err, err_len) == OOS_OK) { *out = c; return OOS_OK; }
+        if (gdi_only_open(c, err, err_len) == OOS_OK) return gdi_only_start(c, out, err, err_len);
         set_err(err, err_len, "QI IDXGIOutput1", hr); goto fail;
     }
 
