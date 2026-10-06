@@ -848,6 +848,24 @@ export function absorbForeignStyles(saved, written, current) {
     return saved;
 }
 
+// Q-14 (tools/oo-screen/research/QUALITY-AUDIT.md): 1:1 дає рівно один
+// піксель відео на фізичний піксель ЛИШЕ коли й початок картинки лежить на
+// сітці фізичних пікселів. Поширені dpr 1.25/1.5 (масштаб Windows 125/150 %)
+// кладуть будь-який цілий CSS-відступ між пікселями: 250 CSS px × 1.25 =
+// 312.5 фізичних — і компоновщик змішує кожен піксель із сусідом навпіл, тобто
+// «1:1» мило так само, як масштабування. Тут абсолютну позицію (viewport)
+// округлюємо до фізичного пікселя: dx/dy — поправка до CSS-відступу; розмір —
+// точний videoW/dpr, а не виміряний getBoundingClientRect (той квантований
+// layout-одиницями). Чи браузер і сам не підганяє шар до сітки — UNVERIFIED;
+// поправка в межах ±0.5 фізичного пікселя, тож шкоди від неї немає.
+export function oneToOnePlacement(absLeft, absTop, videoW, videoH, dpr) {
+    const d = dpr > 0 ? dpr : 1;
+    const snap = (v) => Math.round(v * d) / d;
+    const l = Number.isFinite(absLeft) ? absLeft : 0;
+    const t = Number.isFinite(absTop) ? absTop : 0;
+    return { dx: snap(l) - l, dy: snap(t) - t, width: videoW / d, height: videoH / d };
+}
+
 export function oneToOneSize(videoW, videoH, dpr) {
     const d = dpr > 0 ? dpr : 1;
     return {
@@ -1416,14 +1434,26 @@ export function createOoWebrtcLayer(o) {
         const fit = (config.input || config.inputChannel || config.textTiles || config.cursorLayer)
             ? fitRect(mr.width, mr.height, video.videoWidth, video.videoHeight)
             : { left: 0, top: 0, width: mr.width, height: mr.height };
-        setStyle(video, 'left', (mr.left - cr.left + container.scrollLeft + fit.left) + 'px');
-        setStyle(video, 'top', (mr.top - cr.top + container.scrollTop + fit.top) + 'px');
-        setStyle(video, 'width', fit.width + 'px');
-        setStyle(video, 'height', fit.height + 'px');
+        let vLeft = mr.left - cr.left + container.scrollLeft + fit.left;
+        let vTop = mr.top - cr.top + container.scrollTop + fit.top;
+        let vWidth = fit.width;
+        let vHeight = fit.height;
+        // Q-14: у 1:1 — початок на сітці фізичних пікселів, розмір точний.
+        if (displayMode === DISPLAY_1X1 && video.videoWidth > 0 && video.videoHeight > 0) {
+            const p = oneToOnePlacement(mr.left + fit.left, mr.top + fit.top,
+                video.videoWidth, video.videoHeight, currentDpr());
+            vLeft += p.dx;
+            vTop += p.dy;
+            vWidth = p.width;
+            vHeight = p.height;
+        }
+        setStyle(video, 'left', vLeft + 'px');
+        setStyle(video, 'top', vTop + 'px');
+        setStyle(video, 'width', vWidth + 'px');
+        setStyle(video, 'height', vHeight + 'px');
         // Оверлей тайлів — у тому самому боксі, що й картинка.
         if (textTiles) {
-            textTiles.place(mr.left - cr.left + container.scrollLeft + fit.left, mr.top - cr.top + container.scrollTop + fit.top,
-                fit.width, fit.height);
+            textTiles.place(vLeft, vTop, vWidth, vHeight);
         }
         if (cursorLayer) cursorLayer.relayout();
     }
