@@ -374,6 +374,43 @@ func keepStillAU(still, sameFrameEncodedBefore bool, aus []encode.AU) bool {
 	return still && sameFrameEncodedBefore && len(aus) == 1 && !aus[0].Keyframe
 }
 
+// gopTimeEnabled — Q-11: OO_SCREEN_GOP_TIME=1 вмикає IDR за часом
+// (keyframe.TimeGOP, інтервал = -gop-seconds). Типово вимкнено.
+func gopTimeEnabled(getenv func(string) string) bool {
+	return getenv("OO_SCREEN_GOP_TIME") == "1"
+}
+
+// hasKeyframe — чи є серед AU хоч один IDR.
+func hasKeyframe(aus []encode.AU) bool {
+	for i := range aus {
+		if aus[i].Keyframe {
+			return true
+		}
+	}
+	return false
+}
+
+// nextStillAU — новий вміст кешу keepalive (sendStillKeepalive) після виходу
+// енкодера. Повертає cur, якщо кеш не змінюється.
+//
+// IDR завжди замінює кеш: закешований раніше still-P-кадр посилається на
+// референси ДО IDR, і глядач, що приєднався на цьому IDR, не декодує його
+// повтор на локу/UAC. Сам IDR декодовний для будь-кого; наступний still-P,
+// закодований уже після IDR, знову займе його місце (keepStillAU).
+func nextStillAU(cur *encode.AU, still, sameFrameEncodedBefore bool, aus []encode.AU) *encode.AU {
+	for i := range aus {
+		if aus[i].Keyframe {
+			cp := aus[i]
+			return &cp
+		}
+	}
+	if keepStillAU(still, sameFrameEncodedBefore, aus) {
+		cp := aus[0]
+		return &cp
+	}
+	return cur
+}
+
 // shouldAdmit вирішує, чи пускати щойно захоплений кадр далі — на кодування й
 // відправку. Виділено з циклу з тієї ж причини, що й shouldKeepalive: правило
 // перевіряється тестом без DXGI, енкодера й хаба.

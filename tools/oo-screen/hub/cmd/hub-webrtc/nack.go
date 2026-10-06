@@ -55,13 +55,14 @@ import (
 	"github.com/pion/rtcp"
 )
 
-const (
-	// nackBufferSize — розмір кільця ретрансмісії pion. 1024 — дефолт
-	// ResponderInterceptor, і RegisterDefaultInterceptors його не переозначає
-	// (webrtc/interceptor.go передає лише loggerFactory). Пакет, старший за це
-	// вікно, responder віддати НЕ може — цим і визначається «задоволено».
-	nackBufferSize = 1024
+// nackBufferSize — розмір кільця ретрансмісії. 1024 — дефолт pion
+// ResponderInterceptor (RegisterDefaultInterceptors його не переозначає) і
+// власного responder-а (nackresp.go); з OO_SCREEN_NACK_WINDOW — розмір кілець
+// ніг за бітрейтом (Q-12, до 8192). Пакет, старший за це вікно, responder
+// віддати НЕ може — цим і визначається «задоволено».
+var nackBufferSize = nackRingSlots
 
+const (
 	nackWindow     = 2 * time.Second // вікно, за яким рахуємо частку
 	nackMinSamples = 16              // менше запитів у вікні — статистики немає, не судимо
 	nackGoodRatio  = 0.5             // < 50% задоволених -> NACK більше не рятує
@@ -85,7 +86,7 @@ const (
 // nackRecoverable — точна умова pion rtpbuffer.Get: пакет ще в кільці, якщо
 // відстань від найновішого записаного seq менша за вікно. Арифметика uint16
 // сама відкидає «seq з майбутнього» (різниця обгортається у величезне число),
-// тож окремої перевірки половини діапазону не треба: window <= 1024 << 32768.
+// тож окремої перевірки половини діапазону не треба: window <= 8192 << 32768.
 func nackRecoverable(highest, seq, window uint16) bool {
 	return highest-seq < window
 }
@@ -94,10 +95,10 @@ func nackRecoverable(highest, seq, window uint16) bool {
 // кільця, старіших пакетів у ньому просто немає (нога підключилась посеред
 // потоку), і рахувати їх задоволеними означало б завищити частку.
 func nackWindowFor(sent uint64) uint16 {
-	if sent < nackBufferSize {
+	if sent < uint64(nackBufferSize) {
 		return uint16(sent)
 	}
-	return nackBufferSize
+	return uint16(nackBufferSize)
 }
 
 // nackStats — підсумок ОДНОГО закритого вікна: скільки seq запитано, скільки з

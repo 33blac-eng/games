@@ -90,3 +90,37 @@ func (p *Policy) Due(now time.Time, still bool) bool {
 
 // Since — закодованих кадрів від останнього IDR (діагностика).
 func (p *Policy) Since() int { return p.since }
+
+// TimeGOP — Q-11: періодичний IDR за ЧАСОМ, а не за кількістю закодованих
+// кадрів. Із VFR (текстовий режим 15 fps, keepalive 1 кадр/с) GOP MFT у
+// кадрах (gop-seconds × fps) розтягується у хвилини: новий глядач / втрачений
+// пакет чекають IDR набагато довше за -gop-seconds. TimeGOP просить IDR, щойно
+// від останнього IDR минуло Interval — на будь-якому кадрі.
+//
+// Типово ВИМКНЕНО (OO_SCREEN_GOP_TIME=1). Не потокобезпечний.
+type TimeGOP struct {
+	Interval time.Duration
+	last     time.Time // останній IDR (або перший кадр)
+}
+
+// NewTime будує політику; interval <= 0 вимикає її (Due завжди false).
+func NewTime(interval time.Duration) *TimeGOP { return &TimeGOP{Interval: interval} }
+
+// Coded — енкодер віддав AU; key — IDR (будь-чий).
+func (t *TimeGOP) Coded(now time.Time, key bool) {
+	if key || t.last.IsZero() {
+		t.last = now
+	}
+}
+
+// Due — чи просити IDR на кадрі, який зараз кодуватиметься.
+func (t *TimeGOP) Due(now time.Time) bool {
+	if t.Interval <= 0 {
+		return false
+	}
+	if t.last.IsZero() {
+		t.last = now // відлік від першого кадру
+		return false
+	}
+	return now.Sub(t.last) >= t.Interval
+}
