@@ -31,6 +31,35 @@ func withHeaders(data, headers []byte) ([]byte, bool) {
 	return append(merged, data...), true
 }
 
+// prepareAU — політика заголовків одного AU з MFT (план §5.2 + аудит якості
+// Q-06, research/QUALITY-AUDIT.md). Ключовий кадр без інбенд-SPS отримує
+// кешовані SPS/PPS (headers кешуються вже переписаними на BT.709 limited), і
+// injected=true. Будь-який інший AU із власним SPS — ключовий чи НІ — іде через
+// colourFix.
+//
+// Раніше colourFix (h264.RewriteAnnexBSPSColourBT709) застосовувався лише в
+// гілці ключового кадру. MFT, що повторює SPS на не-IDR кадрі (I-кадр без
+// CleanPoint, повтор заголовків після SetBitrate), віддавав би глядачу посеред
+// потоку SPS без colour description: Chrome бере колірний простір з останнього
+// SPS, тож картинка перемкнулась би на вгадану матрицю (зсув кольорів на
+// півекрана до наступного IDR). Скан hasSPS не дає хибних збігів у зрізах:
+// 00 00 01 всередині NAL заборонено emulation prevention.
+//
+// colourFix == nil або його помилка -> AU як є: потік не ламаємо.
+func prepareAU(data, headers []byte, key bool, colourFix func([]byte) ([]byte, error)) ([]byte, bool) {
+	if key {
+		if merged, injected := withHeaders(data, headers); injected {
+			return merged, true
+		}
+	}
+	if colourFix != nil && hasSPS(data) {
+		if rw, err := colourFix(data); err == nil {
+			return rw, false
+		}
+	}
+	return data, false
+}
+
 // checkPlanes validates the CPU NV12 planes against the configured frame size.
 // oos_enc_submit_cpu does memcpy(dst, y + r*YStride, Width) for every row with
 // no bounds knowledge of its own, so a short slice or a stride smaller than the
