@@ -194,3 +194,26 @@ func TestRefineConvergePolicy(t *testing.T) {
 		t.Fatal("MaxQP 30 < MinQP 32 — правило мусить поступитись")
 	}
 }
+
+// Q-10: refine на софт-енкодері — лише з прапорцем і поки swlimit має запас.
+func TestRefineAllowedSoftware(t *testing.T) {
+	off := rcPolicyFromEnv(func(string) string { return "" })
+	if !refineAllowed(off, false, 0.9, true) {
+		t.Fatal("апаратний енкодер: refine завжди")
+	}
+	if refineAllowed(off, true, 0, false) {
+		t.Fatal("софт без OO_SCREEN_REFINE_SOFTWARE: refine вимкнено (як раніше)")
+	}
+	on := rcPolicyFromEnv(func(k string) string {
+		if k == "OO_SCREEN_REFINE_SOFTWARE" {
+			return "1"
+		}
+		return ""
+	})
+	if !refineAllowed(on, true, 0.2, true) || !refineAllowed(on, true, 0, false) {
+		t.Fatal("софт із запасом: refine дозволено")
+	}
+	if refineAllowed(on, true, 0.7, true) {
+		t.Fatal("софт без запасу CPU: refine заборонено")
+	}
+}

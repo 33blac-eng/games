@@ -60,6 +60,10 @@ type rcPolicy struct {
 	// для кадру, що змінив ≥ половини екрана при малому HRD-бюджеті; якість
 	// потім доводить refine. OO_SCREEN_LARGE_FRAME_QP, 0 — вимкнено (типово).
 	LargeFrameQP int
+	// RefineSoftware — Q-10: refine і на софтверному MFT, поки EWMA
+	// internal/swlimit має запас (refineAllowed). OO_SCREEN_REFINE_SOFTWARE,
+	// типово вимкнено: CPU на 2–4 ядрах ще треба заміряти.
+	RefineSoftware bool
 }
 
 // envBool: "1"/"true"/"on" — так, "0"/"false"/"off" — ні, інше — def.
@@ -98,6 +102,7 @@ func rcPolicyFromEnv(getenv func(string) string) rcPolicy {
 		RefineTargetQP: envInt(getenv, "OO_SCREEN_REFINE_TARGET_QP", refine.DefaultTargetQP, 1, 51),
 		RefineBudgetKB: envInt(getenv, "OO_SCREEN_REFINE_BUDGET_KB", 0, 0, 1<<20),
 		LargeFrameQP:   envInt(getenv, "OO_SCREEN_LARGE_FRAME_QP", 0, 0, 51),
+		RefineSoftware: envBool(getenv, "OO_SCREEN_REFINE_SOFTWARE", false),
 	}
 }
 
@@ -240,4 +245,24 @@ func largeFrameBounds(p rcPolicy, motion bool, changed float64, bitrateBps, pixe
 		return 0, 0, false
 	}
 	return lf, p.QPMax, true
+}
+
+// refineSWLoadMax — стеля згладженого завантаження софт-енкодера (частка
+// інтервалу кадру, swlimit.Policy.Load), до якої refine на софті дозволено.
+// Refine — 1–2 (з Converge до 6) кадрів на одну зупинку руху, коли нових
+// кадрів нема; половина інтервалу лишає місце для них і для застосунків.
+const refineSWLoadMax = 0.5
+
+// refineAllowed — Q-10 (QUALITY-AUDIT): чи можна refine на цьому енкодері.
+// Апаратний — завжди; софтверний — лише з OO_SCREEN_REFINE_SOFTWARE і поки
+// swlimit має запас (haveLoad=false — політики ще нема: -force-software або
+// перший кадр, тоді вирішує прапорець).
+func refineAllowed(p rcPolicy, software bool, swLoad float64, haveLoad bool) bool {
+	if !software {
+		return true
+	}
+	if !p.RefineSoftware {
+		return false
+	}
+	return !haveLoad || swLoad < refineSWLoadMax
 }

@@ -1443,7 +1443,8 @@ func main() {
 		keepalives int // скільки разів переслали останній кадр (нерухомий екран)
 		refines    int // скільки refine-кадрів закодовано (ТЗ P4)
 		// refiner — автомат refine (internal/refine): коли рух стих, ще раз
-		// кодуємо останній кадр із нижчим QP. Лише апаратний D3D-шлях.
+		// кодуємо останній кадр із нижчим QP. Апаратний шлях; софтверний — лише з
+		// OO_SCREEN_REFINE_SOFTWARE (Q-10, refineAllowed).
 		refiner = refine.New(refineConfig(rcPol, frameInterval, int(s.bitrateBps.Load())))
 		// C3: правило великого кадру — які межі QP зараз стоять на якому
 		// енкодері (largeQP 0 — межі політики).
@@ -1896,7 +1897,13 @@ loop:
 		//
 		// Refine (ТЗ P4) лише вкорочує цей дедлайн: якщо рух стих, прокидаємось
 		// у мить, коли час refine, а не через повний keepaliveAfter.
-		refineOn := *refineFlag && !s.software && !gatePaused.Load() && s.lastFrame != nil
+		// Q-10: на софтверному MFT — лише з OO_SCREEN_REFINE_SOFTWARE і поки
+		// swlimit має запас CPU (refineAllowed).
+		swLoad, haveSWLoad := 0.0, false
+		if swPol != nil && swPolEnc == s.encoder() {
+			swLoad, haveSWLoad = swPol.Load(), true
+		}
+		refineOn := *refineFlag && refineAllowed(rcPol, s.software, swLoad, haveSWLoad) && !gatePaused.Load() && s.lastFrame != nil
 		if !refineOn {
 			refiner.Disarm()
 		}
