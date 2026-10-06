@@ -227,6 +227,28 @@ static HRESULT make_video(oos_cap *c)
         c->vctx, c->vproc, 0, D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE);
     c->vctx->lpVtbl->VideoProcessorSetStreamOutputRate(
         c->vctx, c->vproc, 0, D3D11_VIDEO_PROCESSOR_OUTPUT_RATE_NORMAL, TRUE, NULL);
+    /* Аудит якості Q-01 (research/QUALITY-AUDIT.md): за документацією D3D11
+     * драйвер МОЖЕ сам вмикати «покращення» під час blit (auto-processing:
+     * шумодав, підсилення країв тощо), а для тексту робочого столу кожне з
+     * них — спотворення ще ДО енкодера. Скейлер енкодера (mft.c, make_scaler)
+     * це вже вимикає; захоплення BGRA -> NV12 — ні. Те саме тут: auto-
+     * processing off і кожен фільтр, що його оголошує процесор, явно вимкнено.
+     * Void-виклики, перевіряти нічого. Чи вмикав щось драйвер на RGB-вході
+     * (і, отже, чи є видимий виграш) — UNVERIFIED на залізі. */
+    c->vctx->lpVtbl->VideoProcessorSetStreamAutoProcessingMode(c->vctx, c->vproc, 0, FALSE);
+    {
+        D3D11_VIDEO_PROCESSOR_CAPS caps;
+        memset(&caps, 0, sizeof(caps));
+        if (SUCCEEDED(c->venum->lpVtbl->GetVideoProcessorCaps(c->venum, &caps))) {
+            int f;
+            for (f = D3D11_VIDEO_PROCESSOR_FILTER_BRIGHTNESS;
+                 f <= D3D11_VIDEO_PROCESSOR_FILTER_STEREO_ADJUSTMENT; f++) {
+                if (caps.FilterCaps & (1u << f))
+                    c->vctx->lpVtbl->VideoProcessorSetStreamFilter(
+                        c->vctx, c->vproc, 0, (D3D11_VIDEO_PROCESSOR_FILTER)f, FALSE, 0);
+            }
+        }
+    }
     /* Desktop is full-range sRGB; the NV12 we emit is studio-range BT.709,
      * which is what the encoder and every browser decoder expect. */
     {
