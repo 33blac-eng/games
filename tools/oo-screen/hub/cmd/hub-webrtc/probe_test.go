@@ -286,3 +286,119 @@ func TestProbeCapModelRecovery(t *testing.T) {
 		}
 	}
 }
+
+// N4 з детектором затримки: модель лише проби (RR раз на 1 с, вердикт через
+// 1 с, з живим TWCC — ще перевірка рівно на probeNextAt після успіху чи невдачі, як
+// AfterFunc у finishProbe) над стелею 2 Мбіт/с, яку знімають у РІЗНІЙ фазі
+// відносно останньої невдалої проби. Корінь 17 с на стенді: пауза після
+// невдач росла до 8 с, а проба ×1.15 після них не піднімала ціль
+// (0.85×1.15 < 1). Стеля моделі — як на стенді з логів хаба: проба під
+// стелею 2M проходить, лише поки rate ≤ поріг (1.6–1.9 Мбіт/с: вище детектор
+// бачить ріст черги й обриває її; на стенді поріг «гуляє» з IDR і шумом), а
+// після невдалої проби зріз по затримці тримає ціль ≤ 1.5 М. Повертає
+// найгірше відновлення до ≥ 90% по порогах і фазах.
+func probeDelayModelWorst(t *testing.T, live bool) (worst float64) {
+	t.Helper()
+	const step = 100 * time.Millisecond
+	for _, thr := range []uint64{1_600_000, 1_700_000, 1_800_000, 1_900_000} {
+		for phase := 0; phase < 80; phase++ {
+			c := bitrateCtl{target: 1_300_000, startBps: 8_000_000, probeOn: true, cleanSince: t0}
+			now := t0
+			uncap := t0.Add(40*time.Second + time.Duration(phase)*step)
+			var verdictAt, recheckAt time.Time
+			var okv bool
+			rec := -1.0
+			for i := 1; i <= 1200; i++ {
+				now = now.Add(step)
+				if live {
+					c.twccAt = now
+				}
+				capped := now.Before(uncap)
+				if !verdictAt.IsZero() && !now.Before(verdictAt) {
+					res := probeFailed
+					if okv {
+						res = probeOK
+					}
+					var send bool
+					c, send = c.probeDone(res, now)
+					verdictAt = time.Time{}
+					if res == probeFailed && capped && c.target > 1_500_000 {
+						c.target = 1_500_000
+					}
+					if (send || res == probeFailed) && c.delayLive(now) {
+						recheckAt = c.probeNextAt
+					}
+				}
+				due := i%10 == 0 // RR
+				if !recheckAt.IsZero() && !now.Before(recheckAt) {
+					due, recheckAt = true, time.Time{}
+				}
+				if due {
+					var rate uint64
+					var ok bool
+					if c, rate, ok = c.probeDue(now); ok {
+						verdictAt = now.Add(time.Second)
+						okv = !capped || rate <= thr
+					}
+				}
+				if !capped && rec < 0 && c.target >= 7_200_000 {
+					rec = now.Sub(uncap).Seconds()
+				}
+			}
+			if rec < 0 {
+				t.Fatalf("live=%v thr=%d phase=%d: не відновилось за 80 с", live, thr, phase)
+			}
+			if rec > worst {
+				worst = rec
+			}
+		}
+	}
+	return worst
+}
+
+func TestProbeDelayLiveRecoveryAllPhases(t *testing.T) {
+	old := probeDelayModelWorst(t, false)
+	fix := probeDelayModelWorst(t, true)
+	t.Logf("найгірше відновлення (4 пороги × 80 фаз): без живого TWCC %.1f с, з ним %.1f с", old, fix)
+	if fix > 12.5 {
+		t.Fatalf("з детектором найгірша фаза %.1f с, want ≤ 12.5", fix)
+	}
+	if old <= fix {
+		t.Fatalf("модель не відтворює корінь: старе %.1f ≤ нове %.1f", old, fix)
+	}
+}
+
+func TestProbeDelayLiveGatesAndMul(t *testing.T) {
+	now := t0.Add(5 * time.Second)
+	c := probeCtl(2_000_000, 8_000_000)
+	c.probeFails = 3
+	// Без фідбеку — як було: ×1.15 і пауза до 8 с.
+	if _, rate, ok := c.probeDue(now); !ok || rate != 2_300_000 {
+		t.Fatalf("без TWCC rate=%d ok=%v", rate, ok)
+	}
+	c.twccAt = now.Add(-time.Second)
+	c2, rate, ok := c.probeDue(now)
+	if !ok || rate != 2_500_000 {
+		t.Fatalf("з живим TWCC rate=%d, want ×1.25", rate)
+	}
+	c2, _ = c2.probeDone(probeFailed, now)
+	if g := c2.probeNextAt.Sub(now); g != probeGapMaxDelay {
+		t.Fatalf("пауза після 4-ї невдачі %v, want %v", g, probeGapMaxDelay)
+	}
+	// Фідбек застарів (Chrome перестав слати TWCC) — знову 8 с.
+	c3 := c
+	c3.twccAt = now.Add(-3 * time.Second)
+	c3, _, _ = c3.probeDue(now)
+	c3, _ = c3.probeDone(probeFailed, now)
+	if g := c3.probeNextAt.Sub(now); g != probeGapMax {
+		t.Fatalf("застарілий TWCC: пауза %v, want %v", g, probeGapMax)
+	}
+	// Успіх із живим TWCC — наступна проба вже через probeGapOKDelay.
+	c4 := probeCtl(2_000_000, 8_000_000)
+	c4.twccAt = now
+	c4, _, _ = c4.probeDue(now)
+	c4, send := c4.probeDone(probeOK, now)
+	if !send || c4.probeNextAt.Sub(now) != probeGapOKDelay {
+		t.Fatalf("send=%v next=%v", send, c4.probeNextAt.Sub(now))
+	}
+}

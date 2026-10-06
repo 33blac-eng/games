@@ -56,6 +56,7 @@ var cursorChan atomic.Pointer[webrtc.DataChannel]
 
 // applyCursorGrant — єдине місце, що вмикає/вимикає шар: і капчер (кадр із
 // вказівником чи без), і Publisher (шле чи мовчить) перемикаються разом.
+// Кличе його cursorGrantGate (дозвіл хаба І прямі ноги), а не хаб напряму.
 func applyCursorGrant(on bool) {
 	capture.SetCursorLayer(on)
 	cursorPub.SetActive(on)
@@ -63,13 +64,13 @@ func applyCursorGrant(on bool) {
 
 func cursorChannelOpen(dc *webrtc.DataChannel) {
 	cursorChan.Store(dc)
-	applyCursorGrant(false) // новий хаб/нога: дозвіл треба отримати заново
-	cursorSinks.add(dc)     // N6: fan — ще й канали прямих ніг
+	cursorGrantGate.setHub(false) // новий хаб/нога: дозвіл треба отримати заново
+	cursorSinks.add(dc)           // N6: fan — ще й канали прямих ніг
 }
 
 func cursorChannelClosed(dc *webrtc.DataChannel) {
 	if cursorChan.CompareAndSwap(dc, nil) {
-		applyCursorGrant(false)
+		cursorGrantGate.setHub(false)
 	}
 	cursorSinks.remove(dc)
 }
@@ -82,7 +83,7 @@ func cursorGrantMessage(dc *webrtc.DataChannel, b []byte) {
 		return
 	}
 	log.Printf("oo-agent: cursor layer %v (хаб)", on)
-	applyCursorGrant(on)
+	cursorGrantGate.setHub(on)
 }
 
 // observeCursor — з кадрового циклу на КОЖЕН кадр (NoChange теж).

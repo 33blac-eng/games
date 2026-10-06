@@ -23,6 +23,7 @@ package main
 
 import (
 	"errors"
+	"fmt"
 	"log"
 	"os"
 	"strings"
@@ -105,7 +106,8 @@ func agentAuthConfigError() error {
 	if agentAuthStrict() && !legacyAgentTokenAllowed() && agentMaster() == token {
 		return errStrictNoMaster
 	}
-	return nil
+	// Хвиля 8: слабкий master / права файлу (strict) і файл відкликань нод.
+	return agentAuthHardenError()
 }
 
 // agentAuthModeSummary — один рядок для журналу старту: як зараз
@@ -126,6 +128,9 @@ func agentAuthModeSummary() string {
 	}
 	if agentMasterPrev() != "" {
 		master += ", ротація: старий master ще приймається (OO_SCREEN_AGENT_SECRET_PREV)"
+	}
+	if os.Getenv("OO_SCREEN_AGENT_REVOKED_FILE") != "" {
+		master += fmt.Sprintf("; відкликано нод: %d (OO_SCREEN_AGENT_REVOKED_FILE)", revoked.count())
 	}
 	return "agent-auth: " + mode + "; " + master
 }
@@ -152,6 +157,10 @@ var prevWarned sync.Map
 // agentAuthorized — чи має право tok зареєструвати агента ноди node.
 func agentAuthorized(node, tok string) bool {
 	if !validAgentNodeID(node) {
+		return false
+	}
+	// S1 (хвиля 8): відкликана нода не проходить жодним токеном.
+	if agentNodeRevoked(node) {
 		return false
 	}
 	if master := agentMaster(); master != token || legacyAgentTokenAllowed() {

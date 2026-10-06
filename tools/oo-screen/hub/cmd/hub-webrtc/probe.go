@@ -65,6 +65,17 @@ const (
 	probeFull    = 0.95 // нога мусила реально пронести ≥ стільки від rate
 	probeRing    = 64   // скільки останніх пакетів ноги тримаємо для дублів
 
+	// N4 з детектором затримки (delayLive): невдала проба коштує ~1 інтервал
+	// TWCC-фідбеку черги, а не дропи до NACK, тож (1) пауза після невдач —
+	// не довша за probeGapMaxDelay (з 8 с одна невдача перед зняттям стелі
+	// давала до 8 с простою — 2M: 17 с замість ≤ 15); (2) множник проби не
+	// нижчий за probeMulDelayMin — ×1.15 давало 0.85×1.15 < 1, тобто успішну
+	// пробу БЕЗ підйому цілі (ще ~2 с); (3) після успіху наступна проба вже
+	// через probeGapOKDelay (не чекаючи RR раз на ~1 с: крок 2 с → ~1.5 с).
+	probeGapMaxDelay = 4 * time.Second
+	probeMulDelayMin = 1.25
+	probeGapOKDelay  = 500 * time.Millisecond
+
 	paceBurst      = 20 * time.Millisecond // місткість бакета в часі
 	paceMinBytes   = 6000                  // ...але не менше за ~4 пакети
 	paceBacklog    = 256                   // черга ноги довша — не пейсимо (H-12, priming)
@@ -79,13 +90,23 @@ func flagOn(v string) bool { return v == "1" }
 // успішної проби (канал щойно довів запас — розгін після зняття стелі);
 // перша проба після зрізу ×1.5 (заміряно: ×2 над стелею 4M = 80-170 NACK,
 // бо обрив проби доходить лише через RTT + опит NACK 100 мс), далі менші.
-func probeMul(fails int, lastOK bool) float64 {
+func probeMul(fails int, lastOK, delay bool) float64 {
+	if delay && !lastOK && fails > 0 {
+		return math.Max(probeMulFails(fails), probeMulDelayMin)
+	}
 	switch {
 	case lastOK:
 		return 2.0
 	case fails == 0:
 		return 1.5
-	case fails == 1:
+	}
+	return probeMulFails(fails)
+}
+
+// probeMulFails — множник після fails ≥ 1 невдач поспіль (без детектора).
+func probeMulFails(fails int) float64 {
+	switch {
+	case fails <= 1:
 		return 1.25
 	default:
 		return 1.15
@@ -116,7 +137,7 @@ func (c bitrateCtl) probeDue(now time.Time) (bitrateCtl, uint64, bool) {
 	if now.Before(c.probeNextAt) {
 		return c, 0, false
 	}
-	rate := uint64(float64(c.target) * probeMul(c.probeFails, c.probeLastOK))
+	rate := uint64(float64(c.target) * probeMul(c.probeFails, c.probeLastOK, c.delayLive(now)))
 	if lim := uint64(float64(ceil) * probeMaxOver); rate > lim {
 		rate = lim
 	}
@@ -152,12 +173,16 @@ func (c bitrateCtl) probeDone(res probeOutcome, now time.Time) (bitrateCtl, bool
 	case probeFailed:
 		c.probeLastOK = false
 		c.probeFails++
+		gapMax := probeGapMax
+		if c.delayLive(now) {
+			gapMax = probeGapMaxDelay
+		}
 		gap := probeGapFail
-		for i := 1; i < c.probeFails && gap < probeGapMax; i++ {
+		for i := 1; i < c.probeFails && gap < gapMax; i++ {
 			gap *= 2
 		}
-		if gap > probeGapMax {
-			gap = probeGapMax
+		if gap > gapMax {
+			gap = gapMax
 		}
 		c.probeNextAt = now.Add(gap)
 		c.reason = "probe_fail"
@@ -166,6 +191,9 @@ func (c bitrateCtl) probeDone(res probeOutcome, now time.Time) (bitrateCtl, bool
 	c.probeFails = 0
 	c.probeLastOK = true
 	c.probeNextAt = now.Add(probeGapOK)
+	if c.delayLive(now) {
+		c.probeNextAt = now.Add(probeGapOKDelay)
+	}
 	next := uint64(float64(rate) * probeAccept)
 	if ceil := c.probeCeil(); next > ceil {
 		next = ceil
@@ -348,6 +376,15 @@ func finishProbe(ns *nodeSession, legs []*viewerLeg, now time.Time) {
 	if send {
 		sendBitrateTarget(ns, next.target, 0, 0, 0, false)
 		metricsNoteBitrate(ns, prev, "probe", 0)
+	}
+	if next.delayLive(now) && (send || res == probeFailed) {
+		// N4: наступна проба — щойно мине пауза (probeGapOKDelay після
+		// успіху, backoff після невдачі), а не на наступному RR: RR іде раз
+		// на ~1 с, і вердикт часто лягає одразу ПІСЛЯ нього — тоді кожен
+		// крок розгону займав 2 с, а пауза після невдачі — до +1 с.
+		if d := next.probeNextAt.Sub(now); d > 0 {
+			time.AfterFunc(d, func() { maybeProbe(ns, time.Now()) })
+		}
 	}
 }
 
