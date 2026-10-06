@@ -137,7 +137,7 @@ Chrome через WebRTC не приймає H.264 High 4:4:4, тому потр
 | `-width` / `-height` | 0 (рідна роздільність) | 0 | більше немає примусових 1080p |
 | `-output` | 0 | 0 | індекс монітора на старті |
 | `-force-software` | false | false | примусовий софт-енкодер (діагностика) |
-| `-gop-seconds` | 2 | 2 (>3 — лише разом з `OO_SCREEN_GOP_SPAN` на хабі) | інтервал IDR |
+| `-gop-seconds` | 10 | 10 (>11 — лише разом з більшим `OO_SCREEN_GOP_SPAN` на хабі) | інтервал IDR (у кадрах `gop-seconds×fps`, див. `research/QUALITY-AUDIT.md` Q-11) |
 | `-refine` | true | true | дошліфування нерухомого екрана (QP 22→18) |
 | `-text-tiles` | false | true після пілоту (потрібні `OO_SCREEN_TILES=1` і `config.textTiles`) | lossless тайли кольорового тексту |
 | `-cursor-layer` | false | true після пілоту (потрібен `config.cursorLayer`) | курсор окремим каналом |
@@ -183,7 +183,7 @@ Chrome через WebRTC не приймає H.264 High 4:4:4, тому потр
 | `OO_SCREEN_SESSION_CAP` | 120m | 120m | максимальна тривалість сесії |
 | `OO_SCREEN_START_BITRATE` | 8000000 | 8000000 | стартовий бітрейт, біт/с |
 | `OO_SCREEN_BITRATE_FASTUP` | 0 | 1 після пілоту | швидке відновлення бітрейту |
-| `OO_SCREEN_GOP_SPAN` | 3s (макс 30s) | 3s, або трохи більше за `-gop-seconds` | байтовий GOP-кеш |
+| `OO_SCREEN_GOP_SPAN` | 12s (макс 30s) | 12s, або трохи більше за `-gop-seconds` | байтовий GOP-кеш |
 | `OO_SCREEN_STRICT_CODEC` | 0 | 0 | різати сесію при неузгодженому профілі H.264 |
 | `OO_SCREEN_TILES` | 0 | 1 разом з `-text-tiles` | пересилати канал `oosc-tiles` |
 | `OO_SCREEN_RECORD` / `OO_SCREEN_RECORD_DIR` | 0 / `recordings` | за політикою | запис сесій (0700/0600) |
