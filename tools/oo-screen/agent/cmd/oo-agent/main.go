@@ -1444,8 +1444,11 @@ func main() {
 		refines    int // скільки refine-кадрів закодовано (ТЗ P4)
 		// refiner — автомат refine (internal/refine): коли рух стих, ще раз
 		// кодуємо останній кадр із нижчим QP. Лише апаратний D3D-шлях.
-		refiner = refine.New(refine.Config{MinGap: frameInterval,
-			AfterKeyframe: rcPol.RefineAfterIDR, QPAware: rcPol.RefineQPAware})
+		refiner = refine.New(refineConfig(rcPol, frameInterval, int(s.bitrateBps.Load())))
+		// C3: правило великого кадру — які межі QP зараз стоять на якому
+		// енкодері (largeQP 0 — межі політики).
+		largeQP    int
+		largeQPEnc *encode.Encoder
 		// TASK.md крок 4: вид кожного поданого кадру за PTS і QP з потоку —
 		// щоб refine знав, що лишилось на екрані (encpolicy.go).
 		auKind = &auKinds{}
@@ -2160,6 +2163,27 @@ loop:
 			// A-06: без покоління енкодер лишив би закешовану input-view на
 			// СТАРІЙ текстурі, якщо перебудований капчер отримав ту саму адресу.
 			encFrame.TextureGen = frame.TextureGen
+		}
+		// C3: великий кадр на вузькому каналі — одразу високий MinQP (дешевий
+		// кадр без стрибка HRD), якість доведе refine. Будь-який інший кадр
+		// повертає межі політики ДО SetRefineQP (той відновлює MinQP саме з них).
+		if rcPol.LargeFrameQP > 0 {
+			if largeQPEnc != s.encoder() {
+				largeQPEnc, largeQP = s.encoder(), 0
+			}
+			lmin, lmax, large := largeFrameBounds(rcPol, !still && refineQP == 0, textCF, int(s.bitrateBps.Load()), s.encW*s.encH)
+			want := lmin
+			if !large {
+				want = 0
+				lmin, lmax, _ = qpBounds(rcPol)
+			}
+			if want != largeQP {
+				if lerr := s.encoder().SetQPBounds(lmin, lmax); lerr != nil {
+					log.Printf("oo-agent: large-frame QP: %v — правило вимкнено", lerr)
+					rcPol.LargeFrameQP = 0
+				}
+				largeQP = want
+			}
 		}
 		if refineQP > 0 {
 			if rerr := s.encoder().SetRefineQP(refineQP); rerr != nil {

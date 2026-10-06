@@ -166,3 +166,31 @@ func TestEncStatsQPWindow(t *testing.T) {
 	var nilW *qpWindow
 	nilW.add(20) // вимкнено — без паніки
 }
+
+// C3: прапорці збіжності й великого кадру типово вимкнені і доходять до
+// refine.Config / меж QP.
+func TestRefineConvergePolicy(t *testing.T) {
+	off := rcPolicyFromEnv(func(string) string { return "" })
+	if off.RefineConverge || off.LargeFrameQP != 0 {
+		t.Fatalf("типово має бути вимкнено: %+v", off)
+	}
+	if c := refineConfig(off, time.Millisecond, 8_000_000); c.Converge {
+		t.Fatal("Converge без прапорця")
+	}
+	env := map[string]string{"OO_SCREEN_REFINE_CONVERGE": "1", "OO_SCREEN_REFINE_TARGET_QP": "14", "OO_SCREEN_LARGE_FRAME_QP": "32"}
+	on := rcPolicyFromEnv(func(k string) string { return env[k] })
+	c := refineConfig(on, time.Millisecond, 8_000_000)
+	if !c.Converge || c.TargetQP != 14 || c.ByteBudget != 1_000_000 {
+		t.Fatalf("config %+v", c)
+	}
+	if _, _, ok := largeFrameBounds(on, false, 1, 2_000_000, 1920*1080); ok {
+		t.Fatal("правило на нерухомому кадрі")
+	}
+	if mn, _, ok := largeFrameBounds(on, true, 1, 2_000_000, 1920*1080); !ok || mn != 32 {
+		t.Fatalf("великий кадр на 2M: %d %v", mn, ok)
+	}
+	on.QPMax = 30
+	if _, _, ok := largeFrameBounds(on, true, 1, 2_000_000, 1920*1080); ok {
+		t.Fatal("MaxQP 30 < MinQP 32 — правило мусить поступитись")
+	}
+}

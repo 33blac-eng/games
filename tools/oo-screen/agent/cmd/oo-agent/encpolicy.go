@@ -46,6 +46,20 @@ type rcPolicy struct {
 	// MFT, підтримка CODECAPI-властивостей, QP кадрів з потоку).
 	// OO_SCREEN_ENC_TELEMETRY, типово вимкнено.
 	EncTelemetry bool
+	// RefineConverge — C3: top-off до збіжності (refine.Config.Converge):
+	// після кроків 22/18 слати ще refine-кадри з RefineTargetQP, доки QP з
+	// потоку гірший за ціль (до 4 кадрів, бюджет RefineBudget байтів на
+	// епізод). OO_SCREEN_REFINE_CONVERGE, типово вимкнено.
+	RefineConverge bool
+	// RefineTargetQP — ціль збіжності. OO_SCREEN_REFINE_TARGET_QP (дефолт 16).
+	RefineTargetQP int
+	// RefineBudgetKB — бюджет епізоду, КБ; 0 — одна секунда -bitrate.
+	// OO_SCREEN_REFINE_BUDGET_KB.
+	RefineBudgetKB int
+	// LargeFrameQP — C3, правило великого кадру (refine.LargeFrameMinQP): MinQP
+	// для кадру, що змінив ≥ половини екрана при малому HRD-бюджеті; якість
+	// потім доводить refine. OO_SCREEN_LARGE_FRAME_QP, 0 — вимкнено (типово).
+	LargeFrameQP int
 }
 
 // envBool: "1"/"true"/"on" — так, "0"/"false"/"off" — ні, інше — def.
@@ -80,6 +94,10 @@ func rcPolicyFromEnv(getenv func(string) string) rcPolicy {
 		QPMax:          envInt(getenv, "OO_SCREEN_QP_MAX", 0, 0, 51),
 		IntraRefresh:   envInt(getenv, "OO_SCREEN_INTRA_REFRESH", 0, 0, 3600),
 		EncTelemetry:   envBool(getenv, "OO_SCREEN_ENC_TELEMETRY", false),
+		RefineConverge: envBool(getenv, "OO_SCREEN_REFINE_CONVERGE", false),
+		RefineTargetQP: envInt(getenv, "OO_SCREEN_REFINE_TARGET_QP", refine.DefaultTargetQP, 1, 51),
+		RefineBudgetKB: envInt(getenv, "OO_SCREEN_REFINE_BUDGET_KB", 0, 0, 1<<20),
+		LargeFrameQP:   envInt(getenv, "OO_SCREEN_LARGE_FRAME_QP", 0, 0, 51),
 	}
 }
 
@@ -193,4 +211,33 @@ func (w *qpWindow) encStatsMsg(seq uint64, encoder string, software bool, caps s
 		QPLast: w.last, QPMin: w.min, QPMax: w.max, QPFrames: w.n}
 	w.min, w.max, w.n = 0, 0, 0
 	return m
+}
+
+// refineConfig — refine.Config з політики (C3). bitrateBps — стартовий
+// -bitrate: з нього бюджет епізоду, коли OO_SCREEN_REFINE_BUDGET_KB не задано.
+func refineConfig(p rcPolicy, minGap time.Duration, bitrateBps int) refine.Config {
+	c := refine.Config{MinGap: minGap, AfterKeyframe: p.RefineAfterIDR, QPAware: p.RefineQPAware}
+	if p.RefineConverge {
+		c.Converge, c.TargetQP = true, p.RefineTargetQP
+		c.ByteBudget = p.RefineBudgetKB * 1000
+		if c.ByteBudget == 0 && bitrateBps > 0 {
+			c.ByteBudget = bitrateBps / 8
+		}
+	}
+	return c
+}
+
+// largeFrameBounds — межі QP для кадру з часткою зміни changed (C3, правило
+// великого кадру): ok=false — правило не діє, лишаються межі політики
+// (qpBounds). Стеля нижча за MinQP правила — конфлікт налаштувань, правило
+// поступається.
+func largeFrameBounds(p rcPolicy, motion bool, changed float64, bitrateBps, pixels int) (minQP, maxQP int, ok bool) {
+	if !motion {
+		return 0, 0, false
+	}
+	lf := refine.LargeFrameMinQP(changed, bitrateBps, pixels, p.LargeFrameQP)
+	if lf == 0 || (p.QPMax > 0 && p.QPMax < lf) {
+		return 0, 0, false
+	}
+	return lf, p.QPMax, true
 }

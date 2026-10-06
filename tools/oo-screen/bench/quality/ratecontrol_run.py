@@ -42,7 +42,17 @@ VARIANTS = {
     "qpmax40": {"qpmax": 40},
     "qpmax36": {"qpmax": 36},
     "qpmin16": {"qpmin": 16},
+    # C3: top-off до збіжності (refine.Config.Converge, OO_SCREEN_REFINE_CONVERGE): після 22/18 ще
+    # refine-кадри з TARGET_QP, доки ВИМІРЯНИЙ QP гірший, ≤ CONV_EXTRA кадрів і ≤ 1 с бітрейту байтів.
+    "conv": {"rekey": True, "conv": True},
+    # MFT, що ігнорує QP семпла (refine кодує rate control) — без і з Converge.
+    "ignqp": {"rekey": True, "ignqp": True},
+    "ignqp+conv": {"rekey": True, "ignqp": True, "conv": True},
+    # C3: правило великого кадру (OO_SCREEN_LARGE_FRAME_QP=32) + Converge.
+    "large32+conv": {"rekey": True, "conv": True, "large": 32},
 }
+TARGET_QP = 16           # refine.DefaultTargetQP
+CONV_EXTRA = 4           # refine.DefaultMaxExtra
 
 
 def build(out_dir):
@@ -66,10 +76,18 @@ class Agent:
         self.since_idr = 0       # закодованих кадрів від останнього IDR
         self.want_idr = False
         self.last_change = -10 ** 9
+        self.bytes = 0           # байтів refine за епізод (Converge)
+        self.budget = 0          # бюджет епізоду, байтів (1 с бітрейту)
 
     def motion(self, i):
         self.armed, self.done, self.next = True, 0, i + REFINE_IDLE
         self.last_change = i
+        self.bytes = 0
+
+    def converging(self):
+        return (self.v.get("conv") and self.done >= len(REFINE_QPS)
+                and self.done < len(REFINE_QPS) + CONV_EXTRA
+                and self.worst > TARGET_QP and self.bytes < self.budget)
 
     def refine_due(self, i):
         while self.armed and self.done < len(REFINE_QPS) and i >= self.next:
@@ -78,7 +96,9 @@ class Agent:
                 self.done += 1      # крок нічого не покращить — пропускаємо, не витрачаючи кадр
                 continue
             return qp
-        if self.done >= len(REFINE_QPS):
+        if self.armed and i >= self.next and self.converging():
+            return TARGET_QP
+        if self.done >= len(REFINE_QPS) and not self.converging():
             self.armed = False
         return 0
 
@@ -93,8 +113,10 @@ class Agent:
             if self.v.get("rekey") and refine_qp == 0:
                 # Ключовий кадр перезаписав дошліфований екран якістю rate control — refine знову.
                 self.armed, self.done, self.next = True, 0, i + REFINE_IDLE
+                self.bytes = 0
         elif refine_qp:
-            self.worst = refine_qp if self.worst == 0 else min(self.worst, refine_qp)
+            # як Go: QP з потоку важить більше за запитаний (MFT міг його проігнорувати)
+            self.worst = qp if self.worst == 0 else min(self.worst, qp)
         elif motion and self.worst > 0:
             self.worst = max(self.worst, qp)
         # keepalive (повтор без змін) — суцільний P-skip, якість екрана не міняє
@@ -102,25 +124,30 @@ class Agent:
             self.done += 1
             gap = math.ceil(nbytes * 8 / peak_bps * FPS) if peak_bps else 1
             self.next = i + max(1, gap)
-            if self.done >= len(REFINE_QPS):
+            self.bytes += nbytes
+            if self.done >= len(REFINE_QPS) and not self.converging():
                 self.armed = False
 
 
 def scan(kind, n, corpus):
     wl = WL.make(kind, WL.Sources(corpus))
-    changed, prev = [], None
+    changed, frac, prev = [], [], None
     for i in range(n):
         f = wl.frame(i)
-        changed.append(prev is None or not np.array_equal(f, prev))
+        if prev is None:
+            changed.append(True); frac.append(1.0)
+        else:
+            d = np.any(f != prev, axis=2)
+            changed.append(bool(d.any())); frac.append(float(d.mean()))
         prev = f
-    return changed
+    return changed, frac
 
 
 def run_variant(args):
     name, v, kind, kbps, n, corpus, tool = args[:7]
     joins_s = args[7] if len(args) > 7 else JOINS_S
     wl = WL.make(kind, WL.Sources(corpus))
-    changed = scan(kind, n, corpus)
+    changed, changed_frac = scan(kind, n, corpus)
     td = tempfile.mkdtemp()
     dump = os.path.join(td, "d.yuv")
     opts = [f"keyint={2 * GOP if v.get('idle_idr') else GOP}"]
@@ -130,6 +157,7 @@ def run_variant(args):
     p = subprocess.Popen([tool, str(WL.W), str(WL.H), str(FPS), os.path.join(td, "o.h264"), dump] + opts,
                          stdin=subprocess.PIPE, stdout=subprocess.PIPE)
     a = Agent(v)
+    a.budget = kbps * 1000 // 8
     peak = kbps * 1500
     joins = {int(t * FPS) for t in joins_s if t * FPS < n}
     last_sent, have_pix = -10 ** 9, False
@@ -154,7 +182,14 @@ def run_variant(args):
         if newpix:
             frame_bytes = to_yuv(wl.frame(i))
         dump_it = int(i in samples)
-        hdr = f"{kbps} {newpix} {send} {idr} {rq} {dump_it}\n".encode()
+        enc_q = 0 if v.get("ignqp") else rq  # ignqp: QP семпла проігноровано, кодує rate control
+        if newpix and v.get("large"):
+            # правило великого кадру (refine.LargeFrameMinQP): частка зміни x HRD на змінений піксель
+            frac = changed_frac[i]
+            if frac >= 0.5 and (kbps * 1000 / 2) / (frac * WL.W * WL.H) < 1.0:
+                # x264 не має MinQP на кадр: наближення — примусовий QP правила (дешевий кадр).
+                enc_q = v["large"]
+        hdr = f"{kbps} {newpix} {send} {idr} {enc_q} {dump_it}\n".encode()
         p.stdin.write(hdr + (frame_bytes if newpix else b""))
         p.stdin.flush()
         nb, typ, qp = p.stdout.readline().decode().split()
