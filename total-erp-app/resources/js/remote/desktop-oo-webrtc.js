@@ -1067,6 +1067,26 @@ export function mapRemoteToClient(x, y, rect, srcW, srcH) {
     return { x: b.x + x * scale, y: b.y + y * (b.height / srcH), scale };
 }
 
+/** cursorLayerOn — F9, з хвилі 10 типово ON; вимикач — config.cursorLayer=false. */
+export function cursorLayerOn(config) {
+    return !!config && config.cursorLayer !== false;
+}
+
+/** letterboxOn — чи вписувати відео за пропорціями потоку. Шар курсора
+ *  (типово ON) лєтербоксу НЕ вмикає — лише явне config.cursorLayer=true:
+ *  з вводом через Mesh лєтербокс зсунув би клік («КУРСОР НЕ ТАМ»). */
+export function letterboxOn(config) {
+    const c = config || {};
+    return !!(c.input || c.inputChannel || c.textTiles || c.cursorLayer === true);
+}
+
+/** mapRemoteToClientFill — як mapRemoteToClient, але для відео без
+ *  лєтербоксу (object-fit:fill у боксі Mesh-canvas, ввід через Mesh). */
+export function mapRemoteToClientFill(x, y, rect, srcW, srcH) {
+    if (!rect || !(srcW > 0) || !(srcH > 0) || !(rect.width > 0) || !(rect.height > 0)) return null;
+    return { x: x * rect.width / srcW, y: y * rect.height / srcH, scale: rect.width / srcW };
+}
+
 /** offerBody — тіло /offer/viewer. monitor лише ціле >0 (F6, config.monitor:
  *  потік "<node>#m<i>" на хабі), інакше поля немає — offer як до F6.
  *  caps — C1: rtpVideoCaps() (config.reportCaps), лише телеметрія хаба. */
@@ -1616,7 +1636,7 @@ export function createOoWebrtcLayer(o) {
         // повз. Тож лєтербокс лише з власним вводом; інакше відео = бокс canvas.
         // PR-оверлеї (тайли, курсор-шар, канал вводу) теж рахують по прямокутнику
         // картинки (containBox), тож лєтербокс потрібен і їм, не лише oo-input.
-        const fit = (config.input || config.inputChannel || config.textTiles || config.cursorLayer)
+        const fit = letterboxed()
             ? fitRect(mr.width, mr.height, video.videoWidth, video.videoHeight)
             : { left: 0, top: 0, width: mr.width, height: mr.height };
         let box;
@@ -2148,6 +2168,12 @@ export function createOoWebrtcLayer(o) {
         }
     }
 
+    // letterboxed — чи вписує syncGeometry відео за пропорціями потоку. Шар
+    // курсора з хвилі 10 типово ON, тож лєтербокс дає лише ЯВНЕ
+    // config.cursorLayer=true: інакше з вводом через Mesh клік поїхав би
+    // повз («КУРСОР НЕ ТАМ», 16.09.2026).
+    function letterboxed() { return letterboxOn(config); }
+
     function attachCursorChannel(peer, gen) {
         let dc;
         try {
@@ -2167,7 +2193,9 @@ export function createOoWebrtcLayer(o) {
                 const srcH = p.frameH || video.videoHeight;
                 const vr = video.getBoundingClientRect();
                 const cr = container.getBoundingClientRect();
-                const m = mapRemoteToClient(p.x, p.y, vr, srcW, srcH);
+                const m = letterboxed()
+                    ? mapRemoteToClient(p.x, p.y, vr, srcW, srcH)
+                    : mapRemoteToClientFill(p.x, p.y, vr, srcW, srcH);
                 if (!m) return null;
                 if (config.pixelSnap !== false) {
                     // P-3: гаряча точка — на цілому фізичному пікселі (як і відео):
@@ -2186,6 +2214,14 @@ export function createOoWebrtcLayer(o) {
                     y: vr.top - cr.top + container.scrollTop + m.y,
                     scale: m.scale,
                 };
+            },
+            // Керівник: оверлей у локальній позиції миші, без round-trip.
+            localPoint: (ev) => {
+                if (!ev || typeof ev.clientX !== 'number') return null;
+                const cr = container.getBoundingClientRect();
+                const org = config.pixelSnap !== false ? containerOrigin(cr)
+                    : { x: cr.left - container.scrollLeft, y: cr.top - container.scrollTop };
+                return { x: ev.clientX - org.x, y: ev.clientY - org.y };
             },
         });
         cursorLayer = layer;
@@ -2273,11 +2309,12 @@ export function createOoWebrtcLayer(o) {
                 textTiles.onMessage(ev.data);
             };
         }
-        // Шар курсора — ЛИШЕ під config.cursorLayer (типово вимкнено; агентові
-        // потрібен -cursor-layer). Канал відкриває браузер ДО offer-а, хаб ловить
+        // Шар курсора — з хвилі 10 ТИПОВО ON (вимикач config.cursorLayer=false;
+        // агент/хаб — OO_SCREEN_CURSOR_LAYER=0). Вказівник зникає з відео лише
+        // після дозволу хаба, коли КОЖЕН глядач має цей канал. Канал відкриває браузер ДО offer-а, хаб ловить
         // його спільним диспетчером OnDataChannel viewer-ноги (як input/tiles).
         // Без прапорця offer бітово той самий, що й раніше.
-        if (config.cursorLayer) attachCursorChannel(peer, gen);
+        if (cursorLayerOn(config)) attachCursorChannel(peer, gen);
         // F5: канал вводу — ЛИШЕ під config.inputChannel і лише для ролі control.
         // Відкриваємо ДО offer-а; слухачі DOM чіпляємо, коли відомий grant
         // квитка і канал відкритий (armInput нижче). Мовчазний канал хаб не

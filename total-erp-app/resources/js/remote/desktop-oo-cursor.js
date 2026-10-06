@@ -1,5 +1,5 @@
-// desktop-oo-cursor.js — шар курсора OO-плеєра (config.cursorLayer, ТИПОВО
-// ВИМКНЕНО). Агент із -cursor-layer не вмальовує вказівник у відео, а шле
+// desktop-oo-cursor.js — шар курсора OO-плеєра (config.cursorLayer, з хвилі 10
+// ТИПОВО ON; вимкнути — config.cursorLayer=false). Агент із -cursor-layer не вмальовує вказівник у відео, а шле
 // форму й позицію окремим DataChannel-ом 'oosc-cursor' (дзеркало
 // tools/oo-screen/internal/cursorproto). Тут — розбір повідомлень і показ.
 //
@@ -135,6 +135,44 @@ export function cursorPresentation(role, shape, url, visible) {
     return { css: 'none', overlay: true };
 }
 
+// cssCursorSize — R-5: CSS-курсор браузер малює 1 піксель картинки = 1 CSS px
+// (тобто ×dpr фізичних), а відео показане з масштабом scale CSS px на
+// віддалений піксель. Щоб курсор був того ж розміру, що й картинка (на dpr
+// 1.25 у 1:1 — 0.8), форму треба перемасштабувати до w·scale CSS px; гаряча
+// точка — у тих самих пікселях, округлена й у межах форми.
+export function cssCursorSize(shape, scale) {
+    const s = scale > 0 && Number.isFinite(scale) ? scale : 1;
+    const w = Math.max(1, Math.round(shape.w * s));
+    const h = Math.max(1, Math.round(shape.h * s));
+    return {
+        w, h,
+        hotX: Math.min(w - 1, Math.max(0, Math.round(shape.hotX * s))),
+        hotY: Math.min(h - 1, Math.max(0, Math.round(shape.hotY * s))),
+    };
+}
+
+// LOCAL_HOLD_MS — скільки після локального руху миші віддалена позиція НЕ
+// перебиває локальну (вона приходить із запізненням RTT і лише «тягнула б»
+// курсор назад). LOCAL_SNAP_PX — розбіжність (CSS px), яку вважаємо тим самим
+// наміром; більша й без локального руху — застосунок сам посунув курсор.
+export const LOCAL_HOLD_MS = 300;
+export const LOCAL_SNAP_PX = 4;
+
+// pickCursorPoint — ЧИСТЕ рішення, де малювати оверлей керівника: local
+// ({x,y,t} у координатах контейнера) — миттєвий, без round-trip; remote
+// ({x,y}) — лише коли локального руху давно не було І віддалений курсор
+// помітно деінде (SetCursorPos застосунку). Без тремтіння: свіжий локальний
+// рух завжди виграє.
+export function pickCursorPoint(local, remote, now) {
+    if (!local) return remote || null;
+    if (!remote) return local;
+    if (now - local.t < LOCAL_HOLD_MS) return local;
+    const dx = remote.x - local.x;
+    const dy = remote.y - local.y;
+    if (dx * dx + dy * dy <= LOCAL_SNAP_PX * LOCAL_SNAP_PX) return local;
+    return remote;
+}
+
 // resolveCursorRole — config.cursorRole явно ('control'|'view'), інакше
 // config.viewOnly=true -> глядач, а за замовчуванням — керівник (Mesh-canvas
 // під шаром ловить мишу саме цієї людини).
@@ -150,6 +188,13 @@ export function resolveCursorRole(config) {
 //   o.place(pos)       — {x,y,scale} у координатах контейнера або null
 //                        (мапінг робить desktop-oo-webrtc.js через containBox);
 //   o.role             — ROLE_CONTROL | ROLE_VIEW.
+//   o.localPoint(ev)   — (необов'язково) pointer-подія -> {x,y} контейнера;
+//                        керівник тоді малює оверлей у ЛОКАЛЬНІЙ позиції миші.
+//   o.scale()          — (необов'язково) CSS px на віддалений піксель для
+//                        CSS-курсора (R-5); без нього — масштаб із place().
+//   o.rescale(url,w,h,cb) — (необов'язково) перемасштабувати картинку форми,
+//                        cb(url2) коли готово; типово — canvas документа.
+//   o.now()            — годинник (тести).
 export function createCursorLayer(o) {
     const doc = o.doc;
     const role = o.role === ROLE_VIEW ? ROLE_VIEW : ROLE_CONTROL;
@@ -158,7 +203,66 @@ export function createCursorLayer(o) {
     let pos = null;
     let img = null;
     let lastCss = null;
+    let local = null;              // {x,y,t} — остання локальна позиція миші
+    const scaled = new Map();      // 'id:w:h' -> url | '' (у роботі)
     const MAX_CACHE = 64;
+    const now = typeof o.now === 'function' ? o.now : () => Date.now();
+
+    function defaultRescale(url, w, h, cb) {
+        const win = doc && doc.defaultView;
+        const Img = win && win.Image;
+        if (!Img) return;
+        try {
+            const im = new Img();
+            im.onload = () => {
+                try {
+                    const c = doc.createElement('canvas');
+                    c.width = w; c.height = h;
+                    const ctx = c.getContext('2d');
+                    ctx.imageSmoothingEnabled = true;
+                    ctx.imageSmoothingQuality = 'high';
+                    ctx.drawImage(im, 0, 0, w, h);
+                    cb(c.toDataURL('image/png'));
+                } catch (e) { /* лишаємо нескейлений */ }
+            };
+            im.src = url;
+        } catch (e) { /* ignore */ }
+    }
+    const rescale = typeof o.rescale === 'function' ? o.rescale : defaultRescale;
+
+    // cssEntry — CSS-курсор форми в масштабі відео (R-5). Поки перемасштабована
+    // картинка не готова — рідна (як до R-5), з рідною гарячою точкою.
+    function cssEntry(id, entry, scale) {
+        const g = cssCursorSize(entry.shape, scale);
+        if (g.w === entry.shape.w && g.h === entry.shape.h) return { shape: entry.shape, url: entry.url };
+        const key = id + ':' + g.w + ':' + g.h;
+        if (!scaled.has(key)) {
+            if (scaled.size >= MAX_CACHE) scaled.delete(scaled.keys().next().value);
+            scaled.set(key, '');
+            let sync = true;
+            rescale(entry.url, g.w, g.h, (u) => {
+                if (!u || !scaled.has(key)) return;
+                scaled.set(key, u);
+                if (!sync) render();
+            });
+            sync = false;
+        }
+        const got = scaled.get(key);
+        if (got) return { shape: { w: g.w, h: g.h, hotX: g.hotX, hotY: g.hotY }, url: got };
+        return { shape: entry.shape, url: entry.url };
+    }
+
+    const onLocalMove = (ev) => {
+        if (typeof o.localPoint !== 'function') return;
+        const p = o.localPoint(ev);
+        if (!p) return;
+        local = { x: p.x, y: p.y, t: now() };
+        if (img && img.style.display === 'block') render();
+    };
+    const moveTarget = role === ROLE_CONTROL ? o.container : null;
+    if (moveTarget && typeof moveTarget.addEventListener === 'function') {
+        try { moveTarget.addEventListener('pointermove', onLocalMove, { passive: true }); } catch (e) { /* ignore */ }
+    }
 
     function overlay() {
         if (img) return img;
@@ -181,12 +285,21 @@ export function createCursorLayer(o) {
     }
 
     function render() {
-        const entry = pos ? shapes.get(pos.shapeId) : null;
+        let entry = pos ? shapes.get(pos.shapeId) : null;
+        const at = pos ? o.place(pos) : null;
+        if (entry && role === ROLE_CONTROL) {
+            const sc = typeof o.scale === 'function' ? o.scale() : (at && at.scale);
+            entry = Object.assign({}, entry, cssEntry(pos.shapeId, entry, sc));
+            if (entry.shape.w > CSS_CURSOR_MAX || entry.shape.h > CSS_CURSOR_MAX) entry = shapes.get(pos.shapeId);
+        }
         const pres = cursorPresentation(role, entry && entry.shape, entry && entry.url, pos && pos.visible);
         setCss(pres.css);
         if (!pres.overlay) { if (img) img.style.display = 'none'; return; }
-        const at = o.place(pos);
         if (!at) { if (img) img.style.display = 'none'; return; }
+        // Керівник: оверлей одразу під локальною мишею (без round-trip);
+        // віддалена позиція — лише коли застосунок сам посунув курсор.
+        const pt = role === ROLE_CONTROL ? pickCursorPoint(local, at, now()) : at;
+        at.x = pt.x; at.y = pt.y;
         const el = overlay();
         if (el.getAttribute('src') !== entry.url) el.setAttribute('src', entry.url);
         const s = at.scale > 0 ? at.scale : 1;
@@ -214,6 +327,11 @@ export function createCursorLayer(o) {
         // relayout — геометрія відео змінилась (resize, 1:1).
         relayout() { render(); },
         destroy() {
+            if (moveTarget && typeof moveTarget.removeEventListener === 'function') {
+                try { moveTarget.removeEventListener('pointermove', onLocalMove, { passive: true }); } catch (e) { /* ignore */ }
+            }
+            scaled.clear();
+            local = null;
             for (const [el, c] of savedCursor) { try { el.style.cursor = c; } catch (e) { /* ignore */ } }
             savedCursor.clear();
             if (img && img.parentNode) { try { img.parentNode.removeChild(img); } catch (e) { /* ignore */ } }

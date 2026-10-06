@@ -4,7 +4,8 @@ import {
     decodeCursorMessage, cursorPresentation, resolveCursorRole, shapeDataUrl,
     createCursorLayer, ROLE_CONTROL, ROLE_VIEW, CSS_CURSOR_MAX, CURSOR_CHANNEL_LABEL,
 } from '../desktop-oo-cursor.js';
-import { mapRemoteToClient, mapClientToRemote, containBox } from '../desktop-oo-webrtc.js';
+import { mapRemoteToClient, mapClientToRemote, containBox, cursorLayerOn, letterboxOn, mapRemoteToClientFill } from '../desktop-oo-webrtc.js';
+import { cssCursorSize, pickCursorPoint, LOCAL_HOLD_MS } from '../desktop-oo-cursor.js';
 
 const hex = (h) => Uint8Array.from(h.match(/../g).map((x) => parseInt(x, 16)));
 
@@ -151,6 +152,63 @@ const place = (p) => ({ x: p.x * 2, y: p.y * 2, scale: 2 });
     layer.onMessage(posMsg(9, 1, 1, false));
     assert.equal(img.style.display, 'none');
     layer.destroy();
+}
+
+// ── Хвиля 10: дефолт ON, вимикач, без лєтербоксу для Mesh-вводу ───────────
+assert.equal(cursorLayerOn({}), true, 'F9 типово ON');
+assert.equal(cursorLayerOn({ cursorLayer: false }), false, 'вимикач config.cursorLayer=false');
+assert.equal(letterboxOn({}), false, 'дефолтний шар не вмикає лєтербокс (ввід через Mesh)');
+assert.equal(letterboxOn({ cursorLayer: true }), true);
+assert.deepEqual(mapRemoteToClientFill(50, 25, { width: 200, height: 50 }, 100, 100), { x: 100, y: 12.5, scale: 2 });
+
+// R-5: CSS-курсор у масштабі відео (dpr 1.25 у 1:1 -> scale 0.8).
+assert.deepEqual(cssCursorSize({ w: 32, h: 32, hotX: 0, hotY: 0 }, 0.8), { w: 26, h: 26, hotX: 0, hotY: 0 });
+assert.deepEqual(cssCursorSize({ w: 32, h: 32, hotX: 15, hotY: 31 }, 0.8), { w: 26, h: 26, hotX: 12, hotY: 25 });
+assert.deepEqual(cssCursorSize({ w: 16, h: 16, hotX: 2, hotY: 3 }, 1), { w: 16, h: 16, hotX: 2, hotY: 3 });
+{
+    let asked = null;
+    const layer = createCursorLayer({
+        doc, container, targets: () => [canvas], role: ROLE_CONTROL,
+        place: (p) => ({ x: p.x, y: p.y, scale: 0.8 }),
+        rescale: (url, w, h, cb) => { asked = [w, h]; cb('data:scaled'); },
+    });
+    layer.onMessage(pngShapeMsg(7, 32, 32, 15, 31));
+    layer.onMessage(posMsg(7, 10, 10, true));
+    assert.deepEqual(asked, [26, 26]);
+    assert.equal(canvas.style.cursor, 'url("data:scaled") 12 25, auto', 'перемасштабована форма і гаряча точка');
+    layer.destroy();
+}
+
+// Локальна позиція керівника: свіжий локальний рух виграє, віддалена — лише
+// коли застосунок посунув курсор (давно без руху й далеко).
+assert.deepEqual(pickCursorPoint({ x: 1, y: 1, t: 1000 }, { x: 50, y: 50 }, 1000 + LOCAL_HOLD_MS - 1), { x: 1, y: 1, t: 1000 });
+assert.deepEqual(pickCursorPoint({ x: 1, y: 1, t: 0 }, { x: 3, y: 2 }, 10000), { x: 1, y: 1, t: 0 });
+assert.deepEqual(pickCursorPoint({ x: 1, y: 1, t: 0 }, { x: 50, y: 50 }, 10000), { x: 50, y: 50 });
+{
+    let clock = 0;
+    const listeners = {};
+    const cont = fakeEl('div');
+    cont.addEventListener = (k, f) => { listeners[k] = f; };
+    cont.removeEventListener = (k) => { delete listeners[k]; };
+    const layer = createCursorLayer({
+        doc, container: cont, targets: () => [canvas], role: ROLE_CONTROL, now: () => clock,
+        place: (p) => ({ x: p.x, y: p.y, scale: 1 }),
+        localPoint: (ev) => ({ x: ev.clientX, y: ev.clientY }),
+    });
+    layer.onMessage(pngShapeMsg(8, 200, 200, 0, 0)); // > 128: оверлей
+    layer.onMessage(posMsg(8, 10, 10, true));
+    const im = cont.children[0];
+    assert.equal(im.style.transform, 'translate(10px,10px) scale(1)');
+    clock = 100;
+    listeners.pointermove({ clientX: 40, clientY: 30 });
+    assert.equal(im.style.transform, 'translate(40px,30px) scale(1)', 'миттєво під локальною мишею');
+    layer.onMessage(posMsg(8, 20, 20, true)); // запізніла віддалена — не тягне назад
+    assert.equal(im.style.transform, 'translate(40px,30px) scale(1)');
+    clock = 100 + LOCAL_HOLD_MS + 1;
+    layer.onMessage(posMsg(8, 300, 300, true)); // застосунок посунув курсор
+    assert.equal(im.style.transform, 'translate(300px,300px) scale(1)');
+    layer.destroy();
+    assert.equal(listeners.pointermove, undefined);
 }
 
 console.log('cursor-layer: ok');
