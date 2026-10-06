@@ -200,32 +200,41 @@ func (g *Gate) decide(ctx context.Context, cancel context.CancelFunc, gen uint64
 		g.mu.Unlock() // глядач пішов, поки думали — рішення застаріле
 		return
 	}
-	g.pending = nil
 	if !ok {
+		g.pending = nil
 		g.blockedTo = g.cfg.Now().Add(g.cfg.Cooldown)
 		g.mu.Unlock()
 		g.cfg.Logf("consent: DENIED (%s)", how)
 		return
 	}
 	if !g.want {
+		g.pending = nil
 		g.mu.Unlock()
 		g.cfg.Logf("consent: answer ignored — viewer left before it")
 		return
 	}
-	g.granted = true
+	// pending лишається виставленим, доки індикатор не показано: повторний
+	// resume не запускає другий decide, а revoke (gen++) робить це рішення
+	// застарілим.
 	g.mu.Unlock()
-	g.cfg.Logf("consent: granted (%s, policy=%s)", how, g.cfg.Policy)
-	// Індикатор — ДО першого кадру.
+	// Індикатор — ДО згоди: Allowed() (ввід) і кадри вмикаються лише коли
+	// користувач уже бачить, що за ним дивляться.
 	g.cfg.UI.ShowIndicator(func() { g.End() })
 	g.mu.Lock()
-	live := g.granted && g.gen == gen // revoke міг встигнути між локами
+	live := g.gen == gen && g.pending != nil && g.want // revoke чи pause міг встигнути між локами
+	if g.gen == gen {
+		g.pending = nil // рішення завершене (успішно чи ні)
+	}
 	if live {
+		g.granted = true
 		g.inner(true)
 	}
 	g.mu.Unlock()
 	if !live {
 		g.cfg.UI.HideIndicator()
+		return
 	}
+	g.cfg.Logf("consent: granted (%s, policy=%s)", how, g.cfg.Policy)
 }
 
 // End — кнопка «Завершити сесію» на ПК: зупиняє кадри/ввід і на Cooldown
