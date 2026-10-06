@@ -13,6 +13,12 @@ import (
 // Це писар у процесі (трек незвʼязаний, мережі нема) — доводить лише, що pump
 // встигає генерувати rate, а не що канал його несе.
 func TestProbeThroughPump(t *testing.T) {
+	// Керований тікер проби: під навантаженням справжній тікер губив тики
+	// (pump не отримував процесор), і вікно проби недобирало байтів.
+	ticks := make(chan time.Time)
+	prevTicker := newProbeTicker
+	newProbeTicker = func() (<-chan time.Time, func()) { return ticks, func() {} }
+	t.Cleanup(func() { newProbeTicker = prevTicker })
 	ns := readyNode(t, "probe-pump")
 	vl := ns.onlyViewer(t)
 	for i := 0; i < 8; i++ {
@@ -25,7 +31,13 @@ func TestProbeThroughPump(t *testing.T) {
 	now := time.Now()
 	p := &legProbe{start: now, end: now.Add(probeDur), bps: 4_000_000, evalUntil: now.Add(probeDur + probeGrace)}
 	vl.setProbe(p)
-	time.Sleep(probeDur + 50*time.Millisecond)
+	// Тики по годиннику проби, крок probeTick, до кінця вікна включно.
+	// Канал небуферизований: кожна відправка повертається лише тоді, коли
+	// pump уже обробив попередній тик, — без вікон сну.
+	for at := now.Add(probeTick); !at.After(p.end); at = at.Add(probeTick) {
+		ticks <- at
+	}
+	ticks <- p.end // гарантує, що останній тик у вікні вже оброблено
 	vl.setProbe(nil)
 	want := float64(p.bps) / 8 * probeDur.Seconds()
 	got := float64(p.sentBytes.Load())
@@ -47,7 +59,10 @@ func TestProbeThroughPump(t *testing.T) {
 	q := &legProbe{start: now, end: now.Add(probeDur), bps: 4_000_000, evalUntil: now.Add(time.Second)}
 	q.aborted.Store(true)
 	vl.setProbe(q)
-	time.Sleep(100 * time.Millisecond)
+	for i := 1; i <= 20; i++ {
+		ticks <- now.Add(time.Duration(i) * probeTick)
+	}
+	ticks <- now.Add(probeDur) // останній тик у вікні вже оброблено
 	vl.setProbe(nil)
 	if q.padBytes.Load() != 0 {
 		t.Fatalf("обірвана проба дописала %d", q.padBytes.Load())

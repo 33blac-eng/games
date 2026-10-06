@@ -199,3 +199,40 @@ func TestParsePolicy(t *testing.T) {
 		t.Error("unknown policy must error")
 	}
 }
+
+// blockingShowUI — ShowIndicator висить, доки тест не відпустить: ловимо
+// вікно між «згода є» і «індикатор видно».
+type blockingShowUI struct {
+	*fakeUI
+	entered chan struct{}
+	release chan struct{}
+}
+
+func (b *blockingShowUI) ShowIndicator(onEnd func()) {
+	close(b.entered)
+	<-b.release
+	b.fakeUI.ShowIndicator(onEnd)
+}
+
+// Allowed() (ввід/кадри) не може стати true, поки індикатор ще не показано.
+func TestAllowedOnlyAfterIndicatorShown(t *testing.T) {
+	ui := &blockingShowUI{fakeUI: newFake(), entered: make(chan struct{}), release: make(chan struct{})}
+	s := &sink{}
+	s.paused.Store(true)
+	g := New(Config{Policy: Unattended, UI: ui, Timeout: time.Second, Cooldown: time.Hour})
+	sig := g.Wrap(s.gate)
+	sig(true)
+	select {
+	case <-ui.entered:
+	case <-time.After(30 * time.Second):
+		t.Fatal("ShowIndicator never called")
+	}
+	if g.Allowed() || !s.paused.Load() {
+		t.Fatal("granted before indicator is visible")
+	}
+	close(ui.release)
+	waitFor(t, func() bool { return g.Allowed() })
+	if !ui.shown.Load() || s.paused.Load() {
+		t.Fatal("after grant: indicator and frames must be on")
+	}
+}

@@ -44,7 +44,8 @@ type AgentLeg struct {
 	opt       AgentLegOptions
 	dropped   atomic.Int64
 	delivered atomic.Int64
-	closed    atomic.Bool
+	closed    atomic.Bool // рвемо: колбеки стану більше не звітують
+	down      atomic.Bool // PC.Close() уже повернувся — нога справді мертва
 	done      chan struct{}
 	once      sync.Once
 	reason    atomic.Value // string: чому нога закрилась
@@ -154,6 +155,7 @@ func (l *AgentLeg) shutdown(reason string, report bool) {
 		l.reason.Store(reason)
 		close(l.done)
 		_ = l.PC.Close()
+		l.down.Store(true)
 		if report && l.opt.OnState != nil {
 			l.opt.OnState(StateClosed, "", reason)
 		}
@@ -163,7 +165,9 @@ func (l *AgentLeg) shutdown(reason string, report bool) {
 // Closed — чи нога вже закрита, і чому.
 func (l *AgentLeg) Closed() (bool, string) {
 	r, _ := l.reason.Load().(string)
-	return l.closed.Load(), r
+	// down, а не closed: «закрита» має означати, що PeerConnection уже
+	// закрито (кадри не йдуть), а не лише що закриття почалось.
+	return l.down.Load(), r
 }
 
 // handleInput — та сама правда, що judgeInput на relay-нозі: grant із квитка

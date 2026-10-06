@@ -32,7 +32,7 @@ func TestOpusToneReachesViewer(t *testing.T) {
 	if !strings.EqualFold(audio.Codec().MimeType, "audio/opus") || audio.Codec().Channels != 2 {
 		t.Fatalf("кодек доріжки %+v", audio.Codec())
 	}
-	if err := audio.SetReadDeadline(time.Now().Add(15 * time.Second)); err != nil {
+	if err := audio.SetReadDeadline(time.Now().Add(eventGuard)); err != nil {
 		t.Fatal(err)
 	}
 	dec, _ := opusenc.NewDecoder()

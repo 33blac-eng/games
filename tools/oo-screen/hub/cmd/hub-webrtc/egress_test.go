@@ -88,7 +88,7 @@ func TestEgressConnOrderAndIntegrity(t *testing.T) {
 			for d, c := range rx {
 				buf := make([]byte, 2048)
 				for k, w := range want[d] {
-					_ = c.SetReadDeadline(time.Now().Add(3 * time.Second))
+					_ = c.SetReadDeadline(time.Now().Add(eventGuard)) // запобіжник, не вікно
 					m, _, err := c.ReadFromUDP(buf)
 					if err != nil {
 						t.Fatalf("приймач %d: пакет %d з %d: %v", d, k, len(want[d]), err)
@@ -131,7 +131,7 @@ func TestEgressConnManyDestinations(t *testing.T) {
 			buf := make([]byte, 2048)
 			for d, c := range rx {
 				for k := 0; k < per; k++ {
-					_ = c.SetReadDeadline(time.Now().Add(3 * time.Second))
+					_ = c.SetReadDeadline(time.Now().Add(eventGuard)) // запобіжник, не вікно
 					m, _, err := c.ReadFromUDP(buf)
 					if err != nil {
 						t.Fatalf("приймач %d, пакет %d: %v", d, k, err)
