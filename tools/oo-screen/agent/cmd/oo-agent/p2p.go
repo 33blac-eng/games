@@ -296,7 +296,7 @@ func (a *p2pAgent) handleOffer(ctx context.Context, o p2p.Offer) {
 		OnInput: a.input,
 		OnDataChannel: func(dc *webrtc.DataChannel) {
 			if dc.Label() == cursorproto.ChannelLabel && a.cursor != nil {
-				a.cursor.attach(dc)
+				a.cursor.attach(id, dc)
 			}
 		},
 		OnState: func(state, pair, reason string) {
@@ -318,6 +318,11 @@ func (a *p2pAgent) handleOffer(ctx context.Context, o p2p.Offer) {
 		return
 	}
 	// Реєстрація ДО answer: наступний poll уже має назвати ногу в active.
+	// F9: і в дозволі шару курсора — поки браузер ноги не відкрив
+	// oosc-cursor, вказівник лишається в кадрі (кадри підуть лише після ICE).
+	if a.cursor != nil {
+		a.cursor.legAdd(id)
+	}
 	a.legs.Add(id, leg)
 	a.mu.Lock()
 	ent.leg = leg
@@ -497,6 +502,9 @@ func (a *p2pAgent) drop(id string) {
 	delete(a.entries, id)
 	a.mu.Unlock()
 	a.forgetLeg(id)
+	if a.cursor != nil {
+		a.cursor.legDrop(id)
+	}
 	if had {
 		a.notifyActive()
 	}
