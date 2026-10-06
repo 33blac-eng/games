@@ -96,6 +96,11 @@ OOS_GUID(OOS_AVEncH264CABACEnable,        STATIC_CODECAPI_AVEncH264CABACEnable);
  * plain DEFINE_GUID in mfapi.h (storage allocated via INITGUID). Verified
  * against mingw-w64 headers. */
 OOS_GUID(OOS_AVEncVideoMaxQP,             STATIC_CODECAPI_AVEncVideoMaxQP);
+/* TASK.md крок 4: межі QP для екранного вмісту і поступове інтра-оновлення
+ * замість періодичного IDR. Обидва — Windows 8+/10+, best effort: MFT, що
+ * відмовив, лишається на старій поведінці, відмова видна в cfg_report. */
+OOS_GUID(OOS_AVEncVideoMinQP,             STATIC_CODECAPI_AVEncVideoMinQP);
+OOS_GUID(OOS_AVEncVideoGradualIntraRefresh, STATIC_CODECAPI_AVEncVideoGradualIntraRefresh);
 
 /* IID_ICodecAPI: mingw declares it extern in strmif.h, but icodecapi.h (which
  * would define it) redefines struct CodecAPIEventData and cannot be included
@@ -198,6 +203,11 @@ struct oos_enc {
     int32_t  mf_held;       /* this encoder holds a ref on the MTA anchor */
     int64_t  last_pts;
     int32_t  refine_qp;     /* >0: per-frame QP for the following submits (ТЗ P4) */
+    /* TASK.md крок 4: межі QP поза refine. 0 = не задано (MFT за дефолтом;
+     * refine відновлює MaxQP до 51, як раніше). */
+    int32_t  qp_min, qp_max;
+    int32_t  intra_refresh; /* >0: запитане інтра-оновлення, кадрів */
+    int32_t  intra_refresh_on; /* MFT прийняв GradualIntraRefresh */
 
     /* Timing of the last submit, split so the gate can tell the MFT's own cost
      * apart from back-pressure (waiting for METransformNeedInput). */
@@ -510,6 +520,16 @@ static void configure_codecapi(oos_enc *e)
      * нашому вмісті радше ЗМЕНШУЮТЬ потік. Більше двох не беремо: без B-кадрів
      * і при GOP=2с виграш згасає, а пошук дорожчає. */
     note_cfg(e, "MaxNumRefFrame", set_codec_u32(e, &OOS_AVEncVideoMaxNumRefFrame, 2));
+    /* TASK.md крок 4, OO_SCREEN_INTRA_REFRESH (типово вимкнено). Значення —
+     * тривалість оновлення в кадрах (MSDN: «number of frames over which the
+     * intra refresh is spread»). UNVERIFIED на залізі: який MFT це вміє і чи
+     * декодер Chrome стартує з такого потоку — keyframe_request усе одно дає
+     * справжній IDR. Відмова -> лишається періодичний IDR (GOP вище). */
+    if (e->intra_refresh > 0) {
+        HRESULT hr = set_codec_u32(e, &OOS_AVEncVideoGradualIntraRefresh, (ULONG)e->intra_refresh);
+        note_cfg(e, "GradualIntraRefresh", hr);
+        e->intra_refresh_on = SUCCEEDED(hr);
+    }
 
     if (!e->is_hardware) {
         /* ТЗ P8. Софтверний Microsoft H264 MFT без підказки бере ВСІ логічні
@@ -1108,6 +1128,7 @@ int oos_enc_open(const oos_enc_cfg *cfg, oos_enc **out, char *err, int32_t err_l
     e->fps     = cfg->fps > 0 ? cfg->fps : 30;
     e->bitrate = cfg->bitrate_bps > 0 ? cfg->bitrate_bps : 8000000;
     e->gop     = cfg->gop > 0 ? cfg->gop : e->fps * 2;
+    e->intra_refresh = cfg->intra_refresh > 0 ? cfg->intra_refresh : 0;
     e->src_w   = cfg->src_width  > 0 ? cfg->src_width  : e->width;
     e->src_h   = cfg->src_height > 0 ? cfg->src_height : e->height;
     e->in_id = 0; e->out_id = 0;
@@ -1513,12 +1534,41 @@ int oos_enc_set_refine_qp(oos_enc *e, int32_t qp, char *err, int32_t err_len)
     if (!e->codec) return OOS_ENC_OK; /* sample attribute alone */
     /* MaxQP caps the rate controller from above, so the frame cannot come out
      * blurrier than qp even if the per-sample QP is ignored. 51 = no cap.
-     * MaxBitRate/BufferSize stay untouched: the HRD still bounds the burst. */
-    HRESULT hr = set_codec_u32(e, &OOS_AVEncVideoMaxQP, (ULONG)(qp > 0 ? qp : 51));
+     * MaxBitRate/BufferSize stay untouched: the HRD still bounds the burst.
+     * TASK.md крок 4: відновлення — до заданої стелі (oos_enc_set_qp_bounds),
+     * а MinQP на час refine опускається, щоб не затиснути QP семпла. */
+    HRESULT hr = set_codec_u32(e, &OOS_AVEncVideoMaxQP,
+                               (ULONG)(qp > 0 ? qp : (e->qp_max > 0 ? e->qp_max : 51)));
+    if (e->qp_min > 0 && (qp == 0 || qp < e->qp_min))
+        set_codec_u32(e, &OOS_AVEncVideoMinQP, (ULONG)(qp > 0 ? qp : e->qp_min));
     if (FAILED(hr)) { set_err(err, err_len, "AVEncVideoMaxQP", hr);
                       return OOS_ENC_ERROR; }
     return OOS_ENC_OK;
 }
+
+int oos_enc_set_qp_bounds(oos_enc *e, int32_t min_qp, int32_t max_qp, char *err, int32_t err_len)
+{
+    if (!e) return OOS_ENC_ERROR;
+    if (min_qp < 0 || min_qp > 51 || max_qp < 0 || max_qp > 51 ||
+        (min_qp > 0 && max_qp > 0 && min_qp > max_qp)) {
+        set_msg(err, err_len, "qp bounds out of range"); return OOS_ENC_ERROR;
+    }
+    if (!e->codec) { set_msg(err, err_len, "MFT has no ICodecAPI"); return OOS_ENC_ERROR; }
+    HRESULT hmin = S_OK, hmax = S_OK;
+    /* 0 = зняти межу: MinQP 0 / MaxQP 51 — повний діапазон H.264. */
+    if (min_qp != e->qp_min)
+        hmin = set_codec_u32(e, &OOS_AVEncVideoMinQP, (ULONG)min_qp);
+    /* Поки триває refine, стелю тримає він; нова застосується на restore. */
+    if (max_qp != e->qp_max && e->refine_qp == 0)
+        hmax = set_codec_u32(e, &OOS_AVEncVideoMaxQP, (ULONG)(max_qp > 0 ? max_qp : 51));
+    if (SUCCEEDED(hmin)) e->qp_min = min_qp;
+    if (SUCCEEDED(hmax)) e->qp_max = max_qp;
+    if (FAILED(hmin)) { set_err(err, err_len, "AVEncVideoMinQP", hmin); return OOS_ENC_ERROR; }
+    if (FAILED(hmax)) { set_err(err, err_len, "AVEncVideoMaxQP", hmax); return OOS_ENC_ERROR; }
+    return OOS_ENC_OK;
+}
+
+int32_t oos_enc_intra_refresh(oos_enc *e) { return e ? e->intra_refresh_on : 0; }
 
 int oos_enc_flush(oos_enc *e, char *err, int32_t err_len)
 {

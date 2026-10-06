@@ -58,6 +58,11 @@ typedef struct {
      * gate to exercise the software sync path on a machine that also has
      * hardware. Zero -> hardware first, software only as an automatic fallback. */
     int32_t force_software;
+
+    /* TASK.md крок 4: >0 — CODECAPI_AVEncVideoGradualIntraRefresh на цю
+     * кількість кадрів (best effort, UNVERIFIED; oos_enc_intra_refresh каже,
+     * чи MFT прийняв). 0 — лише періодичний IDR, як раніше. */
+    int32_t intra_refresh;
 } oos_enc_cfg;
 
 typedef struct {
@@ -112,6 +117,15 @@ int oos_enc_set_bitrate(oos_enc *e, int32_t bps, char *err, int32_t err_len);
  * The sample QP is applied even when ICodecAPI refuses MaxQP; that refusal is
  * still reported through err. */
 int oos_enc_set_refine_qp(oos_enc *e, int32_t qp, char *err, int32_t err_len);
+
+/* TASK.md крок 4: межі QP rate control поза refine (CODECAPI_AVEncVideoMinQP /
+ * MaxQP). 0 = без межі (MinQP 0 / MaxQP 51). Refine тимчасово перекриває обидві
+ * й відновлює саме ці. Відмова MFT — OOS_ENC_ERROR з HRESULT у err; межа, яку
+ * не прийняли, не запам'ятовується. */
+int oos_enc_set_qp_bounds(oos_enc *e, int32_t min_qp, int32_t max_qp, char *err, int32_t err_len);
+
+/* 1 — MFT прийняв GradualIntraRefresh (cfg.intra_refresh). */
+int32_t oos_enc_intra_refresh(oos_enc *e);
 
 /* Drain + MFT_MESSAGE_COMMAND_FLUSH + restart streaming; next frame is an IDR. */
 int oos_enc_flush(oos_enc *e, char *err, int32_t err_len);

@@ -27,6 +27,20 @@ type rcPolicy struct {
 	// IdleIDR — періодичний IDR агент ставить сам, у тиші (internal/keyframe);
 	// GOP самого MFT тоді вдвічі довший — запобіжник. OO_SCREEN_IDLE_IDR.
 	IdleIDR bool
+	// QPMin/QPMax — межі QP rate control поза refine (CODECAPI_AVEncVideo
+	// MinQP/MaxQP); 0 — не задавати. OO_SCREEN_QP_MIN / OO_SCREEN_QP_MAX.
+	// Типово не задано: у симуляції (mixed, 2M) MaxQP 36 піднімає PSNR p5
+	// 17.2 -> 28.9 dB, але кадри перевищують HRD — макс. затримка черги
+	// 371 -> 744 мс. Це вибір «читабельно, але з ривком» для повільних
+	// каналів, а не безпечний дефолт. MinQP 16 на 8M: -7 % бітрейту ціною
+	// -0.5 dB, на 2M нічого.
+	QPMin, QPMax int
+	// IntraRefresh — кадрів поступового інтра-оновлення (CODECAPI_AVEncVideo
+	// GradualIntraRefresh); 0 — вимкнено. OO_SCREEN_INTRA_REFRESH. GOP MFT не
+	// змінюється: періодичний IDR лишається запобіжником, а keyframe_request
+	// — справжнім IDR. Типово вимкнено: чи вміє це конкретний MFT і як Chrome
+	// стартує з такого потоку — UNVERIFIED.
+	IntraRefresh int
 }
 
 // envBool: "1"/"true"/"on" — так, "0"/"false"/"off" — ні, інше — def.
@@ -57,6 +71,9 @@ func rcPolicyFromEnv(getenv func(string) string) rcPolicy {
 		RefineAfterIDR: envBool(getenv, "OO_SCREEN_REFINE_AFTER_IDR", true),
 		RefineQPAware:  envBool(getenv, "OO_SCREEN_REFINE_QP_AWARE", false),
 		IdleIDR:        envBool(getenv, "OO_SCREEN_IDLE_IDR", false),
+		QPMin:          envInt(getenv, "OO_SCREEN_QP_MIN", 0, 0, 51),
+		QPMax:          envInt(getenv, "OO_SCREEN_QP_MAX", 0, 0, 51),
+		IntraRefresh:   envInt(getenv, "OO_SCREEN_INTRA_REFRESH", 0, 0, 3600),
 	}
 }
 
@@ -68,6 +85,16 @@ func encoderGOP(gop int, p rcPolicy) int {
 		return keyframe.New(keyframe.Config{GOPFrames: gop}).EncoderGOP()
 	}
 	return gop
+}
+
+// qpBounds — межі для Encoder.SetQPBounds; ok=false — нічого не задано.
+// MinQP вище за MaxQP не має сенсу: тоді MinQP відкидається.
+func qpBounds(p rcPolicy) (minQP, maxQP int, ok bool) {
+	minQP, maxQP = p.QPMin, p.QPMax
+	if maxQP > 0 && minQP > maxQP {
+		minQP = 0
+	}
+	return minQP, maxQP, minQP > 0 || maxQP > 0
 }
 
 // auKinds — вид кадру (refine.Frame без Key/QP), поданого в енкодер, за його

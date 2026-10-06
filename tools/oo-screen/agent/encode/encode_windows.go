@@ -76,6 +76,12 @@ type Config struct {
 	// false the encoder tries hardware first and only falls back to software
 	// automatically. The software path is CPU-only, so D3DDevice is ignored.
 	ForceSoftware bool
+
+	// IntraRefresh > 0 asks the MFT for gradual intra refresh over that many
+	// frames (CODECAPI_AVEncVideoGradualIntraRefresh, TASK.md крок 4) instead
+	// of relying on periodic IDR bursts alone. Best effort and UNVERIFIED on
+	// hardware: Encoder.IntraRefresh reports whether the MFT accepted it.
+	IntraRefresh int
 }
 
 // Frame is one NV12 input. Either the CPU planes or Texture must be set; when
@@ -141,6 +147,8 @@ type Encoder struct {
 	level    int
 	profile  int
 
+	intraRefresh bool // MFT accepted GradualIntraRefresh
+
 	headers []byte // cached SPS/PPS, Annex-B
 
 	// headersInjected counts IDR AUs that did NOT carry an inband SPS and had
@@ -189,6 +197,9 @@ func New(cfg Config) (*Encoder, error) {
 	if cfg.ForceSoftware {
 		c.force_software = 1
 	}
+	if cfg.IntraRefresh > 0 {
+		c.intra_refresh = C.int32_t(cfg.IntraRefresh)
+	}
 
 	buf := (*C.char)(C.calloc(256, 1))
 	defer C.free(unsafe.Pointer(buf))
@@ -211,6 +222,8 @@ func New(cfg Config) (*Encoder, error) {
 		zeroCopy: C.oos_enc_is_d3d(handle) != 0,
 		level:    int(C.oos_enc_level(handle)),
 		profile:  int(C.oos_enc_profile(handle)),
+
+		intraRefresh: C.oos_enc_intra_refresh(handle) != 0,
 	}
 	var hp *C.uint8_t
 	var hl C.int32_t
@@ -247,6 +260,27 @@ func (e *Encoder) ZeroCopy() bool { return e.zeroCopy }
 // Level is the H.264 level_idc that was pinned on the output type; -1 means the
 // MFT picked one (4.2 is not legal above 1080p, so a bigger desktop lands here).
 func (e *Encoder) Level() int { return e.level }
+
+// IntraRefresh reports whether the MFT accepted Config.IntraRefresh.
+func (e *Encoder) IntraRefresh() bool { return e.intraRefresh }
+
+// SetQPBounds sets the rate-control QP range outside refine (TASK.md крок 4):
+// CODECAPI_AVEncVideoMinQP / MaxQP, 0 = no bound. SetRefineQP overrides both
+// for its frames and restores these. A refusal is returned (the bound the MFT
+// refused is not remembered), so the caller can log it and carry on.
+func (e *Encoder) SetQPBounds(minQP, maxQP int) error {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.closed {
+		return ErrClosed
+	}
+	buf := (*C.char)(C.calloc(256, 1))
+	defer C.free(unsafe.Pointer(buf))
+	if C.oos_enc_set_qp_bounds(e.e, C.int32_t(minQP), C.int32_t(maxQP), buf, 256) != C.OOS_ENC_OK {
+		return fmt.Errorf("encode: set qp bounds %d..%d: %s", minQP, maxQP, C.GoString(buf))
+	}
+	return nil
+}
 
 // Profile is the H.264 profile_idc the MFT actually accepted: 77 = Main (what
 // browsers announce), 100 = High (the fallback rung, which browsers refuse).

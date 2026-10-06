@@ -103,7 +103,7 @@ func TestObserveAUsDrivesRefine(t *testing.T) {
 	}
 }
 
-func TestRCPolicyGOP(t *testing.T) {
+func TestRCPolicyGOPAndBounds(t *testing.T) {
 	if g := encoderGOP(300, rcPolicy{}); g != 300 {
 		t.Fatalf("без IdleIDR GOP %d", g)
 	}
@@ -113,7 +113,16 @@ func TestRCPolicyGOP(t *testing.T) {
 	if g := encoderGOP(0, rcPolicy{IdleIDR: true}); g != 0 {
 		t.Fatalf("дефолтний GOP має лишатись дефолтом, а не %d", g)
 	}
-	if p := rcPolicyFromEnv(envMap(map[string]string{"OO_SCREEN_IDLE_IDR": "1"})); !p.IdleIDR {
+	if _, _, ok := qpBounds(rcPolicy{}); ok {
+		t.Fatal("межі без env")
+	}
+	if mn, mx, ok := qpBounds(rcPolicy{QPMin: 40, QPMax: 30}); !ok || mn != 0 || mx != 30 {
+		t.Fatalf("min>max: %d %d %v", mn, mx, ok)
+	}
+	p := rcPolicyFromEnv(envMap(map[string]string{
+		"OO_SCREEN_IDLE_IDR": "1", "OO_SCREEN_QP_MIN": "16", "OO_SCREEN_QP_MAX": "38", "OO_SCREEN_INTRA_REFRESH": "90",
+	}))
+	if !p.IdleIDR || p.QPMin != 16 || p.QPMax != 38 || p.IntraRefresh != 90 {
 		t.Fatalf("env: %+v", p)
 	}
 }

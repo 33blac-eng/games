@@ -26,6 +26,7 @@ type Config struct {
 	SrcWidth      int
 	SrcHeight     int
 	ForceSoftware bool
+	IntraRefresh  int
 }
 
 type Frame struct {
@@ -60,4 +61,6 @@ func (e *Encoder) ForceIDR() error            { return ErrNoHardware }
 func (e *Encoder) SetBitrate(int) error       { return ErrNoHardware }
 func (e *Encoder) SetRefineQP(int) error      { return ErrNoHardware }
 func (e *Encoder) Flush() error               { return ErrNoHardware }
+func (e *Encoder) SetQPBounds(int, int) error { return ErrNoHardware }
+func (e *Encoder) IntraRefresh() bool         { return false }
 func (e *Encoder) Close() error               { return nil }

@@ -522,6 +522,7 @@ func (s *stream) openEncoder(device uintptr, gen uint64, srcW, srcH int) (*encod
 	cfg := encode.Config{
 		Width: reqW, Height: reqH, FPS: s.fps, BitrateBps: bps, GOP: encoderGOP(gopFrames(s.gopSeconds, s.fps), s.rc),
 		D3DDevice: d3d, SrcWidth: srcW, SrcHeight: srcH, ForceSoftware: s.forceSoftware,
+		IntraRefresh: s.rc.IntraRefresh,
 	}
 	enc, err := encode.New(cfg)
 	// A-19: ErrNoHardware — це не «MFT не взяв цю геометрію», а «апаратного
@@ -577,6 +578,7 @@ func (s *stream) openEncoder(device uintptr, gen uint64, srcW, srcH int) (*encod
 		enc, err = encode.New(encode.Config{
 			Width: w, Height: h, FPS: s.fps, BitrateBps: bps, GOP: encoderGOP(gopFrames(s.gopSeconds, s.fps), s.rc),
 			D3DDevice: 0, SrcWidth: srcW, SrcHeight: srcH, ForceSoftware: true,
+			IntraRefresh: s.rc.IntraRefresh,
 		})
 		if err != nil {
 			return nil, 0, 0, false, err
@@ -610,6 +612,18 @@ func (s *stream) openEncoder(device uintptr, gen uint64, srcW, srcH int) (*encod
 				runtime.NumCPU(), w, h, softwareCoreCost(w*h, s.fps), s.fps,
 				capped, softwareCoreCost(w*h, capped))
 		}
+	}
+	// TASK.md крок 4: межі QP і інтра-оновлення — best effort. Відмова MFT
+	// лишає його rate control як був; у лозі видно, що саме не прижилось.
+	if mn, mx, ok := qpBounds(s.rc); ok {
+		if qerr := enc.SetQPBounds(mn, mx); qerr != nil {
+			log.Printf("oo-agent: межі QP %d..%d не прийнято: %v — rate control MFT без меж", mn, mx, qerr)
+		} else {
+			log.Printf("oo-agent: межі QP rate control %d..%d (0 = без межі)", mn, mx)
+		}
+	}
+	if s.rc.IntraRefresh > 0 {
+		log.Printf("oo-agent: інтра-оновлення %d кадрів: прийнято=%v (ні — лишається періодичний IDR)", s.rc.IntraRefresh, enc.IntraRefresh())
 	}
 	s.encDev = device
 	s.encGen = gen
