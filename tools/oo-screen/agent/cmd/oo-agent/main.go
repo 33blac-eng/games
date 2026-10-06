@@ -37,6 +37,7 @@ import (
 	"github.com/organicoils/oo-screen/internal/control"
 	"github.com/organicoils/oo-screen/internal/cursorproto"
 	"github.com/organicoils/oo-screen/internal/h264"
+	"github.com/organicoils/oo-screen/internal/keyframe"
 	"github.com/organicoils/oo-screen/internal/pacer"
 	"github.com/organicoils/oo-screen/internal/refine"
 	"github.com/organicoils/oo-screen/internal/swlimit"
@@ -519,7 +520,7 @@ func (s *stream) openEncoder(device uintptr, gen uint64, srcW, srcH int) (*encod
 	reqW, reqH := requestedSize(s.reqW, s.reqH, srcW, srcH)
 	auto := s.reqW <= 0 || s.reqH <= 0
 	cfg := encode.Config{
-		Width: reqW, Height: reqH, FPS: s.fps, BitrateBps: bps, GOP: gopFrames(s.gopSeconds, s.fps),
+		Width: reqW, Height: reqH, FPS: s.fps, BitrateBps: bps, GOP: encoderGOP(gopFrames(s.gopSeconds, s.fps), s.rc),
 		D3DDevice: d3d, SrcWidth: srcW, SrcHeight: srcH, ForceSoftware: s.forceSoftware,
 	}
 	enc, err := encode.New(cfg)
@@ -574,7 +575,7 @@ func (s *stream) openEncoder(device uintptr, gen uint64, srcW, srcH int) (*encod
 			w, h, reqW, reqH)
 		enc.Close()
 		enc, err = encode.New(encode.Config{
-			Width: w, Height: h, FPS: s.fps, BitrateBps: bps, GOP: gopFrames(s.gopSeconds, s.fps),
+			Width: w, Height: h, FPS: s.fps, BitrateBps: bps, GOP: encoderGOP(gopFrames(s.gopSeconds, s.fps), s.rc),
 			D3DDevice: 0, SrcWidth: srcW, SrcHeight: srcH, ForceSoftware: true,
 		})
 		if err != nil {
@@ -1434,6 +1435,9 @@ func main() {
 		// щоб refine знав, що лишилось на екрані (encpolicy.go).
 		auKind = &auKinds{}
 		auQP   = h264.NewQPReader()
+		// OO_SCREEN_IDLE_IDR: періодичний IDR — у тиші, а не посеред руху
+		// (internal/keyframe). nil — вимкнено, IDR ставить GOP MFT як раніше.
+		kfPol *keyframe.Policy
 		// Gap #2: сигнал «текстовий режим» з площі dirty/move rects. Споживач —
 		// стеля FPS (-text-fps, textfps.go): у текстовому режимі кодуємо не
 		// частіше за textModeGap; затриманий кадр дошлемо, щойно щілина
@@ -1478,6 +1482,9 @@ func main() {
 		tpMu        sync.Mutex // guards tp across reconnects; the single ordered sender goroutine reads it under this lock
 		sendQueue   = make(chan sendJob, 8)
 	)
+	if rcPol.IdleIDR {
+		kfPol = keyframe.New(keyframe.Config{GOPFrames: gopFrames(s.gopSeconds, s.fps)})
+	}
 
 	// onContentMode — новий стан автомата Text / Normal / Video. textOn —
 	// рівно «режим Text» (у Video текстова стеля не діє ніколи); з
@@ -1938,6 +1945,9 @@ loop:
 		case err == nil:
 			s.lastFrame, lastFrameEncoded = frame, false
 			refiner.Motion(time.Now()) // новий кадр = рух: refine, що йшов, перериваємо
+			if kfPol != nil {
+				kfPol.Motion(time.Now())
+			}
 			// Текстові тайли: invalidate ДО кодування цього кадру (tiles.go).
 			tilesMotion()
 			textCF = capture.ChangedFraction(frame)
@@ -2139,10 +2149,22 @@ loop:
 				refineErrLog.Do(func() { log.Printf("oo-agent: refine restore: %v", rerr) })
 			}
 		}
+		// Періодичний IDR у тиші: лише на keepalive-повторі нерухомого екрана
+		// і лише апаратному MFT (Windows 7 софт-MFT не вміє ForceKeyFrame —
+		// там лишається GOP самого MFT). Невдача вимикає політику: GOP MFT
+		// (encoderGOP, 2×) однаково ставить IDR сам.
+		if kfPol != nil && !s.software && refineQP == 0 && kfPol.Due(time.Now(), still) {
+			if ierr := s.encoder().ForceIDR(); ierr != nil {
+				log.Printf("oo-agent: idle IDR: %v — політику вимкнено, IDR ставить GOP MFT", ierr)
+				kfPol = nil
+			} else {
+				lastIDRAt = time.Now()
+			}
+		}
 		auKind.note(encFrame.PTS, refine.Frame{Refine: refineQP, Motion: !still && refineQP == 0})
 		encStart := time.Now()
 		aus, err := s.encoder().Encode(encFrame)
-		observeAUs(aus, auKind, auQP, refiner, time.Now())
+		observeAUs(aus, auKind, auQP, refiner, kfPol, time.Now())
 		if err == nil && !still {
 			encSecEWMA = encEWMA(encSecEWMA, time.Since(encStart))
 		}

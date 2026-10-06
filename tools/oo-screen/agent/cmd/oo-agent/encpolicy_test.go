@@ -8,6 +8,7 @@ import (
 
 	"github.com/organicoils/oo-screen/agent/encode"
 	"github.com/organicoils/oo-screen/internal/h264"
+	"github.com/organicoils/oo-screen/internal/keyframe"
 	"github.com/organicoils/oo-screen/internal/refine"
 )
 
@@ -76,12 +77,13 @@ func TestObserveAUsDrivesRefine(t *testing.T) {
 	r := refine.New(refine.Config{QPAware: true, AfterKeyframe: true})
 	var k auKinds
 	qpr := h264.NewQPReader()
+	kf := keyframe.New(keyframe.Config{GOPFrames: 300})
 	// Кадр 0 (IDR, QP 24) подали як рух, AU повертається з наступним Encode.
 	r.Motion(t0)
 	k.note(0, refine.Frame{Motion: true})
-	observeAUs(nil, &k, qpr, r, t0)
+	observeAUs(nil, &k, qpr, r, nil, t0)
 	k.note(time.Second, refine.Frame{})
-	observeAUs([]encode.AU{{Data: h[0].Data, Keyframe: h[0].Keyframe, PTS: 0}}, &k, qpr, r, t0)
+	observeAUs([]encode.AU{{Data: h[0].Data, Keyframe: h[0].Keyframe, PTS: 0}}, &k, qpr, r, kf, t0)
 	if r.WorstQP() != 24 {
 		t.Fatalf("worst %d після IDR QP 24", r.WorstQP())
 	}
@@ -91,9 +93,27 @@ func TestObserveAUsDrivesRefine(t *testing.T) {
 	}
 	// AU 5 — P-кадр із примусовим QP 18, поданий як refine 18.
 	k.note(5, refine.Frame{Refine: 18})
-	observeAUs([]encode.AU{{Data: h[1].Data, PTS: 99}, {Data: h[5].Data, PTS: 5}}, &k, qpr, r, t0)
+	observeAUs([]encode.AU{{Data: h[1].Data, PTS: 99}, {Data: h[5].Data, PTS: 5}}, &k, qpr, r, kf, t0)
 	// Невідомий PTS (99, QP 31) — рух: worst 31, далі refine 18 -> 18.
 	if r.WorstQP() != 18 {
 		t.Fatalf("worst %d після refine 18", r.WorstQP())
+	}
+	if kf.Since() != 2 {
+		t.Fatalf("keyframe.Since %d: IDR скидає, два P-кадри рахуються", kf.Since())
+	}
+}
+
+func TestRCPolicyGOP(t *testing.T) {
+	if g := encoderGOP(300, rcPolicy{}); g != 300 {
+		t.Fatalf("без IdleIDR GOP %d", g)
+	}
+	if g := encoderGOP(300, rcPolicy{IdleIDR: true}); g != 600 {
+		t.Fatalf("IdleIDR: GOP MFT %d, хочемо запобіжник 600", g)
+	}
+	if g := encoderGOP(0, rcPolicy{IdleIDR: true}); g != 0 {
+		t.Fatalf("дефолтний GOP має лишатись дефолтом, а не %d", g)
+	}
+	if p := rcPolicyFromEnv(envMap(map[string]string{"OO_SCREEN_IDLE_IDR": "1"})); !p.IdleIDR {
+		t.Fatalf("env: %+v", p)
 	}
 }

@@ -6,6 +6,7 @@ import (
 
 	"github.com/organicoils/oo-screen/agent/encode"
 	"github.com/organicoils/oo-screen/internal/h264"
+	"github.com/organicoils/oo-screen/internal/keyframe"
 	"github.com/organicoils/oo-screen/internal/refine"
 )
 
@@ -23,6 +24,9 @@ type rcPolicy struct {
 	// вимкнено: у симуляції виграш у межах шуму, а slice QP апаратного MFT
 	// (з AQ) — UNVERIFIED.
 	RefineQPAware bool
+	// IdleIDR — періодичний IDR агент ставить сам, у тиші (internal/keyframe);
+	// GOP самого MFT тоді вдвічі довший — запобіжник. OO_SCREEN_IDLE_IDR.
+	IdleIDR bool
 }
 
 // envBool: "1"/"true"/"on" — так, "0"/"false"/"off" — ні, інше — def.
@@ -52,7 +56,18 @@ func rcPolicyFromEnv(getenv func(string) string) rcPolicy {
 		// сама, що й refine після руху. "0" вимикає.
 		RefineAfterIDR: envBool(getenv, "OO_SCREEN_REFINE_AFTER_IDR", true),
 		RefineQPAware:  envBool(getenv, "OO_SCREEN_REFINE_QP_AWARE", false),
+		IdleIDR:        envBool(getenv, "OO_SCREEN_IDLE_IDR", false),
 	}
+}
+
+// encoderGOP — GOP для encode.Config: з IdleIDR періодичний IDR ставить
+// агент, а MFT отримує вдвічі довший GOP як запобіжник (keyframe.Policy).
+// 0 лишається 0 (дефолт енкодера).
+func encoderGOP(gop int, p rcPolicy) int {
+	if gop > 0 && p.IdleIDR {
+		return keyframe.New(keyframe.Config{GOPFrames: gop}).EncoderGOP()
+	}
+	return gop
 }
 
 // auKinds — вид кадру (refine.Frame без Key/QP), поданого в енкодер, за його
@@ -99,8 +114,11 @@ func (k *auKinds) take(pts time.Duration) (refine.Frame, bool) {
 // (за PTS), чи це IDR і його QP з потоку. Невідомий PTS (кадр до перебудови
 // енкодера) рахується рухом — так безпечніше: невідомий QP не дає
 // QPAware пропустити refine.
-func observeAUs(aus []encode.AU, kinds *auKinds, qpr *h264.QPReader, r *refine.State, now time.Time) {
+func observeAUs(aus []encode.AU, kinds *auKinds, qpr *h264.QPReader, r *refine.State, kf *keyframe.Policy, now time.Time) {
 	for _, au := range aus {
+		if kf != nil {
+			kf.Coded(au.Keyframe)
+		}
 		f, ok := kinds.take(au.PTS)
 		if !ok {
 			f = refine.Frame{Motion: true}
