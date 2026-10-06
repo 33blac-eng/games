@@ -2221,9 +2221,11 @@ loop:
 		// max_fps/admission), теж не годиться: його P-кадр несе реальну дельту.
 		encodedBefore := lastFrameEncoded
 		lastFrameEncoded = true // frame тут завжди == s.lastFrame
-		if refineQP == 0 && keepStillAU(still, encodedBefore, aus) {
-			cp := aus[0]
-			lastStillAU, lastStillEnc, lastStillSentAt = &cp, s.encoder(), time.Now()
+		// IDR скидає кеш навіть на refine-проході (nextStillAU).
+		if refineQP == 0 || hasKeyframe(aus) {
+			if n := nextStillAU(lastStillAU, still && refineQP == 0, encodedBefore, aus); n != lastStillAU {
+				lastStillAU, lastStillEnc, lastStillSentAt = n, s.encoder(), time.Now()
+			}
 		}
 		// Текстові тайли: екран нерухомий і refine уже доведений до кінця
 		// (або, без refine — софт-енкодер, -refine=false, — простій
