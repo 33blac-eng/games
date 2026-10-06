@@ -511,6 +511,10 @@ type bitrateCtl struct {
 	// delayOverAt — останній підтверджений OVERUSE; нуль = не було (або
 	// прапорець OO_SCREEN_DELAYBWE вимкнено) — тоді поведінка рівно як до N3.
 	delayOverAt time.Time
+	// twccAt — останній TWCC-фідбек (withDelay). Нуль або давно — детектор
+	// чергу не бачить (Chrome без transport-cc, прапорець вимкнено), і
+	// проба поводиться рівно як до N4-фіксу (див. delayLive).
+	twccAt time.Time
 }
 
 // Ручки швидкого відновлення. Свідомо консервативні щодо задокументованих

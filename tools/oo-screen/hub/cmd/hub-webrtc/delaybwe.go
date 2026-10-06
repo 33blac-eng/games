@@ -61,6 +61,7 @@ const (
 	probeDelayAbort  = bwe.ProbeDelayAbort
 	delayKFBelow     = bwe.DelayKFBelow
 	delayCutDebounce = bwe.DelayCutDebounce
+	delayLiveFor     = 2 * time.Second // фідбек ~10/с; 2 с — «живий» із запасом
 )
 
 // newTrendline — детектор градієнта затримки (internal/bwe).
@@ -161,6 +162,7 @@ func (t *twccLeg) probeQueued(p *legProbe, now time.Time) bool {
 // Друга умова тримає зрізання, поки черга повна й пласка (градієнт нуль, а
 // дропи йдуть) — саме там чистий детектор тренду мовчить.
 func (c bitrateCtl) withDelay(over bool, acked, sent uint64, winStart, now time.Time) (bitrateCtl, bool) {
+	c.twccAt = now
 	if over && bwe.Limited(acked, sent) {
 		c.delayOverAt = now
 	}
@@ -189,6 +191,14 @@ func (c bitrateCtl) withDelay(over bool, acked, sent uint64, winStart, now time.
 	c.target, c.lastSent = next, now
 	c.reason = "delay"
 	return c, true
+}
+
+// delayLive — чи детектор затримки зараз реально бачить чергу ноди: TWCC-
+// фідбек приходив за останні delayLiveFor. Тоді невдала проба обривається
+// по черзі (+probeDelayAbort або OVERUSE) за ~1 інтервал фідбеку, а не по
+// NACK-ах після дропів, — і пробувати можна частіше (probe.go, N4).
+func (c bitrateCtl) delayLive(now time.Time) bool {
+	return !c.twccAt.IsZero() && now.Sub(c.twccAt) < delayLiveFor
 }
 
 // delayHeld — чи тримає детектор затримки підйом/пробу зараз.
