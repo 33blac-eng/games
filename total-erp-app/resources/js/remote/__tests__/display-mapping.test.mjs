@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import {
     containBox, oneToOneSize, mapClientToRemote, normalizeDisplayMode,
     loadDisplayMode, saveDisplayMode, DISPLAY_FIT, DISPLAY_1X1,
-    absorbForeignStyles,
+    absorbForeignStyles, oneToOnePlacement,
 } from '../desktop-oo-webrtc.js';
 
 // contain: пропорції збігаються — без лєтербоксу
@@ -57,6 +57,33 @@ assert.equal(loadDisplayMode(null), DISPLAY_FIT);
     // ще нічого не записано — знімок без змін
     const s2 = { width: 'a' };
     assert.equal(absorbForeignStyles(s2, null, { width: 'b' }).width, 'a');
+}
+
+// Q-14: 1:1 — початок картинки на сітці ФІЗИЧНИХ пікселів, розмір точний.
+{
+    const near = (a, b) => Math.abs(a - b) < 1e-9;
+    // dpr 1.25: 250 CSS px = 312.5 фізичних -> 312 (250 - 0.4) або 313
+    const p = oneToOnePlacement(250, 100, 1366, 768, 1.25);
+    const physL = (250 + p.dx) * 1.25;
+    const physT = (100 + p.dy) * 1.25;
+    assert.ok(near(physL, Math.round(physL)), 'left на сітці: ' + physL);
+    assert.ok(near(physT, Math.round(physT)), 'top на сітці: ' + physT);
+    assert.ok(Math.abs(p.dx * 1.25) <= 0.5 + 1e-9);
+    // розмір — точно videoW/dpr: 1366 відео-пікселів = 1366 фізичних
+    assert.ok(near(p.width * 1.25, 1366));
+    assert.ok(near(p.height * 1.25, 768));
+    // dpr 1.5, дробовий відступ із layout (1/64 CSS px)
+    const q = oneToOnePlacement(100.015625, 33.3, 1920, 1080, 1.5);
+    assert.ok(near((100.015625 + q.dx) * 1.5, Math.round((100.015625 + q.dx) * 1.5)));
+    assert.ok(near((33.3 + q.dy) * 1.5, Math.round((33.3 + q.dy) * 1.5)));
+    // уже на сітці — поправки нема
+    assert.deepEqual(oneToOnePlacement(40, 8, 1920, 1080, 1.25), { dx: 0, dy: 0, width: 1536, height: 864 });
+    // dpr 1, цілий відступ — нуль; дробовий — до найближчого пікселя
+    assert.equal(oneToOnePlacement(17, 3, 800, 600, 1).dx, 0);
+    assert.ok(near(oneToOnePlacement(17.4, 3, 800, 600, 1).dx, -0.4));
+    // зламаний dpr / NaN — не NaN у стилях
+    const z = oneToOnePlacement(NaN, undefined, 800, 600, 0);
+    assert.deepEqual(z, { dx: 0, dy: 0, width: 800, height: 600 });
 }
 
 console.log('display-mapping: ok');

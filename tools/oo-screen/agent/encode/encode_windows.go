@@ -369,16 +369,11 @@ func (e *Encoder) drainLocked(buf *C.char, timeoutMS int) ([]AU, error) {
 					e.headers = rw
 				}
 			}
-			var injected bool
-			if data, injected = withHeaders(data, e.headers); injected {
-				e.headersInjected++
-			} else if hasSPS(data) {
-				// Інбенд-SPS від MFT — той самий перепис (UNVERIFIED на залізі).
-				// Помилка розбору -> AU іде як є, потік не ламаємо.
-				if rw, err := h264.RewriteAnnexBSPSColourBT709(data); err == nil {
-					data = rw
-				}
-			}
+		}
+		// Q-06: SPS будь-якого AU (не лише ключового) — з явним BT.709 limited.
+		var injected bool
+		if data, injected = prepareAU(data, e.headers, key, h264.RewriteAnnexBSPSColourBT709); injected {
+			e.headersInjected++
 		}
 		out = append(out, AU{
 			Data:     data,
