@@ -1,13 +1,12 @@
 //go:build windows
 
 // oo-agent — Т2: живий агент. DXGI-захоплення (agent/capture) → апаратний
-// MFT-енкодер (agent/encode) → один із двох транспортів (обидва кандидати в
-// одному бінарі, вибір прапорцем -transport). Не дублює agent/capture чи
+// MFT-енкодер (agent/encode) → транспорт WebRTC (легасі-бенч WT — лише в
+// збірці з -tags wt, transport_wt.go; прапорець -transport). Не дублює agent/capture чи
 // agent/encode — тільки склеює їх і §5.5 admission-політику.
 package main
 
 import (
-	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -29,15 +28,16 @@ import (
 	"github.com/pion/rtcp"
 	"github.com/pion/webrtc/v4"
 	"github.com/pion/webrtc/v4/pkg/media"
-	"github.com/quic-go/quic-go"
 
 	"github.com/organicoils/oo-screen/agent/capture"
 	"github.com/organicoils/oo-screen/agent/encode"
 	"github.com/organicoils/oo-screen/internal/agentcred"
+	"github.com/organicoils/oo-screen/internal/consent"
 	"github.com/organicoils/oo-screen/internal/contentmode"
 	"github.com/organicoils/oo-screen/internal/control"
 	"github.com/organicoils/oo-screen/internal/cursorproto"
-	"github.com/organicoils/oo-screen/internal/envelope"
+	"github.com/organicoils/oo-screen/internal/h264"
+	"github.com/organicoils/oo-screen/internal/keyframe"
 	"github.com/organicoils/oo-screen/internal/pacer"
 	"github.com/organicoils/oo-screen/internal/refine"
 	"github.com/organicoils/oo-screen/internal/swlimit"
@@ -49,6 +49,10 @@ var httpClient = &http.Client{Timeout: dialTimeout}
 // nodeID — mesh node_id цього ПК, задається прапорцем -node у main(). Порожній
 // = старий T1/бенч-режим (hub бере node з env). Читається лише з sender-шляху
 // dialWebRTC, який стартує після main() встановив значення.
+// multimonParentPinned — F6: батько -multimon запустив дочірні потоки, тож
+// select_output основного потоку ігнорується (рев'ю: дубль монітора, A-36).
+var multimonParentPinned atomic.Bool
+
 var nodeID string
 
 // cliToken — токен агента, обраний у main() з -token-file / OO_AGENT_TOKEN /
@@ -91,131 +95,6 @@ type transport interface {
 	// відео, і pion серіалізує запис у кожну доріжку сам.
 	sendAudio(data []byte, dur time.Duration) error
 	close()
-}
-
-// ---- WebTransport (кандидат B): envelope-кадри по QUIC-стріму -------------
-
-type wtTransport struct {
-	conn     *quic.Conn
-	videoStr *quic.Stream
-}
-
-func dialWT(hubAddr string, onKeyframeRequest func(), onBitrateTarget func(uint64), onSelectOutput func(int)) (*wtTransport, error) {
-	// SEC #32: перевірка сертифіката за замовчуванням; самопідписаний hub-wt —
-	// через пінінг -wt-cert-sha256 (його CERT_HASH=), -wt-insecure — лише стенд.
-	tlsConf := agentcred.WTTLSConfig(hubAddr, []string{agentALPN}, wtCertPin, wtInsecure)
-	dialCtx, cancel := context.WithTimeout(context.Background(), dialTimeout)
-	defer cancel()
-	conn, err := quic.DialAddr(dialCtx, hubAddr, tlsConf, &quic.Config{})
-	if err != nil {
-		return nil, fmt.Errorf("dial hub-wt %s: %w", hubAddr, err)
-	}
-
-	ctrlStr, err := conn.OpenStreamSync(dialCtx)
-	if err != nil {
-		conn.CloseWithError(0, "")
-		return nil, fmt.Errorf("open control stream: %w", err)
-	}
-	if err := control.Write(ctrlStr, control.Hello(authToken(), 1)); err != nil {
-		conn.CloseWithError(0, "")
-		return nil, fmt.Errorf("send hello: %w", err)
-	}
-	// heartbeat раз/5с, поки конект живий (control-протокол §5.4)
-	go func() {
-		t := time.NewTicker(5 * time.Second)
-		defer t.Stop()
-		var seq uint64 = 1
-		for range t.C {
-			seq++
-			if err := control.Write(ctrlStr, control.Heartbeat(seq)); err != nil {
-				return
-			}
-		}
-	}()
-
-	// Control-стрім двонаправлений: hub шле keyframe_request сюди ж, поки
-	// агент лише пише (heartbeat) і ніколи не читає — запити зависають у
-	// буфері й ForceIDR ніколи не викликається. Читаємо персистентно й на
-	// keyframe_request віддаємо колбек у main() (§5.4/§5.5).
-	go func() {
-		br := bufio.NewReader(ctrlStr)
-		for {
-			m, err := control.ReadKnown(br, nil)
-			if err != nil {
-				return // конект/стрім мертвий — reconnect-логіка в main() це побачить через send-помилки
-			}
-			if m.Type == control.TypeKeyframeRequest && onKeyframeRequest != nil {
-				onKeyframeRequest()
-			}
-			if m.Type == control.TypeBitrateTarget && onBitrateTarget != nil {
-				onBitrateTarget(m.BitrateBps)
-			}
-			// Дзеркало WebRTC-гілки (handleCtlMessage): вибір монітора мусить
-			// працювати обома ногами, інакше «перемкни екран» тихо не діяло б
-			// саме на тому транспорті, яким знімають бенчі.
-			if m.Type == control.TypeSelectOutput && onSelectOutput != nil {
-				onSelectOutput(m.Output)
-			}
-		}
-	}()
-
-	videoStr, err := conn.OpenStreamSync(dialCtx)
-	if err != nil {
-		conn.CloseWithError(0, "")
-		return nil, fmt.Errorf("open video stream: %w", err)
-	}
-
-	return &wtTransport{conn: conn, videoStr: videoStr}, nil
-}
-
-func (t *wtTransport) send(au encode.AU, seq uint64) error {
-	flags := uint8(0)
-	if au.Keyframe {
-		flags |= envelope.FlagKeyframe
-		// Енкодер (agent/encode) вставляє SPS/PPS у кожен IDR — контракт §5.2.
-		flags |= envelope.FlagConfigured
-	}
-	f := &envelope.Frame{
-		Flags: flags,
-		// Епоха БІЛЬШЕ НЕ КОНСТАНТА: SwitchOutput зсуває її, бо інший монітор —
-		// інша геометрія, тобто інший SPS. Глядач мусить побачити зсув, інакше
-		// нова геометрія прийде посеред старого потоку (див. output.go).
-		ConfigEpoch: currentEpoch(),
-		FrameSeq:    seq,
-		PTS:         uint64(au.PTS.Microseconds()),
-		Payload:     bytes.Clone(au.Data),
-	}
-	buf, err := f.Marshal()
-	if err != nil {
-		return fmt.Errorf("marshal frame seq=%d: %w", seq, err)
-	}
-	// 🚨 A-33. Без дедлайну Write на QUIC-стрімі блокується НАЗАВЖДИ, щойно
-	// вікно flow control закрилось: хаб перестав вичитувати (завис, а не впав),
-	// вікно не рухається — і єдиний ordered sender стоїть у цьому виклику. А
-	// поки він стоїть, у txErrCh нічого не приходить, тобто реконект, який мав
-	// би це полагодити, не запускається взагалі. Дедлайн перетворює зависання
-	// на звичайну помилку відправки, а її кадровий цикл уже вміє лікувати.
-	if err := t.videoStr.SetWriteDeadline(time.Now().Add(wtWriteTimeout)); err != nil {
-		return fmt.Errorf("set write deadline seq=%d: %w", seq, err)
-	}
-	if _, err := t.videoStr.Write(buf); err != nil {
-		return fmt.Errorf("write frame seq=%d: %w", seq, err)
-	}
-	return nil
-}
-
-// sendAudio: нога WT — бенчова, доріжок у ній немає взагалі (envelope возить
-// самі AU відео). Звук туди не їде і ніколи не їхав; runAudio для цього
-// транспорту й не стартує (main: гілка лише для webrtc).
-func (t *wtTransport) sendAudio([]byte, time.Duration) error { return nil }
-
-func (t *wtTransport) close() {
-	if t.videoStr != nil {
-		_ = t.videoStr.Close()
-	}
-	if t.conn != nil {
-		_ = t.conn.CloseWithError(0, "")
-	}
 }
 
 type offerReq struct {
@@ -276,7 +155,11 @@ func dialWebRTC(hubURL string, frameInterval time.Duration, onKeyframeRequest fu
 	// Сторож живості починає нову сесію роззброєним: тримати озброєним із
 	// останнім ударом ПОПЕРЕДНЬОЇ означало б вирішити рвати щойно підняте.
 	hubLive.disarm()
-	api, err := newWebRTCAPI()
+	setMaxFps(0) // нова сесія хаба — стеля, якщо є, приїде з його OnOpen
+	// Один знімок на всю ногу: MediaEngine і трек мусять оголосити ОДНЕ й те
+	// саме, навіть якщо енкодер відкриється посеред dial.
+	fmtp := h264Fmtp()
+	api, err := newWebRTCAPI(fmtp)
 	if err != nil {
 		return nil, fmt.Errorf("new api: %w", err)
 	}
@@ -323,13 +206,16 @@ func dialWebRTC(hubURL string, frameInterval time.Duration, onKeyframeRequest fu
 			_ = pc.Close()
 			return nil, fmt.Errorf("create input datachannel: %w", dcErr)
 		}
-		in.OnMessage(func(msg webrtc.DataChannelMessage) {
-			if err := handleInputMessage(msg.Data, inj); err != nil {
-				logInputProblem(time.Now(), err)
-			}
-		})
-		// SEC #37: канал закрився (сесія впала/хаб пішов) — відпустити все.
-		in.OnClose(func() { releaseHeldInput(inj, "input channel closed") })
+		// SEC #37: на закритті каналу attachInputChannel відпускає затиснуте.
+		attachInputChannel(in, inj)
+		// Хвиля 10: рух миші — окремим ненадійним невпорядкованим каналом
+		// (без head-of-line за загубленим пакетом). Старий хаб його ігнорує.
+		mv, mvErr := pc.CreateDataChannel(inputMoveChannelLabel, inputMoveChannelInit())
+		if mvErr != nil {
+			_ = pc.Close()
+			return nil, fmt.Errorf("create input-move datachannel: %w", mvErr)
+		}
+		attachInputMoveChannel(mv, inj)
 		// Поверхня вводу лишається ВСІМ віртуальним робочим столом (дефолт
 		// input.Injector), і це точно лише поки монітор один: DXGI-виходи не
 		// віддають свій Left/Top через capture.OutputInfo, тож звузити її нема з
@@ -350,13 +236,17 @@ func dialWebRTC(hubURL string, frameInterval time.Duration, onKeyframeRequest fu
 			_ = pc.Close()
 			return nil, fmt.Errorf("create cursor datachannel: %w", dcErr)
 		}
-		cur.OnOpen(func() { cursorPub.SetSink(cur) })
-		cur.OnClose(func() { cursorPub.ClearSink(cur) })
+		// F9: канал відкрито ≠ шар увімкнено. Вказівник і далі вмальовується
+		// в кадр, поки хаб не пришле KindMode=1 (усі глядачі ноги вміють шар
+		// і сесія не пишеться в MKV) — cursorGrantHandler.
+		cur.OnOpen(func() { cursorChannelOpen(cur) })
+		cur.OnClose(func() { cursorChannelClosed(cur) })
+		cur.OnMessage(func(m webrtc.DataChannelMessage) { cursorGrantMessage(cur, m.Data) })
 	}
 	track, err := webrtc.NewTrackLocalStaticSample(webrtc.RTPCodecCapability{
 		MimeType:    webrtc.MimeTypeH264,
 		ClockRate:   90000,
-		SDPFmtpLine: h264Fmtp(),
+		SDPFmtpLine: fmtp,
 	}, "video", "oo-screen-agent")
 	if err != nil {
 		_ = pc.Close()
@@ -484,6 +374,15 @@ func dialWebRTC(hubURL string, frameInterval time.Duration, onKeyframeRequest fu
 		_ = pc.Close()
 		return nil, fmt.Errorf("decode answer: %w", err)
 	}
+	// Хаб без OO_SCREEN_AUDIO відхиляє m=audio (порт 0). Opus-доріжку треба
+	// зняти ДО SetRemoteDescription, інакше pion валить усе зʼєднання (а з ним
+	// і відео) помилкою «codec is not supported by remote» — див. audio.go.
+	if atrk != nil && audioRejected(ans.SDP) {
+		if err := detachAudioTrack(pc, atrk); err != nil {
+			log.Printf("oo-agent: хаб відхилив звук, зняти доріжку не вдалось: %v", err)
+		}
+		atrk = nil
+	}
 	if err := pc.SetRemoteDescription(webrtc.SessionDescription{Type: webrtc.SDPTypeAnswer, SDP: ans.SDP}); err != nil {
 		_ = pc.Close()
 		return nil, fmt.Errorf("set remote description: %w", err)
@@ -493,7 +392,7 @@ func dialWebRTC(hubURL string, frameInterval time.Duration, onKeyframeRequest fu
 		_ = pc.Close()
 		return nil, err
 	}
-	return &webrtcTransport{pc: pc, track: track, paced: paced, atrk: atrk, frameInterval: frameInterval, ctl: ctlDC}, nil
+	return &webrtcTransport{pc: pc, track: track, paced: paced, atrk: atrk, frameInterval: frameInterval, ctl: ctlDC, fmtp: fmtp}, nil
 }
 
 // waitConnected чекає на connected, який закриває обробник стану з dialWebRTC.
@@ -562,6 +461,7 @@ type stream struct {
 	fps           int
 	gopSeconds    int // ТЗ 1.4: інтервал IDR у секундах (GOP = gopSeconds*fps)
 	forceSoftware bool
+	rc            rcPolicy // TASK.md крок 4: політики rate control (env, encpolicy.go)
 	logger        *slog.Logger
 
 	// Стан, який чіпає ЛИШЕ кадровий цикл (і SwitchOutput, який кличе той самий
@@ -628,8 +528,9 @@ func (s *stream) openEncoder(device uintptr, gen uint64, srcW, srcH int) (*encod
 	reqW, reqH := requestedSize(s.reqW, s.reqH, srcW, srcH)
 	auto := s.reqW <= 0 || s.reqH <= 0
 	cfg := encode.Config{
-		Width: reqW, Height: reqH, FPS: s.fps, BitrateBps: bps, GOP: gopFrames(s.gopSeconds, s.fps),
+		Width: reqW, Height: reqH, FPS: s.fps, BitrateBps: bps, GOP: encoderGOP(gopFrames(s.gopSeconds, s.fps), s.rc),
 		D3DDevice: d3d, SrcWidth: srcW, SrcHeight: srcH, ForceSoftware: s.forceSoftware,
+		IntraRefresh: s.rc.IntraRefresh,
 	}
 	enc, err := encode.New(cfg)
 	// A-19: ErrNoHardware — це не «MFT не взяв цю геометрію», а «апаратного
@@ -650,7 +551,8 @@ func (s *stream) openEncoder(device uintptr, gen uint64, srcW, srcH int) (*encod
 	}
 	if err != nil {
 		// Не кожен MFT бере рідну роздільність (див. fallbackSize): відступаємо
-		// на 1920x1080 замість того, щоб лишити ПК без картинки зовсім.
+		// у бокс 1920x1080 зі збереженням пропорцій (Q-05) замість того, щоб
+		// лишити ПК без картинки зовсім.
 		// Перш ніж жертвувати роздільністю — пробуємо СОФТВЕРНИЙ енкодер у
 		// рідній. Апаратний MFT відмовляє на 2560x1440, софтверний ту саму
 		// геометрію бере (level 5.1). Але тільки там, де машина це тягне:
@@ -683,8 +585,9 @@ func (s *stream) openEncoder(device uintptr, gen uint64, srcW, srcH int) (*encod
 			w, h, reqW, reqH)
 		enc.Close()
 		enc, err = encode.New(encode.Config{
-			Width: w, Height: h, FPS: s.fps, BitrateBps: bps, GOP: gopFrames(s.gopSeconds, s.fps),
+			Width: w, Height: h, FPS: s.fps, BitrateBps: bps, GOP: encoderGOP(gopFrames(s.gopSeconds, s.fps), s.rc),
 			D3DDevice: 0, SrcWidth: srcW, SrcHeight: srcH, ForceSoftware: true,
+			IntraRefresh: s.rc.IntraRefresh,
 		})
 		if err != nil {
 			return nil, 0, 0, false, err
@@ -719,6 +622,18 @@ func (s *stream) openEncoder(device uintptr, gen uint64, srcW, srcH int) (*encod
 				capped, softwareCoreCost(w*h, capped))
 		}
 	}
+	// TASK.md крок 4: межі QP і інтра-оновлення — best effort. Відмова MFT
+	// лишає його rate control як був; у лозі видно, що саме не прижилось.
+	if mn, mx, ok := qpBounds(s.rc); ok {
+		if qerr := enc.SetQPBounds(mn, mx); qerr != nil {
+			log.Printf("oo-agent: межі QP %d..%d не прийнято: %v — rate control MFT без меж", mn, mx, qerr)
+		} else {
+			log.Printf("oo-agent: межі QP rate control %d..%d (0 = без межі)", mn, mx)
+		}
+	}
+	if s.rc.IntraRefresh > 0 {
+		log.Printf("oo-agent: інтра-оновлення %d кадрів: прийнято=%v (ні — лишається періодичний IDR)", s.rc.IntraRefresh, enc.IntraRefresh())
+	}
 	s.encDev = device
 	s.encGen = gen
 	return enc, w, h, software, nil
@@ -743,6 +658,31 @@ func nativeSize(c *capture.Capturer, outIdx int) (int, int) {
 		return outs[outIdx].Width, outs[outIdx].Height
 	}
 	return 1920, 1080
+}
+
+// idrUnsupported — енкодер не вміє примусовий IDR (hr=E_NOTIMPL, Windows 7).
+func idrUnsupported(err error) bool {
+	return err != nil && strings.Contains(err.Error(), "0x80004001")
+}
+
+// rebuildEncoder відкриває енкодер наново на тому самому капчері: перший кадр
+// нового енкодера — IDR. Лише з кадрового циклу (як syncEncoderToCapture).
+func (s *stream) rebuildEncoder(why string) error {
+	dev, gen := s.cap.Device(), s.cap.Generation()
+	srcW, srcH := s.cap.Size()
+	enc, w, h, sw, err := s.openEncoder(dev, gen, srcW, srcH)
+	if err != nil {
+		return err
+	}
+	if old := s.enc.Swap(enc); old != nil {
+		old.Close()
+	}
+	s.encW, s.encH, s.software = w, h, sw
+	s.applyReadback()
+	s.lastFrame = nil
+	epoch := bumpEpoch()
+	log.Printf("oo-agent: encoder rebuilt (%s): encode %dx%d, epoch=%d", why, w, h, epoch)
+	return nil
 }
 
 // syncEncoderToCapture перебудовує енкодер, якщо капчер після ACCESS_LOST
@@ -892,13 +832,15 @@ func (s *stream) SwitchOutput(idx int) error {
 // ручку керування його екраном повз усю авторизацію ЕРП.
 
 func main() {
-	transportKind := flag.String("transport", "webrtc", "транспорт: webrtc|wt (wt — легасі T1-стенд)")
+	transportKind := flag.String("transport", "webrtc", "транспорт: webrtc|wt (wt — легасі T1-стенд, лише збірка -tags wt)")
 	hubAddr := flag.String("hub", "", "адреса hub-а (wt: host:port QUIC; webrtc: http://host:port/offer/agent)")
 	fps := flag.Int("fps", 30, "цільовий FPS енкодера/GOP (60 — лише для стенда: подвійний CPU без видимої різниці на робочому столі)")
 	bitrate := flag.Int("bitrate", 0, "бітрейт, біт/с (CBR); 0 = порахувати за пікселями кадру (defaultBitrate)")
 	width := flag.Int("width", 0, "ширина вихідного кадру; 0 = рідна роздільність виводу (енкодер масштабує з нативної)")
 	height := flag.Int("height", 0, "висота вихідного кадру; 0 = рідна роздільність виводу")
 	output := flag.Int("output", 0, "індекс DXGI-виводу (монітора) на старті; неіснуючий клампиться до 0")
+	hubStandby := flag.String("hub-standby", os.Getenv("OO_HUB_STANDBY"), "O2: резервні hub-и через кому (webrtc, той самий формат що -hub). Порожньо = OFF (дефолт). Після -failover-after невдалих dial агент перевіряє GET /healthz резерву і переходить на здоровий. UNVERIFIED на реальних ПК")
+	failoverAfter := flag.Int("failover-after", defaultFailoverAfter, "O2: скільки невдалих dial поспіль до перевірки резервного hub-а")
 	node := flag.String("node", "", "mesh node_id цього ПК (webrtc): hub реєструє publisher-а під ним і маршрутизує viewer-ів сюди; порожнє = старий T1-режим (node з env на hub)")
 	forceSoftware := flag.Bool("force-software", false, "пропустити апаратний енум і взяти софтверний Microsoft H264 MFT (CPU NV12 sync-шлях) — для відтворення софт-шляху на машині з hw-енкодером")
 	tokenFlag := flag.String("token", "", "ЗАСТАРІЛО (видно в командному рядку): hub-токен агента; замість нього -token-file або env OO_AGENT_TOKEN")
@@ -908,13 +850,26 @@ func main() {
 	logPath := flag.String("log", "", "шлях до файлу логу; якщо задано — увесь вивід іде туди (GUI-режим -H windowsgui без консолі, stdout нема)")
 	audioFlag := flag.Bool("audio", false, "передавати звук ПК (перекриває env OO_SCREEN_AUDIO=1)")
 	inputFlag := flag.Bool("input", false, "приймати клавіатуру й мишу від глядача (перекриває env OO_SCREEN_INPUT=1)")
-	cursorLayerFlag := flag.Bool("cursor-layer", false, "шар курсора: НЕ вмальовувати вказівник у кадр, а слати форму+позицію каналом oosc-cursor (рух миші не коштує кадру); потрібен плеєр з config.cursorLayer")
+	cursorLayerFlag := flag.Bool("cursor-layer", true, "F9, ТИПОВО ON (вимкнути: -cursor-layer=false або env OO_SCREEN_CURSOR_LAYER=0). Шар курсора: НЕ вмальовувати вказівник у кадр, а слати форму+позицію каналом oosc-cursor (рух миші не коштує кадру); вмикається лише коли хаб дозволить: усі глядачі ноги з config.cursorLayer і без запису MKV, інакше курсор у кадрі як без прапорця")
 	refineFlag := flag.Bool("refine", true, "дошліфування нерухомого екрана (ТЗ P4): через 200 мс без нових кадрів 1–2 рази перекодувати останній кадр із нижчим QP; false — вимкнути")
 	textTilesFlag := flag.Bool("text-tiles", false, "текстові тайли (STAGE3-444 B): на нерухомому дошліфованому екрані один раз слати lossless PNG-тайли кольорового тексту каналом oosc-tiles (потрібен OO_SCREEN_TILES=1 на хабі і config.textTiles у плеєрі)")
 	textFPS := flag.Int("text-fps", 15, "стеля FPS у текстовому режимі (gap #2: набір/читання — дрібні dirty rects); 0 = не обмежувати. Вихід із режиму (рух) знімає стелю миттєво")
 	videoModeFlag := flag.Bool("video-mode", false, "режим «Відео» (internal/contentmode): тривалий рух великої площі (відео, прокрутка) -> до -video-fps на апаратному енкодері, що встигає, і прохання до hub підняти бітрейт у межах стелі; поза ним кадри вмісту не частіше -fps. UNVERIFIED на Windows")
 	videoFPS := flag.Int("video-fps", 60, "частота в режимі «Відео» (лише з -video-mode)")
+	lowMotionCapFlag := flag.Bool("lowmotion-cap", false, "R3: стеля бітрейту для малорухомого вмісту (internal/contentmode.Capper): рух < 25 % екрана -> 25 % цілі (у режимі Video — 50 %), не нижче 1 Мбіт/с; великий рух знімає стелю миттєво. Типово вимкнено. Лише симуляція (bench/quality/lowmotion_run.py), UNVERIFIED на реальному ПК")
+	multimonFlag := flag.Bool("multimon", false, "F6: публікувати КОЖЕН монітор окремим потоком одночасно (дочірній процес на монітор, node_id <node>#m<i>; потрібен OO_SCREEN_MULTIMON=1 на хабі). Типово вимкнено; з одним монітором нічого не міняє. UNVERIFIED на реальних ПК")
+	multimonMax := flag.Int("multimon-max", multimonMaxDefault, "F6: стеля одночасних потоків разом з основним (кожен = апаратна сесія енкодера)")
+	multimonChild := flag.Int("multimon-child", 0, "F6, службовий: цей процес — потік монітора N, запущений батьком -multimon (без звуку/вводу, select_output ігнорує)")
 	gopSeconds := flag.Int("gop-seconds", 10, "інтервал періодичного IDR, с (ТЗ 1.4). Довгий GOP = менше важких IDR (див. bench/quality/RESULTS-workloads.md); новий глядач отримує кадр із GOP-кешу хаба (OO_SCREEN_GOP_SPAN, дефолт 12s ≥ GOP, макс 30s) або IDR на keyframe_request/PLI. >11 вимагає на хабі більшого OO_SCREEN_GOP_SPAN")
+	consentFlag := flag.String("consent-policy", os.Getenv("OO_SCREEN_CONSENT"), "S3: згода користувача ПК: off (дефолт) | always-ask | ask-if-user-logged-in (питати, якщо сесія не заблокована) | unattended-allowed-by-admin (без запиту, з індикатором). Не-off: агент стартує в паузі й не віддає кадри/ввід до згоди; поки глядач є — topmost-плашка з кнопкою «Завершити сесію»")
+	consentTimeout := flag.Duration("consent-timeout", 30*time.Second, "S3: скільки чекати відповіді на запит згоди; мовчання = відмова")
+	autoUpdateURL := flag.String("auto-update-url", "", "S6: URL підписаного (ed25519) маніфесту оновлень; порожньо = автооновлення вимкнено (дефолт). Потрібен ключ, зашитий при збірці (-X main.updatePubKey)")
+	autoUpdateEvery := flag.Duration("auto-update-interval", 6*time.Hour, "S6: як часто перевіряти маніфест")
+	autoUpdateHealth := flag.Duration("auto-update-health-window", 2*time.Minute, "S6: за скільки новий бінарь мусить достукатись до хаба, інакше автоматичний відкат")
+	p2pFlag := flag.Bool("p2p", false, "N6: пряма нога агент↔браузер (перекриває env OO_SCREEN_P2P=1; потрібен OO_SCREEN_P2P=1 на хабі і config.p2p у плеєрі). Типово вимкнено. Лише webrtc і з -node. Нога везе відео+ввід, звук (OO_SCREEN_AUDIO) і шар курсора (-cursor-layer); тайли й додаткові монітори лишаються на relay. UNVERIFIED на реальних ПК/NAT")
+	p2pStun := flag.String("p2p-stun", "", "N6: STUN-сервери через кому (перекриває OO_SCREEN_P2P_STUN)")
+	p2pBwe := flag.Bool("p2p-bwe", false, "N6: локальний контролер бітрейту прямої ноги (internal/bwe, RTCP самої ноги; з OO_SCREEN_DELAYBWE=1 — ще transport-cc і детектор затримки). Перекриває env OO_SCREEN_P2P_BWE=1. Типово вимкнено: енкодер тримає останню ціль хаба")
+	autoUpdateReport := flag.String("auto-update-report-url", "", "O4: куди POST-ити вердикт здоров'я нової версії (ok/fail/inconclusive) для поетапної викатки (oo-rollout serve); порожньо = не звітувати. Токен — env OO_ROLLOUT_REPORT_TOKEN")
 	flag.Parse()
 
 	// Прапорці перекривають env з тієї ж причини, що й -token вище: агента
@@ -924,12 +879,30 @@ func main() {
 	// Тільки в один бік (прапорець вмикає, не вимикає): -audio=false не мусить
 	// гасити те, що людина свідомо ввімкнула через середовище.
 	applyFeatureFlags(*audioFlag, *inputFlag)
+	if *multimonChild > 0 {
+		// F6-дитина: звук, ввід і шар курсора несе лише основний потік.
+		audioEnabled, inputEnabled = false, false
+		*cursorLayerFlag = false
+	}
 	textTilesEnabled = *textTilesFlag
-	// Шар курсора (cursor.go): лише прапорцем, типово вимкнено. Ставиться ДО
-	// першого capture.New — перемикач читається при кожному відкритті капчера.
+	// Шар курсора (cursor.go): з хвилі 10 типово ON; явний прапорець
+	// перекриває env, env OO_SCREEN_CURSOR_LAYER=0 — аварійний вимикач.
+	// Ставиться ДО першого capture.New — перемикач читається при кожному
+	// відкритті капчера.
+	cursorFlagSet := false
+	flag.Visit(func(f *flag.Flag) {
+		if f.Name == "cursor-layer" {
+			cursorFlagSet = true
+		}
+	})
+	if *multimonChild == 0 {
+		*cursorLayerFlag = resolveCursorLayer(cursorFlagSet, *cursorLayerFlag, os.Getenv)
+	}
 	if *cursorLayerFlag {
 		cursorLayerEnabled = true
-		capture.SetCursorLayer(true)
+		// F9: НЕ capture.SetCursorLayer(true) — до дозволу від хаба
+		// вказівник у кадрі (глядач без шару й запис MKV його бачать).
+		applyCursorGrant(false)
 		go runCursorPoller(nil)
 	}
 
@@ -981,14 +954,6 @@ func main() {
 
 	nodeID = *node
 
-	// A-36: другий екземпляр на тому ж ПК рве DXGI-дублікацію першого.
-	release, dup := acquireSingleInstance()
-	if dup {
-		log.Printf("oo-agent: інший агент уже працює на цьому ПК — виходжу")
-		return
-	}
-	defer release()
-
 	if *hubAddr == "" {
 		switch *transportKind {
 		case "wt":
@@ -997,6 +962,32 @@ func main() {
 			*hubAddr = "http://127.0.0.1:4470/offer/agent"
 		}
 	}
+
+	// Реєструється РАНІШЕ за defer release(), отже виконується ПІСЛЯ нього:
+	// новий процес не наткнеться на ще зайнятий м'ютекс.
+	defer func() {
+		if relaunchAfterExit.Load() {
+			relaunchSelf()
+		}
+	}()
+
+	// A-36: другий екземпляр на тому ж ПК рве DXGI-дублікацію першого.
+	release, dup := acquireSingleInstance()
+	if *multimonChild > 0 {
+		release, dup = acquireNamedInstance(`Global\oo-screen-agent-m` + itoa(*multimonChild))
+	}
+	if dup {
+		log.Printf("oo-agent: інший агент уже працює на цьому ПК — виходжу")
+		return
+	}
+	defer release()
+
+	standbyList := *hubStandby
+	if *transportKind != "webrtc" && standbyList != "" {
+		log.Printf("oo-agent: -hub-standby підтримано лише для webrtc — ігнорую")
+		standbyList = ""
+	}
+	hubSel := newHubSelector(*hubAddr, standbyList, *failoverAfter, httpHealth)
 
 	// A-04: під -H windowsgui os.Stderr не існує — уся капчер-діагностика
 	// (recreate failed, access lost) губилась навіть із -log. Один сток.
@@ -1027,10 +1018,28 @@ func main() {
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+	if *multimonChild > 0 {
+		go watchParentStdin(os.Stdin, stop) // F6: батько помер -> виходимо
+	}
 
 	// A-39: logoff/shutdown гасять ctx тим самим шляхом, що Ctrl+C; lock/unlock
 	// читає кадровий цикл. nil = вікно не піднялось, поведінка як до A-39.
 	session := watchSession(stop)
+
+	// S6: щойно встановлене оновлення перевіряємо ПІСЛЯ м'ютекса одного
+	// екземпляра і паралельно з роботою агента (health = агент підключився).
+	if *multimonChild == 0 {
+		go autoUpdateStartup(ctx, *hubAddr, *autoUpdateHealth, stop, *autoUpdateReport, *node)
+	}
+
+	if *autoUpdateURL != "" && *multimonChild == 0 {
+		if u, uerr := newUpdater(*autoUpdateURL, nodeID); uerr != nil {
+			log.Printf("oo-agent: autoupdate вимкнено: %v", uerr)
+		} else {
+			log.Printf("oo-agent: autoupdate: версія %s, маніфест %s кожні %s", agentVersion, *autoUpdateURL, *autoUpdateEvery)
+			go runAutoUpdate(ctx, u, *autoUpdateEvery, stop)
+		}
+	}
 
 	// A-27: замість Fatalf — чекаємо з бек-офом (див. retryUntil). Але
 	// заблокований/захищений робочий стіл (E_ACCESSDENIED на DuplicateOutput)
@@ -1078,7 +1087,7 @@ func main() {
 	// Стеля для bitrate_target: hub бере її з поля bitrate в offer (ceilingBps).
 	// Ставимо ДО dial — offerReq читає цю змінну.
 	//
-	// ponytail: при відступі на 1920x1080 (fallbackSize) бітрейт лишається
+	// ponytail: при відступі в бокс 1920x1080 (fallbackSize) бітрейт лишається
 	// порахованим під рідну — тобто щедрішим, ніж треба. Так СВІДОМО: CBR уже
 	// зашитий в енкодер при відкритті, а SetBitrate до першого кадру MFT
 	// приймає ненадійно (див. bitrateTarget), і перерахунок лише тут розійшовся
@@ -1089,7 +1098,9 @@ func main() {
 		reqW: *width, reqH: *height, fps: effectiveFPS, gopSeconds: *gopSeconds,
 		forceSoftware: *forceSoftware, logger: logger,
 		cap: cap_, output: outIdx,
+		rc: rcPolicyFromEnv(os.Getenv),
 	}
+	log.Printf("oo-agent: rate-control policy %+v", s.rc)
 	s.bitrateBps.Store(int64(bitrateBps))
 	paceTargetBps.Store(uint64(bitrateBps))
 	// nil-guard: на паузі капчер звільнено (releaseCapture), тож на виході з
@@ -1130,6 +1141,23 @@ func main() {
 	publishOutputs(outIdx)
 	if l := outputs.Load(); l != nil {
 		log.Printf("oo-agent: outputs=%d active=%d %+v", len(l.Outputs), l.Active, l.Outputs)
+		// F6: решта моніторів — дочірніми потоками. Лише батько, лише webrtc
+		// і лише з node_id (без нього хабу нема з чим звʼязати потоки).
+		if (*multimonFlag || multimonEnvOn()) && *multimonChild == 0 {
+			switch {
+			case *transportKind != "webrtc" || nodeID == "":
+				log.Printf("oo-agent: multimon потребує -transport=webrtc і -node — вимкнено")
+			default:
+				kids := multimonChildren(len(l.Outputs), outIdx, *multimonMax)
+				if len(kids) > 0 {
+					// Рев'ю F6: з дітьми основний потік теж закріплений —
+					// інакше select_output перевів би його на монітор, який
+					// уже захоплює дитина (дубль + конфлікт DXGI, A-36).
+					multimonParentPinned.Store(true)
+				}
+				startMultimonChildren(ctx, kids, nodeID, *logPath, cliToken)
+			}
+		}
 	}
 	// logFirstSoftFrame: одноразове діагностичне логування геометрії CPU-кадру.
 	// Краш на Computer (Intel, native 1920x1200, encode 1920x1080) не
@@ -1176,6 +1204,103 @@ func main() {
 		}
 	}
 
+	// S3: згода користувача ПК. Gate стоїть МІЖ сигналом хаба і gatePaused:
+	// resume від хаба лише ПРОСИТЬ, відчиняє — локальне рішення (діалог або
+	// політика адміна з прапорця). Без згоди агент стартує на паузі, а ввід
+	// відкидає сам (inputAllowed, input.go) — глядачу нічим це обійти.
+	consentPolicy, err := consent.ParsePolicy(*consentFlag)
+	if err != nil {
+		log.Fatalf("oo-agent: %v", err)
+	}
+	consentGate = consent.New(consent.Config{
+		Policy:      consentPolicy,
+		UI:          consent.NativeUI{},
+		UserPresent: func() bool { return !session.Locked() },
+		Timeout:     *consentTimeout,
+		Logf:        log.Printf,
+	})
+	if consentGate.Required() {
+		gatePaused.Store(true)
+		log.Printf("oo-agent: consent policy=%s — старт у паузі до згоди", consentPolicy)
+	}
+	onGate = consentGate.Wrap(onGate)
+
+	// N6: пряма нога. Хаб не бачить прямого глядача, тож шле "pause" (у нього
+	// глядачів 0) — поки жива хоч одна пряма нога, цю паузу не пропускаємо, а
+	// згода/кадри тримаються прямою ногою. Без -p2p — рівно як раніше.
+	var p2pAg *p2pAgent
+	if p2pCfg := p2pConfig(*p2pFlag, *p2pStun, os.Getenv); p2pCfg.Enabled && *multimonChild == 0 {
+		base := p2pHubBase(*hubAddr)
+		if *transportKind != "webrtc" || nodeID == "" || base == "" {
+			log.Printf("oo-agent: p2p: потрібні -transport webrtc, -node і http(s) -hub — пряму ногу вимкнено")
+		} else {
+			consented := onGate
+			var hubWantsView atomic.Bool
+			var p2pLive atomic.Int32
+			onGate = func(resume bool) {
+				hubWantsView.Store(resume)
+				p2pAg.setHubViewers(resume) // relay-глядачів нема — ціль хаба не тримає енкодер
+				if !resume && p2pLive.Load() > 0 {
+					return
+				}
+				consented(resume)
+			}
+			p2pAg = newP2PAgent(p2pCfg, func() string {
+				if b := p2pHubBase(hubSel.current()); b != "" {
+					return b
+				}
+				return base
+			}, nodeID, authToken)
+			if consentGate.Required() {
+				p2pAg.consent = consentGate
+				p2pAg.requestConsent = func(ctx context.Context) bool {
+					consented(true) // діалог (або політика адміна)
+					for !consentGate.Allowed() {
+						select {
+						case <-ctx.Done():
+							return false
+						case <-time.After(100 * time.Millisecond):
+						}
+					}
+					return true
+				}
+			}
+			p2pAg.onKeyframe = onKeyframeRequest
+			// Звук і шар курсора — ті самі прапорці, що й на relay.
+			p2pAg.audio = audioEnabled
+			p2pAg.audioCap = audioCodec.Capability()
+			if cursorLayerEnabled {
+				p2pAg.cursor = cursorSinks
+			}
+			// Локальний контролер (дефолт вимкнено). Ціль іде тим самим шляхом,
+			// що й bitrate_target хаба (onBitrateTarget нижче -> кадровий цикл).
+			p2pAg.bwe = *p2pBwe || os.Getenv("OO_SCREEN_P2P_BWE") == "1"
+			p2pAg.delayBWE = os.Getenv("OO_SCREEN_DELAYBWE") == "1"
+			p2pAg.ceilBps = uint64(bitrateBps)
+			p2pAg.startBps = func() uint64 { return uint64(s.bitrateBps.Load()) }
+			p2pInj := newInputInjector()
+			p2pAg.onActive = func(n int) {
+				p2pLive.Store(int32(n))
+				if n == 0 {
+					releaseHeldInput(p2pInj, "p2p leg closed") // SEC #37
+				}
+				if n > 0 {
+					consented(true)
+				} else if !hubWantsView.Load() {
+					consented(false)
+				}
+			}
+			if p2pInj != nil {
+				p2pAg.onInput = func(ev []byte) {
+					if err := handleInputMessage(ev, p2pInj); err != nil {
+						logInputProblem(time.Now(), err)
+					}
+				}
+			}
+			log.Printf("oo-agent: p2p увімкнено (stun=%d, turn=%v)", len(p2pCfg.STUN), p2pCfg.TURNURL != "")
+		}
+	}
+
 	// applyBitrate — ЄДИНЕ місце, де ціль реально лягає в енкодер. IDR тут
 	// БІЛЬШЕ НЕ ФОРСУЄМО (P0 B4/B5): AVEncCommonMeanBitRate — динамічна
 	// властивість MFT, CBR-контроль перераховує QP з наступного кадру, тож
@@ -1183,6 +1308,12 @@ func main() {
 	// найбільший кадр, і саме при ЗНИЖЕННІ цілі (канал вузький) він б'є в
 	// чергу вузького місця: стенд показав 22-33 IDR/хв під стелею і фризи від
 	// них. Якщо глядачу потрібен IDR, хаб шле keyframe_request окремо.
+	var (
+		lowCap            = contentmode.NewCapper(contentmode.CapConfig{})
+		lowCapEnc         *encode.Encoder
+		lowCapApplied     int
+		applyLowMotionCap func(contentmode.Mode, float64)
+	)
 	applyBitrate := func(bps int) {
 		e := s.encoder()
 		if e == nil {
@@ -1196,7 +1327,34 @@ func main() {
 		// нею, інакше перемикання монітора мовчки скасовувало б притискання хаба.
 		s.bitrateBps.Store(int64(bps))
 		paceTargetBps.Store(uint64(bps))
+		lowCapApplied = bps // енкодер тепер на новій цілі; стелю перекладе наступний кадр
 		log.Printf("oo-agent: bitrate -> %d bps", bps)
+	}
+
+	// applyLowMotionCap (-lowmotion-cap, R3) — стеля поверх ЖИВОЇ цілі хаба
+	// (s.bitrateBps не чіпаємо: це ціль хаба, на ній відкривається новий
+	// енкодер). Лише з кадрового циклу (A-13). Новий енкодер (SwitchOutput,
+	// reacquire) відкривається з цілі хаба — тоді вважаємо застосованою її.
+	applyLowMotionCap = func(mode contentmode.Mode, area float64) {
+		lowCap.Update(mode, area, time.Now())
+		e := s.encoder()
+		if e == nil {
+			return
+		}
+		target := int(s.bitrateBps.Load())
+		if e != lowCapEnc {
+			lowCapEnc, lowCapApplied = e, target
+		}
+		want := lowCap.Bps(target)
+		if want == lowCapApplied {
+			return
+		}
+		if err := e.SetBitrate(want); err != nil {
+			log.Printf("oo-agent: lowmotion-cap SetBitrate(%d): %v", want, err)
+			return
+		}
+		lowCapApplied = want
+		log.Printf("oo-agent: lowmotion-cap -> %d bps (ціль %d, area≈%.3f, mode=%v)", want, target, area, mode)
 	}
 
 	// onBitrateTarget — hub просить іншу CBR-ціль. Крутимо ручку на живому
@@ -1219,12 +1377,32 @@ func main() {
 		log.Printf("oo-agent: bitrate -> %d bps (застосує кадровий цикл)", bps)
 	}
 
+	// N6: ціль локального контролера прямої ноги — тим самим шляхом.
+	// Енкодер один, тож ціль хаба і цілі ніг ідуть через арбітраж p2pAg
+	// (мінімум): hubBitrateTarget — те, що отримує транспорт хаба.
+	hubBitrateTarget := onBitrateTarget
+	if p2pAg != nil && p2pAg.bwe {
+		p2pAg.onBitrate = func(bps uint64) {
+			log.Printf("oo-agent: p2p bwe (мін. ніг і хаба) -> %d bps", bps)
+			onBitrateTarget(bps)
+		}
+		hubBitrateTarget = p2pAg.setHubTarget
+	}
+
 	// onSelectOutput — hub попросив інший монітор (control §select_output; сам
 	// запит приходить із консолі ЕРП). Тут лише КЛАДЕМО намір: перемикання
 	// капчера робить кадровий цикл, бо capture.Capturer «NOT safe for concurrent
 	// use», а ми в горутині DataChannel/QUIC-стріму. Неіснуючий індекс відсіє
 	// SwitchOutput проти живої енумерації — залишимось на поточному моніторі.
 	onSelectOutput := func(idx int) {
+		if *multimonChild > 0 {
+			log.Printf("oo-agent: select_output -> %d проігноровано: потік закріплений за монітором %d (F6)", idx, *multimonChild)
+			return
+		}
+		if multimonParentPinned.Load() {
+			log.Printf("oo-agent: select_output -> %d проігноровано: -multimon активний, монітори вже публікуються окремими потоками (F6)", idx)
+			return
+		}
 		log.Printf("oo-agent: select_output -> %d (застосує кадровий цикл)", idx)
 		s.requestOutput(idx)
 	}
@@ -1242,6 +1420,9 @@ func main() {
 	// обробник стану pion блокувати не можна.
 	pcDown := make(chan string, 1)
 	onDown := func(reason string) {
+		if p2pAg != nil {
+			p2pAg.setHubViewers(false) // хаб відпав — relay-глядачів нема; gate після реконекту поверне
+		}
 		select {
 		case pcDown <- reason:
 		default:
@@ -1249,17 +1430,27 @@ func main() {
 	}
 
 	tp, err := retryUntil(ctx, "initial dial "+*hubAddr, func() (transport, error) {
-		return dial(*transportKind, *hubAddr, frameInterval, onKeyframeRequest, onGate, onBitrateTarget, onSelectOutput, onDown)
+		t, err := dial(*transportKind, hubSel.current(), frameInterval, onKeyframeRequest, onGate, hubBitrateTarget, onSelectOutput, onDown)
+		if err != nil {
+			hubSel.failed(ctx)
+			return nil, err
+		}
+		hubSel.ok()
+		*hubAddr = hubSel.current()
+		return t, nil
 	})
 	if err != nil {
 		return
 	}
 	log.Printf("oo-agent: connected via %s to %s", *transportKind, *hubAddr)
+	markAgentConnected()
 
 	type sendJob struct {
 		au  encode.AU
 		seq uint64
 	}
+
+	rcPol := s.rc
 
 	var (
 		seq        uint64       // envelope/output frame sequence (wt only; monotonic per AU sent)
@@ -1271,8 +1462,27 @@ func main() {
 		keepalives int // скільки разів переслали останній кадр (нерухомий екран)
 		refines    int // скільки refine-кадрів закодовано (ТЗ P4)
 		// refiner — автомат refine (internal/refine): коли рух стих, ще раз
-		// кодуємо останній кадр із нижчим QP. Лише апаратний D3D-шлях.
-		refiner = refine.New(refine.Config{MinGap: frameInterval})
+		// кодуємо останній кадр із нижчим QP. Апаратний шлях; софтверний — лише з
+		// OO_SCREEN_REFINE_SOFTWARE (Q-10, refineAllowed).
+		refiner = refine.New(refineConfig(rcPol, frameInterval, int(s.bitrateBps.Load())))
+		// C3: правило великого кадру — які межі QP зараз стоять на якому
+		// енкодері (largeQP 0 — межі політики).
+		largeQP    int
+		largeQPEnc *encode.Encoder
+		// TASK.md крок 4: вид кожного поданого кадру за PTS і QP з потоку —
+		// щоб refine знав, що лишилось на екрані (encpolicy.go).
+		auKind = &auKinds{}
+		auQP   = h264.NewQPReader()
+		// C2: QP кадрів за вікно статистики -> enc_stats хабу (nil — вимкнено).
+		encQPW      *qpWindow
+		encStatsSeq uint64
+		// OO_SCREEN_IDLE_IDR: періодичний IDR — у тиші, а не посеред руху
+		// (internal/keyframe). nil — вимкнено, IDR ставить GOP MFT як раніше.
+		kfPol *keyframe.Policy
+		// Q-11 (OO_SCREEN_GOP_TIME=1): IDR кожні -gop-seconds за ЧАСОМ —
+		// GOP у кадрах на VFR (текст 15 fps, keepalive 1 кадр/с) тягнеться
+		// хвилинами. nil — вимкнено.
+		timeGOP *keyframe.TimeGOP
 		// Gap #2: сигнал «текстовий режим» з площі dirty/move rects. Споживач —
 		// стеля FPS (-text-fps, textfps.go): у текстовому режимі кодуємо не
 		// частіше за textModeGap; затриманий кадр дошлемо, щойно щілина
@@ -1317,6 +1527,16 @@ func main() {
 		tpMu        sync.Mutex // guards tp across reconnects; the single ordered sender goroutine reads it under this lock
 		sendQueue   = make(chan sendJob, 8)
 	)
+	if rcPol.EncTelemetry {
+		encQPW = &qpWindow{}
+		log.Printf("oo-agent: enc telemetry on: CODECAPI %s", s.encoder().CodecAPICaps())
+	}
+	if rcPol.IdleIDR {
+		kfPol = keyframe.New(keyframe.Config{GOPFrames: gopFrames(s.gopSeconds, s.fps)})
+	}
+	if gopTimeEnabled(os.Getenv) {
+		timeGOP = keyframe.NewTime(time.Duration(s.gopSeconds) * time.Second)
+	}
 
 	// onContentMode — новий стан автомата Text / Normal / Video. textOn —
 	// рівно «режим Text» (у Video текстова стеля не діє ніколи); з
@@ -1350,6 +1570,9 @@ func main() {
 	// незалежно скидала спільний inFlight, ламаючи admission-контроль.
 	go func() {
 		for job := range sendQueue {
+			if p2pAg != nil {
+				p2pAg.writeVideo(job.au.Data, frameInterval) // N6: той самий AU у прямі ноги
+			}
 			tpMu.Lock()
 			cur := tp
 			tpMu.Unlock()
@@ -1365,6 +1588,47 @@ func main() {
 		}
 	}()
 
+	if p2pAg != nil {
+		go p2pAg.run(ctx)
+	}
+
+	// Доступність картинки для хаба (hub unavailable.go): на екрані блокування
+	// DuplicateOutput приречений, а консоль ЕРП без цього сигналу йшла в OO,
+	// чекала 8с кадру й лише потім брала Mesh. Раз на секунду звіряємо стан
+	// сесії з тим, що вже сказали ЦІЙ нозі: реконект = нова нога = кажемо заново.
+	go func() {
+		var said transport
+		saidLocked, fbSeq := false, uint64(0)
+		tick := time.NewTicker(time.Second)
+		defer tick.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-tick.C:
+			}
+			tpMu.Lock()
+			cur := tp
+			tpMu.Unlock()
+			locked := session.Locked()
+			if cur == said && locked == saidLocked {
+				continue
+			}
+			w, ok := cur.(*webrtcTransport)
+			if !ok {
+				continue
+			}
+			reason := ""
+			if locked {
+				reason = "session-locked"
+			}
+			fbSeq++
+			if w.sendFallbackReason(fbSeq, reason) {
+				said, saidLocked = cur, locked
+			}
+		}
+	}()
+
 	// Звук — ОКРЕМА горутина, бо джерело в нього своє (WASAPI, ~10мс пакети) і
 	// зупиняти через нього кадровий цикл нема за що. Транспорт бере ту саму
 	// змінну під tpMu, що й відео-sender вище: після реконекту звук піде в
@@ -1372,6 +1636,9 @@ func main() {
 	// Гейт — той самий gatePaused, що керує відео (див. runAudio).
 	if audioEnabled && *transportKind == "webrtc" {
 		go runAudio(ctx, &gatePaused, func(data []byte, dur time.Duration) error {
+			if p2pAg != nil {
+				p2pAg.writeAudio(data, dur) // N6: той самий кадр у прямі ноги
+			}
 			tpMu.Lock()
 			cur := tp
 			tpMu.Unlock()
@@ -1395,9 +1662,11 @@ func main() {
 		lastStillAU     *encode.AU
 		lastStillEnc    *encode.Encoder
 		lastStillSentAt time.Time
-		reacqBackoff    = reacquireBackoffMin
-		suspended       bool      // A-17: дублікацію віддано на паузі
-		lastIDRAt       time.Time // A-31: дебаунс IDR за запитом
+		// lastFrameEncoded — s.lastFrame уже пройшов через енкодер (keepStillAU).
+		lastFrameEncoded bool
+		reacqBackoff     = reacquireBackoffMin
+		suspended        bool      // A-17: дублікацію віддано на паузі
+		lastIDRAt        time.Time // A-31: дебаунс IDR за запитом
 	)
 	sendStillKeepalive := func() {
 		if lastStillAU == nil || gatePaused.Load() || time.Since(lastStillSentAt) < keepaliveAfter {
@@ -1433,7 +1702,12 @@ func main() {
 		// Знімається прапорець лише якщо його поставили МИ і новий хаб за час
 		// дозвону нічого про гейт не сказав — див. reconnectGate.restore.
 		rg := beginReconnectGate(&gatePaused, &gateSeen)
-		defer rg.restore()
+		// S3: згода не переживає реконект (на тому боці може бути інший
+		// глядач), тож і паузу знімає лише новий resume через Gate.
+		consentGate.Reset()
+		if !consentGate.Required() {
+			defer rg.restore()
+		}
 		if s.cap != nil && !suspended {
 			s.cap.Suspend()
 			suspended = true
@@ -1448,8 +1722,11 @@ func main() {
 			tp.close()
 			tpMu.Unlock()
 
-			newTp, err := dial(*transportKind, *hubAddr, frameInterval, onKeyframeRequest, onGate, onBitrateTarget, onSelectOutput, onDown)
+			newTp, err := dial(*transportKind, hubSel.current(), frameInterval, onKeyframeRequest, onGate, hubBitrateTarget, onSelectOutput, onDown)
 			if err != nil {
+				if hubSel.failed(ctx) {
+					backoff = reconnectBackoffMin // новий хаб здоровий — пробуємо одразу з короткою витримкою
+				}
 				wait := jitterBackoff(backoff)
 				log.Printf("oo-agent: reconnect failed, retry in %s: %v", wait.Round(time.Millisecond), err)
 				select {
@@ -1460,6 +1737,8 @@ func main() {
 				backoff = nextBackoff(backoff)
 				continue
 			}
+			hubSel.ok()
+			*hubAddr = hubSel.current()
 			tpMu.Lock()
 			tp = newTp
 			tpMu.Unlock()
@@ -1592,6 +1871,18 @@ loop:
 
 		suspended = false
 
+		// Енкодер (пере)відкрився з іншим профілем/рівнем, ніж оголосила нога:
+		// новий offer, інакше глядач рахує буфер за чужим рівнем (fmtpStale).
+		tpMu.Lock()
+		wt, isRTC := tp.(*webrtcTransport)
+		stale := isRTC && wt.fmtpStale()
+		tpMu.Unlock()
+		if stale {
+			log.Printf("oo-agent: енкодер кодує fmtp=%s, а нога оголосила %s — новий offer", h264Fmtp(), wt.fmtp)
+			reconnect()
+			continue
+		}
+
 		// Ціль, що прийшла на паузі, застосовується тут — на першому кадрі
 		// після відновлення, поки в MFT знову йдуть кадри.
 		if bps := bitrateWanted.take(); bps != 0 {
@@ -1601,6 +1892,15 @@ loop:
 		if s.wantIDR.Swap(false) && time.Since(lastIDRAt) >= idrDebounce {
 			if err := s.encoder().ForceIDR(); err != nil {
 				log.Printf("oo-agent: ForceIDR (request): %v", err)
+				// Windows 7: програмний H.264 MFT не має AVEncVideoForceKeyFrame
+				// (E_NOTIMPL). Без IDR новий глядач не дочекається першого кадру
+				// (8 с і назад у Mesh — H-PC 06.10.2026). Перший кадр щойно
+				// відкритого енкодера завжди IDR, тож перевідкриваємо його.
+				if idrUnsupported(err) {
+					if rerr := s.rebuildEncoder("IDR не підтримується енкодером"); rerr != nil {
+						log.Printf("oo-agent: rebuild encoder for IDR: %v", rerr)
+					}
+				}
 			}
 			lastIDRAt = time.Now()
 		}
@@ -1623,7 +1923,13 @@ loop:
 		//
 		// Refine (ТЗ P4) лише вкорочує цей дедлайн: якщо рух стих, прокидаємось
 		// у мить, коли час refine, а не через повний keepaliveAfter.
-		refineOn := *refineFlag && !s.software && !gatePaused.Load() && s.lastFrame != nil
+		// Q-10: на софтверному MFT — лише з OO_SCREEN_REFINE_SOFTWARE і поки
+		// swlimit має запас CPU (refineAllowed).
+		swLoad, haveSWLoad := 0.0, false
+		if swPol != nil && swPolEnc == s.encoder() {
+			swLoad, haveSWLoad = swPol.Load(), true
+		}
+		refineOn := *refineFlag && refineAllowed(rcPol, s.software, swLoad, haveSWLoad) && !gatePaused.Load() && s.lastFrame != nil
 		if !refineOn {
 			refiner.Disarm()
 		}
@@ -1646,7 +1952,7 @@ loop:
 		// A-01: капчер міг пережити ACCESS_LOST і жити вже на іншому девайсі.
 		if dev, gen := s.cap.Device(), s.cap.Generation(); encoderStale(dev, gen, s.encDev, s.encGen) {
 			s.lastFrame = nil // аліасив буфери/текстуру старого девайса
-			if dev == 0 {
+			if captureRecovering(dev, err) {
 				// Дублікацію втрачено, капчер ще відновлює її (лок/UAC):
 				// кадру нема, сесію тримає повтор keepalive (A-03).
 				sendStillKeepalive()
@@ -1695,8 +2001,11 @@ loop:
 				continue
 			}
 		case err == nil:
-			s.lastFrame = frame
+			s.lastFrame, lastFrameEncoded = frame, false
 			refiner.Motion(time.Now()) // новий кадр = рух: refine, що йшов, перериваємо
+			if kfPol != nil {
+				kfPol.Motion(time.Now())
+			}
 			// Текстові тайли: invalidate ДО кодування цього кадру (tiles.go).
 			tilesMotion()
 			textCF = capture.ChangedFraction(frame)
@@ -1704,6 +2013,10 @@ loop:
 				textCF,
 				textmode.Fraction(frame.MoveArea, frame.Width, frame.Height), time.Now())
 			onContentMode(mode, flipped)
+			if *lowMotionCapFlag {
+				applyLowMotionCap(mode, contentmode.Area(textCF,
+					textmode.Fraction(frame.MoveArea, frame.Width, frame.Height)))
+			}
 		case ctx.Err() != nil:
 			break loop // зупиняють агента, а не просто екран стоїть
 		case refineWait && errors.Is(err, context.DeadlineExceeded):
@@ -1752,7 +2065,7 @@ loop:
 				continue
 			}
 			log.Printf("oo-agent: перший кадр знято через GDI (екран нерухомий)")
-			frame, s.lastFrame = gdi, gdi
+			frame, s.lastFrame, lastFrameEncoded = gdi, gdi, false
 			// Перший кадр — теж «рух»: без цього refine (і тайли за ним) на
 			// сесії, що стартувала на нерухомому екрані, чекали б першої зміни.
 			refiner.Motion(time.Now())
@@ -1822,6 +2135,13 @@ loop:
 			}
 		}
 
+		// C1: «Швидкість» глядача (control max_fps). Keepalive/refine (still) не
+		// чіпаємо — без keepalive сторож браузера рве сесію.
+		if gap := maxFpsGap(int(maxFpsWanted.Load()), s.fps); gap > 0 && !still && now.Sub(lastAdmitAt) < gap {
+			throttled++
+			continue
+		}
+
 		// Gap #2: текстова стеля. Стоїть ПІСЛЯ софт-бюджету — обидва мусять
 		// пропустити, тож ефективна стеля = min. still (keepalive/refine) і
 		// дошлення затриманого не чіпаємо. Вихід із текстового режиму вже
@@ -1877,6 +2197,27 @@ loop:
 			// СТАРІЙ текстурі, якщо перебудований капчер отримав ту саму адресу.
 			encFrame.TextureGen = frame.TextureGen
 		}
+		// C3: великий кадр на вузькому каналі — одразу високий MinQP (дешевий
+		// кадр без стрибка HRD), якість доведе refine. Будь-який інший кадр
+		// повертає межі політики ДО SetRefineQP (той відновлює MinQP саме з них).
+		if rcPol.LargeFrameQP > 0 {
+			if largeQPEnc != s.encoder() {
+				largeQPEnc, largeQP = s.encoder(), 0
+			}
+			lmin, lmax, large := largeFrameBounds(rcPol, !still && refineQP == 0, textCF, int(s.bitrateBps.Load()), s.encW*s.encH)
+			want := lmin
+			if !large {
+				want = 0
+				lmin, lmax, _ = qpBounds(rcPol)
+			}
+			if want != largeQP {
+				if lerr := s.encoder().SetQPBounds(lmin, lmax); lerr != nil {
+					log.Printf("oo-agent: large-frame QP: %v — правило вимкнено", lerr)
+					rcPol.LargeFrameQP = 0
+				}
+				largeQP = want
+			}
+		}
 		if refineQP > 0 {
 			if rerr := s.encoder().SetRefineQP(refineQP); rerr != nil {
 				// MaxQP відмовлено — per-sample QP усе одно стоїть; логуємо раз.
@@ -1887,8 +2228,35 @@ loop:
 				refineErrLog.Do(func() { log.Printf("oo-agent: refine restore: %v", rerr) })
 			}
 		}
+		// Періодичний IDR у тиші: лише на keepalive-повторі нерухомого екрана
+		// і лише апаратному MFT (Windows 7 софт-MFT не вміє ForceKeyFrame —
+		// там лишається GOP самого MFT). Невдача вимикає політику: GOP MFT
+		// (encoderGOP, 2×) однаково ставить IDR сам.
+		if kfPol != nil && !s.software && refineQP == 0 && kfPol.Due(time.Now(), still) {
+			if ierr := s.encoder().ForceIDR(); ierr != nil {
+				log.Printf("oo-agent: idle IDR: %v — політику вимкнено, IDR ставить GOP MFT", ierr)
+				kfPol = nil
+			} else {
+				lastIDRAt = time.Now()
+			}
+		}
+		// Q-11: IDR за часом — на будь-якому кадрі, лише апаратному MFT (той
+		// самий запобіжник, що й вище). Невдача вимикає політику.
+		if timeGOP != nil && !s.software && refineQP == 0 && timeGOP.Due(time.Now()) {
+			if ierr := s.encoder().ForceIDR(); ierr != nil {
+				log.Printf("oo-agent: time GOP IDR: %v — політику вимкнено, IDR ставить GOP MFT", ierr)
+				timeGOP = nil
+			} else {
+				lastIDRAt = time.Now()
+			}
+		}
+		auKind.note(encFrame.PTS, refine.Frame{Refine: refineQP, Motion: !still && refineQP == 0})
 		encStart := time.Now()
 		aus, err := s.encoder().Encode(encFrame)
+		observeAUs(aus, auKind, auQP, refiner, kfPol, time.Now(), encQPW)
+		if timeGOP != nil {
+			timeGOP.Coded(time.Now(), hasKeyframe(aus))
+		}
 		if err == nil && !still {
 			encSecEWMA = encEWMA(encSecEWMA, time.Since(encStart))
 		}
@@ -1914,7 +2282,7 @@ loop:
 			log.Printf("oo-agent: encode.Encode: %v", err)
 			// A-12: «MFT event wait timeout» — енкодер завис; перебудова через
 			// той самий шлях, що й для ACCESS_LOST.
-			if strings.Contains(err.Error(), "wedged") {
+			if errors.Is(err, encode.ErrWedged) {
 				s.releaseCapture()
 			}
 			continue
@@ -1926,10 +2294,15 @@ loop:
 			sendAsync(au)
 		}
 		// Refine-AU не кешуємо як keepalive: його залишок поверх іншого
-		// референсу зіпсував би картинку.
-		if still && refineQP == 0 && len(aus) == 1 && !aus[0].Keyframe {
-			cp := aus[0]
-			lastStillAU, lastStillEnc, lastStillSentAt = &cp, s.encoder(), time.Now()
+		// референсу зіпсував би картинку. Кадр, що ще не кодувався (дропнутий
+		// max_fps/admission), теж не годиться: його P-кадр несе реальну дельту.
+		encodedBefore := lastFrameEncoded
+		lastFrameEncoded = true // frame тут завжди == s.lastFrame
+		// IDR скидає кеш навіть на refine-проході (nextStillAU).
+		if refineQP == 0 || hasKeyframe(aus) {
+			if n := nextStillAU(lastStillAU, still && refineQP == 0, encodedBefore, aus); n != lastStillAU {
+				lastStillAU, lastStillEnc, lastStillSentAt = n, s.encoder(), time.Now()
+			}
 		}
 		// Текстові тайли: екран нерухомий і refine уже доведений до кінця
 		// (або, без refine — софт-енкодер, -refine=false, — простій
@@ -1945,6 +2318,16 @@ loop:
 		}
 
 		if time.Since(lastLog) >= 5*time.Second {
+			if encQPW != nil {
+				encStatsSeq++
+				m := encQPW.encStatsMsg(encStatsSeq, s.encoder().Name(), s.software, s.encoder().CodecAPICaps())
+				tpMu.Lock()
+				cur := tp
+				tpMu.Unlock()
+				if cs, ok := cur.(ctlSender); ok {
+					_ = cs.sendCtl(m)
+				}
+			}
 			log.Printf("oo-agent: sent=%d dropped=%d keepalives=%d refines=%d throttled=%d", sent.Load(), dropped.Load(), keepalives, refines, throttled)
 			dropped.Store(0)
 			lastLog = time.Now()

@@ -16,6 +16,9 @@ type Pkt struct {
 	At     time.Time
 	Sent   time.Time // коли пакет вийшов із хаба (вхід реле); нуль — невідомо
 	Size   int
+	// Filler — пакет займає seq, але медіа не несе (FEC у RED): збирач кадрів
+	// пропускає його, лише не вважає його seq діркою між кадрами.
+	Filler bool
 }
 
 // IsIDRPayload — чи несе H.264 RTP-payload (RFC 6184) зріз IDR.
@@ -69,6 +72,16 @@ func (r *Recorder) Add(seq uint16, ts uint32, marker bool, payload []byte, at, s
 	r.Pkts = append(r.Pkts, Pkt{Ext: e, TS: ts, Marker: marker, IDR: IsIDRPayload(payload), Start: IsNALStart(payload), At: at, Sent: sent, Size: len(payload)})
 }
 
+// AddFiller — прийнято не-медіа пакет у тому ж просторі seq (ULPFEC).
+func (r *Recorder) AddFiller(seq uint16, size int, at time.Time) {
+	e := r.u.ext(seq)
+	if r.seen[e] {
+		return
+	}
+	r.seen[e] = true
+	r.Pkts = append(r.Pkts, Pkt{Ext: e, Filler: true, At: at, Size: size})
+}
+
 // Frame — кадр (AU) на приймачі.
 type Frame struct {
 	TS        uint32
@@ -91,7 +104,18 @@ func Frames(pkts []Pkt) []Frame {
 	if len(pkts) == 0 {
 		return nil
 	}
-	ps := append([]Pkt(nil), pkts...)
+	ps := make([]Pkt, 0, len(pkts))
+	filler := map[uint64]bool{}
+	for _, p := range pkts {
+		if p.Filler {
+			filler[p.Ext] = true
+		} else {
+			ps = append(ps, p)
+		}
+	}
+	if len(ps) == 0 {
+		return nil
+	}
 	sort.Slice(ps, func(i, j int) bool { return ps[i].Ext < ps[j].Ext })
 	// База часу: мін(прихід - ts/90k) — найшвидший шлях.
 	ts0 := ps[0].TS
@@ -171,7 +195,11 @@ func Frames(pkts []Pkt) []Frame {
 		// Початок кадру цілий, якщо перед ним marker попереднього кадру, або
 		// (евристика, коли той загублений) перший пакет кадру починає NAL —
 		// для x264 без зрізів кадр = один VCL NAL, тож так і є.
-		complete := uint64(a.n) == a.maxE-a.minE+1 && markerAt[a.maxE] && (i == 0 || markerAt[a.minE-1] || a.start)
+		prevE := a.minE - 1
+		for filler[prevE] && prevE > 0 {
+			prevE--
+		}
+		complete := uint64(a.n) == a.maxE-a.minE+1 && markerAt[a.maxE] && (i == 0 || markerAt[prevE] || a.start)
 		f := Frame{TS: ts, Send: send, Complete: complete, IDR: a.idr}
 		if complete {
 			f.Done = a.last

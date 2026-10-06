@@ -7,8 +7,9 @@
 //  1. Logoff/shutdown. Процес просто вбивали: черга відправки не доїжджала,
 //     мʼютекс єдиного екземпляра (A-36) звільнявся не нами, а ядром, і на
 //     швидкому релогоні наступний агент міг застати його ще живим. Тепер
-//     WM_QUERYENDSESSION/WM_ENDSESSION гасять ctx тим самим шляхом, що й
-//     Ctrl+C, і main виходить через свої defer-и.
+//     WM_ENDSESSION (вихід вирішено, wParam != 0) гасить ctx тим самим шляхом,
+//     що й Ctrl+C, і main виходить через свої defer-и. WM_QUERYENDSESSION —
+//     лише запит, його ще можуть скасувати: на ньому не гасимо нічого.
 //
 //  2. Lock/unlock. На лок-скріні DXGI не віддає дублікацію взагалі
 //     (E_ACCESSDENIED), а кадровий цикл цього не знав і молотив reacquire —
@@ -26,6 +27,7 @@ import (
 	"log"
 	"runtime"
 	"sync/atomic"
+	"time"
 	"unsafe"
 
 	"golang.org/x/sys/windows"
@@ -52,10 +54,54 @@ type sessionWatch struct {
 	// unlocked зводиться при WTS_SESSION_UNLOCK і ЗНІМАЄТЬСЯ споживачем
 	// (takeUnlocked): це одноразовий «спробуй просто зараз», а не рівень.
 	unlocked atomic.Bool
+
+	// probed — «заблоковано» поставив НАШ опит (inputDesktopLocked на старті), а
+	// не WTS. OpenInputDesktop відмовляє і на UAC/secure desktop, де локу нема —
+	// отже, не буде й WTS-unlock, і без переопиту агент вважав би сесію
+	// заблокованою до першого справжнього lock/unlock: хабу session-locked
+	// (нода не в /nodes), reacquire не робиться. Тому, поки probed, стіл
+	// переопитуємо раз на sessionReprobe.
+	probed    atomic.Bool
+	lastProbe atomic.Int64 // UnixNano останнього опиту
+	probe     func() bool  // inputDesktopLocked; у тестах — підміна
+
+	// hwnd — наше приховане вікно; пишеться до ready, тож після watchSession
+	// читається без синхронізації. Тести шлють у нього повідомлення напряму,
+	// а не шукають за класом (на ПК може жити бойовий агент з тим самим).
+	hwnd uintptr
 }
 
+// sessionReprobe — як часто переопитувати вхідний стіл, поки «заблоковано»
+// відоме лише з опиту. Дешево (один OpenInputDesktop), а UAC-запит живе секунди.
+const sessionReprobe = 2 * time.Second
+
 // Locked — чи заблокована зараз консольна сесія.
-func (w *sessionWatch) Locked() bool { return w != nil && w.locked.Load() }
+func (w *sessionWatch) Locked() bool {
+	if w == nil {
+		return false
+	}
+	if w.probed.Load() {
+		w.reprobe(time.Now())
+	}
+	return w.locked.Load()
+}
+
+// reprobe — стіл, заблокований лише за опитом, відкрився: знімаємо «locked»
+// так само, як це зробив би WTS-unlock (включно з «спробуй просто зараз»).
+func (w *sessionWatch) reprobe(now time.Time) {
+	last := w.lastProbe.Load()
+	if now.UnixNano()-last < int64(sessionReprobe) || !w.lastProbe.CompareAndSwap(last, now.UnixNano()) {
+		return
+	}
+	if w.probe == nil || w.probe() {
+		return
+	}
+	if w.probed.CompareAndSwap(true, false) {
+		w.locked.Store(false)
+		w.unlocked.Store(true)
+		log.Printf("oo-agent: вхідний стіл знову доступний без WTS-unlock (UAC/secure desktop) — reacquire (A-39)")
+	}
+}
 
 // takeUnlocked повертає true рівно один раз на кожен unlock.
 func (w *sessionWatch) takeUnlocked() bool { return w != nil && w.unlocked.Swap(false) }
@@ -65,7 +111,7 @@ func (w *sessionWatch) takeUnlocked() bool { return w != nil && w.unlocked.Swap(
 // ідемпотентне). nil, якщо вікно підняти не вдалось: агент тоді працює рівно
 // як до A-39, без сигналів сесії.
 func watchSession(onEnd func()) *sessionWatch {
-	w := &sessionWatch{}
+	w := &sessionWatch{probe: inputDesktopLocked}
 	ready := make(chan bool, 1)
 	go func() {
 		// Вікно НАЗАВЖДИ привʼязане до потоку, що його створив: цикл повідомлень
@@ -78,7 +124,30 @@ func watchSession(onEnd func()) *sessionWatch {
 	if !<-ready {
 		return nil
 	}
+	// WTS шле lock/unlock лише в МОМЕНТ події. Агент, що стартував уже на
+	// заблокованому ПК (перезапуск завдання, оновлення 16.09.2026 на Maria),
+	// вважав сесію відкритою і не казав хабу session-locked. Тож початковий
+	// стан питаємо самі; далі його веде WTS, як і раніше.
+	if w.probe() {
+		w.locked.Store(true)
+		w.probed.Store(true)
+		w.lastProbe.Store(time.Now().UnixNano())
+		log.Printf("oo-agent: старт на заблокованій сесії — reacquire призупинено (A-39)")
+	}
 	return w
+}
+
+// inputDesktopLocked — чи зараз на екрані НЕ робочий стіл користувача. На
+// екрані блокування / UAC вхідний стіл — Winlogon, і процес користувача його не
+// відкриє (ACCESS_DENIED). Будь-яка відмова = «заблоковано»: хибне
+// «заблоковано» (UAC) зніме переопит (reprobe), хибне «відкрито» коштує 8с чекання.
+func inputDesktopLocked() bool {
+	h, _, _ := procOpenInputDesktop.Call(0, 0, desktopReadObjects)
+	if h == 0 {
+		return true
+	}
+	procCloseDesktop.Call(h)
+	return false
 }
 
 var (
@@ -94,7 +163,11 @@ var (
 	procPostQuitMessage   = user32.NewProc("PostQuitMessage")
 	procWTSRegisterNotify = wtsapi32.NewProc("WTSRegisterSessionNotification")
 	procWTSUnregNotify    = wtsapi32.NewProc("WTSUnRegisterSessionNotification")
+	procOpenInputDesktop  = user32.NewProc("OpenInputDesktop")
+	procCloseDesktop      = user32.NewProc("CloseDesktop")
 )
+
+const desktopReadObjects = 0x0001
 
 type wndClassExW struct {
 	size       uint32
@@ -128,12 +201,13 @@ func (w *sessionWatch) pump(onEnd func(), ready chan<- bool) {
 	proc := windows.NewCallback(func(hwnd windows.Handle, msg uint32, wParam, lParam uintptr) uintptr {
 		switch msg {
 		case wmQueryEndSession:
-			// Не блокуємо вихід із системи: віддати екран важливіше за кадр.
-			if onEnd != nil {
-				onEnd()
-			}
+			// Лише «не заперечую»: це ЗАПИТ, і людина ще може скасувати вихід
+			// («програми заважають вимкненню» -> «Скасувати»). Погасити ctx тут
+			// означало б прибрати ПК з OO до наступного старту задачі, хоча
+			// сесія живе далі. Гасимо на WM_ENDSESSION, коли вихід вирішено.
 			return 1
 		case wmEndSession:
+			// wParam=0 — вихід скасовано (нами чи іншою програмою): живемо далі.
 			if wParam != 0 && onEnd != nil {
 				onEnd()
 			}
@@ -141,9 +215,12 @@ func (w *sessionWatch) pump(onEnd func(), ready chan<- bool) {
 		case wmWTSSessionChange:
 			switch wParam {
 			case wtsSessionLock:
+				// Справжній лок: знімати його тепер буде WTS-unlock, не опит.
+				w.probed.Store(false)
 				w.locked.Store(true)
 				log.Printf("oo-agent: сесію заблоковано — reacquire призупинено (A-39)")
 			case wtsSessionUnlock:
+				w.probed.Store(false)
 				w.locked.Store(false)
 				w.unlocked.Store(true)
 				log.Printf("oo-agent: сесію розблоковано — reacquire негайно (A-39)")
@@ -183,6 +260,7 @@ func (w *sessionWatch) pump(onEnd func(), ready chan<- bool) {
 		defer procWTSUnregNotify.Call(hwnd)
 	}
 
+	w.hwnd = hwnd
 	ready <- true
 
 	var m msgW

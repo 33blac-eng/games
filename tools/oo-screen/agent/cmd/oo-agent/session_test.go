@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/hex"
 	"encoding/json"
 	"os"
@@ -93,6 +94,35 @@ func TestEncoderStale(t *testing.T) {
 			t.Errorf("%s: encoderStale(%#x,%d,%#x,%d)=%v, чекали %v",
 				c.name, c.dev, c.gen, c.encDev, c.encGen, got, c.want)
 		}
+	}
+}
+
+// GDI-only капчер (Windows 7) не має D3D-девайса: Device() == 0 завжди, а
+// покоління росте на кожному відновленні після UAC/локу. Кадр, що прийшов від
+// такого капчера, мусить перебудувати енкодер, а не пропасти як «капчер ще
+// відновлюється» — інакше після першого ж UAC картинка замерзала назавжди.
+// Поверни в кадровому циклі перевірку «лише dev == 0» — цей тест її описує.
+func TestCaptureRecoveringGDIOnly(t *testing.T) {
+	cases := []struct {
+		name string
+		dev  uintptr
+		err  error
+		want bool
+	}{
+		{"DXGI: дублікацію втрачено, кадру нема", 0, context.DeadlineExceeded, true},
+		{"GDI-only: пайплайн відновився, кадр є", 0, nil, false},
+		{"DXGI: новий девайс, кадр є", 0x1000, nil, false},
+		{"DXGI: новий девайс, кадру ще нема", 0x1000, context.DeadlineExceeded, false},
+	}
+	for _, c := range cases {
+		if got := captureRecovering(c.dev, c.err); got != c.want {
+			t.Errorf("%s: captureRecovering(%#x, %v) = %v, чекали %v", c.name, c.dev, c.err, got, c.want)
+		}
+	}
+	// Наскрізь: GDI-only після відновлення — stale за поколінням, але НЕ
+	// «відновлюється», тож цикл іде в syncEncoderToCapture.
+	if !encoderStale(0, 2, 0, 1) || captureRecovering(0, nil) {
+		t.Fatal("GDI-only кадр після відновлення не веде до перебудови енкодера")
 	}
 }
 
@@ -201,4 +231,31 @@ func mustCtl(t *testing.T, m control.Msg) []byte {
 		t.Fatalf("marshal %v: %v", m, err)
 	}
 	return b
+}
+
+// Знахідка G6-3: нога, піднята до відкриття енкодера (старт на локу, фолбек
+// 4d001f), мусить визнати себе застарілою, щойно MFT відкрився з іншим
+// profile-level-id — кадровий цикл за цим робить новий offer. Зроби fmtpStale
+// завжди false — впаде.
+func TestFmtpStaleAfterLateEncoderOpen(t *testing.T) {
+	old, _ := encPLID.Load().(string)
+	t.Cleanup(func() { encPLID.Store(old) })
+
+	encPLID.Store("") // енкодера ще нема — dial оголошує фолбек
+	leg := &webrtcTransport{fmtp: h264Fmtp()}
+	if leg.fmtpStale() {
+		t.Fatal("щойно піднята нога вже «застаріла»")
+	}
+
+	plid, err := encoderPLID(spsPLID(t, 77, 0, 51)) // глядач прийшов: MFT на 2560x1440, Main 5.1
+	if err != nil {
+		t.Fatalf("encoderPLID: %v", err)
+	}
+	encPLID.Store(plid)
+	if !leg.fmtpStale() {
+		t.Fatalf("нога оголосила %q, енкодер кодує %q — а реконекту не буде", leg.fmtp, h264Fmtp())
+	}
+	if fresh := (&webrtcTransport{fmtp: h264Fmtp()}); fresh.fmtpStale() {
+		t.Fatal("нога після реконекту знову «застаріла» — реконекти по колу")
+	}
 }

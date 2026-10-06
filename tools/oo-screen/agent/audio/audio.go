@@ -197,29 +197,14 @@ var errNativeTimeout = errors.New("audio: native read timeout")
 
 func rmsLevel(data []byte, format Format) float64 {
 	bytesPerSample := format.BitsPerSample / 8
-	if bytesPerSample == 0 || len(data) < bytesPerSample {
+	if !knownSample(format) || len(data) < bytesPerSample {
 		return 0
 	}
 
 	var sum float64
 	var count int
 	for offset := 0; offset+bytesPerSample <= len(data); offset += bytesPerSample {
-		var sample float64
-		switch format.SampleFormat {
-		case SampleFormatPCM:
-			sample = pcmSample(data[offset:offset+bytesPerSample], format)
-		case SampleFormatFloat:
-			switch format.BitsPerSample {
-			case 32:
-				sample = float64(math.Float32frombits(binary.LittleEndian.Uint32(data[offset:])))
-			case 64:
-				sample = math.Float64frombits(binary.LittleEndian.Uint64(data[offset:]))
-			default:
-				return 0
-			}
-		default:
-			return 0
-		}
+		sample := Sample(data[offset:offset+bytesPerSample], format)
 		if math.IsNaN(sample) || math.IsInf(sample, 0) {
 			continue
 		}
@@ -232,8 +217,38 @@ func rmsLevel(data []byte, format Format) float64 {
 	return math.Sqrt(sum / float64(count))
 }
 
-func pcmSample(sample []byte, format Format) float64 {
+// knownSample reports whether Sample can decode this format at all.
+func knownSample(f Format) bool {
+	switch f.SampleFormat {
+	case SampleFormatPCM:
+		return f.BitsPerSample == 8 || f.BitsPerSample == 16 || f.BitsPerSample == 24 || f.BitsPerSample == 32
+	case SampleFormatFloat:
+		return f.BitsPerSample == 32 || f.BitsPerSample == 64
+	}
+	return false
+}
+
+// Sample reads one sample as a value in [-1, 1]: PCM 8/16/24/32 (with
+// ValidBitsPerSample honoured) or float 32/64. Unknown format or a short
+// slice reads as 0. The one decoder for both this package's RMS and the
+// agent's PCMU downmix — two copies of it would drift apart.
+func Sample(sample []byte, format Format) float64 {
 	bits := format.BitsPerSample
+	if bits < 8 || len(sample) < bits/8 {
+		return 0
+	}
+	if format.SampleFormat == SampleFormatFloat {
+		switch bits {
+		case 32:
+			return float64(math.Float32frombits(binary.LittleEndian.Uint32(sample)))
+		case 64:
+			return math.Float64frombits(binary.LittleEndian.Uint64(sample))
+		}
+		return 0
+	}
+	if format.SampleFormat != SampleFormatPCM {
+		return 0
+	}
 	valid := format.ValidBitsPerSample
 	if valid <= 0 || valid > bits {
 		valid = bits

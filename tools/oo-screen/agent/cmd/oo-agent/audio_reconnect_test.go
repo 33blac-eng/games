@@ -14,9 +14,9 @@ import (
 // fakeCapturer — джерело, що віддає рівно один валідний 20-мс пакет 48 кГц
 // стерео float32 на кожен NextFrame, з монотонною міткою.
 type fakeCapturer struct {
-	mu     sync.Mutex
-	n      int
-	closed int
+	mu       sync.Mutex
+	n        int
+	closedCh chan struct{} // якщо задано — Close сигналить сюди (без блокування)
 }
 
 func (c *fakeCapturer) Format() audio.Format {
@@ -40,16 +40,13 @@ func (c *fakeCapturer) NextFrame(ctx context.Context) (*audio.Frame, error) {
 	}, nil
 }
 
-func (c *fakeCapturer) closes() int {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	return c.closed
-}
-
 func (c *fakeCapturer) Close() error {
-	c.mu.Lock()
-	c.closed++
-	c.mu.Unlock()
+	if c.closedCh != nil {
+		select {
+		case c.closedCh <- struct{}{}:
+		default:
+		}
+	}
 	return nil
 }
 
@@ -65,7 +62,7 @@ func (c *fakeCapturer) Close() error {
 // `audioCapture(...); return` (тобто прибрати `for`) — тест ЧЕРВОНІЄ на
 // «звук не повернувся в нову доріжку».
 func TestRunAudioSurvivesTransportSwap(t *testing.T) {
-	cap := &fakeCapturer{}
+	cap := &fakeCapturer{closedCh: make(chan struct{}, 1)}
 	orig := audioOpen
 	audioOpen = func() (audioCapturer, error) { return cap, nil }
 	t.Cleanup(func() { audioOpen = orig })
@@ -102,9 +99,12 @@ func TestRunAudioSurvivesTransportSwap(t *testing.T) {
 		})
 	}()
 
-	// Дати горутині впертись у мертву доріжку хоча б раз, потім «підняти» нову.
-	time.Sleep(200 * time.Millisecond)
-	if cap.closes() == 0 {
+	// Дочекатись, поки горутина вперлась у мертву доріжку й закрила джерело,
+	// потім «підняти» нову. Подія, а не сон: під навантаженням `go test ./...`
+	// фіксовані 200 мс не встигали (R3-G6 ⚪2).
+	select {
+	case <-cap.closedCh:
+	case <-time.After(5 * time.Second):
 		t.Fatal("джерело не закрилось після помилки send — audioCapture не вийшов")
 	}
 	mu.Lock()
@@ -125,5 +125,38 @@ func TestRunAudioSurvivesTransportSwap(t *testing.T) {
 	case <-done:
 	case <-time.After(5 * time.Second):
 		t.Fatal("runAudio не завершився по ctx")
+	}
+}
+
+// badFormatCapturer — пристрій із mix format, який агент не обслуговує.
+type badFormatCapturer struct{ fakeCapturer }
+
+func (c *badFormatCapturer) Format() audio.Format {
+	return audio.Format{SampleRate: 48000, Channels: 2, SampleFormat: audio.SampleFormat(99), BitsPerSample: 32, BytesPerFrame: 8}
+}
+
+func (c *badFormatCapturer) NextFrame(ctx context.Context) (*audio.Frame, error) {
+	f, err := c.fakeCapturer.NextFrame(ctx)
+	if f != nil {
+		f.Format = c.Format()
+	}
+	return f, err
+}
+
+// Непідтримуваний формат не має крутити open/close гарячим циклом: одна
+// спроба, далі пауза audioReopenAfter. Прибери перевірку audioLayout після
+// audioOpen у runAudio — відкриттів за 300 мс будуть сотні.
+func TestRunAudioBadFormatBacksOff(t *testing.T) {
+	var opens atomic.Int32
+	orig := audioOpen
+	audioOpen = func() (audioCapturer, error) { opens.Add(1); return &badFormatCapturer{}, nil }
+	t.Cleanup(func() { audioOpen = orig })
+
+	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
+	defer cancel()
+	var paused atomic.Bool
+	runAudio(ctx, &paused, func([]byte, time.Duration) error { return nil })
+	if n := opens.Load(); n > 2 {
+		t.Fatalf("за 300 мс джерело відкривалось %d разів — гарячий цикл на непідтримуваному форматі", n)
 	}
 }

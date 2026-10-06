@@ -165,6 +165,17 @@ type SPS struct {
 	// vuiFlagPos — бітова позиція vui_parameters_present_flag у RBSP
 	// (після nal-заголовка). Потрібна RewriteSPSColourBT709.
 	vuiFlagPos int
+
+	// Поля, без яких не дочитати заголовок слайса до slice_qp_delta
+	// (SliceQP, sliceqp.go).
+	spsID                   int
+	chromaArrayType         int
+	separateColourPlane     bool
+	log2MaxFrameNum         int
+	pocType                 int
+	log2MaxPocLsb           int
+	deltaPicOrderAlwaysZero bool
+	frameMbsOnly            bool
 }
 
 // ProfileLevelID — hex-рядок для SDP profile-level-id та avc1-кодек-стрінга.
@@ -196,8 +207,8 @@ func ParseSPS(nal []byte) (*SPS, error) {
 	s.ProfileIDC = byte(br.bits(8))
 	s.ConstraintFlags = byte(br.bits(8))
 	s.LevelIDC = byte(br.bits(8))
-	br.ue()     // seq_parameter_set_id
-	chroma := 1 // chroma_format_idc: дефолт 4:2:0 для профілів без явного поля
+	s.spsID = br.ue() // seq_parameter_set_id
+	chroma := 1       // chroma_format_idc: дефолт 4:2:0 для профілів без явного поля
 	sepColour := 0
 	switch s.ProfileIDC {
 	case 100, 110, 122, 244, 44, 83, 86, 118, 128, 138, 139, 134, 135:
@@ -232,16 +243,23 @@ func ParseSPS(nal []byte) (*SPS, error) {
 			}
 		}
 	}
-	br.ue() // log2_max_frame_num_minus4
+	s.log2MaxFrameNum = br.ue() + 4 // log2_max_frame_num_minus4
 	poc := br.ue()
+	s.pocType = poc
 	if poc == 0 {
-		br.ue() // log2_max_pic_order_cnt_lsb_minus4
+		s.log2MaxPocLsb = br.ue() + 4 // log2_max_pic_order_cnt_lsb_minus4
 	} else if poc == 1 {
-		br.bits(1)
+		s.deltaPicOrderAlwaysZero = br.bits(1) == 1
 		br.se()
 		br.se()
+		// num_ref_frames_in_pic_order_cnt_cycle: за стандартом 0..255. На
+		// битому SPS ue() дає до 2^32, і цикл крутився б мільярди разів уже
+		// після br.err — секунди CPU в горутині запису хаба.
 		n := br.ue()
-		for i := 0; i < n; i++ {
+		if n > 255 {
+			return nil, errors.New("h264: num_ref_frames_in_pic_order_cnt_cycle > 255")
+		}
+		for i := 0; i < n && br.err == nil; i++ {
 			br.se()
 		}
 	}
@@ -250,6 +268,7 @@ func ParseSPS(nal []byte) (*SPS, error) {
 	wMbs := br.ue() + 1
 	hMapUnits := br.ue() + 1
 	frameMbsOnly := br.bits(1)
+	s.frameMbsOnly = frameMbsOnly == 1
 	if frameMbsOnly == 0 {
 		br.bits(1) // mb_adaptive_frame_field_flag
 	}
@@ -295,6 +314,8 @@ func ParseSPS(nal []byte) (*SPS, error) {
 	if sepColour == 1 {
 		chromaArrayType = 0
 	}
+	s.chromaArrayType = chromaArrayType
+	s.separateColourPlane = sepColour == 1
 	cropX, cropY := 1, 1 // monochrome / 4:4:4
 	switch chromaArrayType {
 	case 1:

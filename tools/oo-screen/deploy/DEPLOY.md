@@ -135,6 +135,73 @@ sudo sh -c 'umask 077; grep ^OO_SCREEN_AGENT_SECRET= /etc/oo-screen/hub.env | cu
 `OO_SCREEN_AGENT_SECRET` (або з ним == `OO_SCREEN_T1_TOKEN`) токени нод НЕ приймає
 (ERROR у журналі) — крок 1 обовʼязковий.
 
+### 6.1 S1: чекліст увімкнення strict на проді (хвиля 8)
+
+Хаб сам перевіряє більшість пунктів на старті (`log.Fatal` у strict, WARNING
+без нього); `hub-webrtc -check-config` робить ту саму перевірку з поточним env
+і виходить (код 0 — хаб стартує, 1 — ні), нічого не слухаючи.
+
+| # | Що | Як перевірити | Хаб сам |
+|---|---|---|---|
+| 1 | Окремий master ≥ 32 символи, згенерований | `oo-node-token -gen-secret > /etc/oo-screen/agent-master` (64 hex) | strict: < 32 символів або == T1 — не стартує; інакше WARNING |
+| 2 | Master файлом, не env | `OO_SCREEN_AGENT_SECRET_FILE=/etc/oo-screen/agent-master`, `OO_SCREEN_AGENT_SECRET` прибрано з `hub.env` | strict + env — WARNING (видно в `/proc/<pid>/environ`) |
+| 3 | Права файлу master | `chown oo-hub: …; chmod 600 …` | strict: група/всі можуть читати — не стартує; інакше WARNING; нечитний — не стартує |
+| 4 | Токени всім нодам | `oo-node-token -secret-file … -nodes-file nodes.txt > tokens.tsv` (битий id — код 1); вибірково `-verify` | — |
+| 5 | Легасі зник | `journalctl -u oo-hub --since -24h \| grep -c "легасі-токені"` = 0 | WARNING раз на ноду |
+| 6 | Перевірка конфігурації ДО рестарту | `sudo -u oo-hub env $(cat /etc/oo-screen/hub.env \| xargs) OO_SCREEN_AGENT_AUTH=strict ./hub-webrtc -check-config` | той самий код, що на старті |
+| 7 | Увімкнути | `OO_SCREEN_AGENT_AUTH=strict` у `hub.env`, `systemctl restart oo-hub`; у журналі `agent-auth: strict (лише токени нод); master=окремий` і жодного `WARNING agent-auth:` | рядок режиму на старті |
+| 8 | Після | `/nodes` — усі ноди на місці; `OO_SCREEN_LEGACY_AGENT_TOKEN` у `hub.env` нема | strict + `_LEGACY_AGENT_TOKEN=1` — WARNING |
+| 9 | Ротація master (за потреби) | новий файл master, старий → `OO_SCREEN_AGENT_SECRET_PREV`; перевипуск токенів; прибрати `_PREV`, коли зникнуть WARNING «СТАРОГО master» | `_PREV` == master — WARNING |
+| 10 | Відкликання одного ПК (вкрадений/списаний) | рядок `node_id` у файлі `OO_SCREEN_AGENT_REVOKED_FILE` (по одному на рядок, `#` — коментар) | перечитується на зміну за ≤ 2 с без рестарту; не читається/битий на старті — хаб не стартує; зіпсувався під час роботи — лишається попередній список (ERROR) |
+
+Про пункт 10: токен ноди детермінований (`HMAC(master, node_id)`), тож
+відкликання діє на node_id, а не на окремий токен: повернути ПК у парк — новий
+`node_id` (або прибрати рядок, якщо ПК довірений). Відкликання не рве вже живу
+агентську ногу — для негайного обриву є runtime-revoke ERP `kind="node"`.
+Потоки додаткових моніторів (`<node>#m<i>`) і P2P-пол агента авторизуються
+тією самою нодою, тож відкликаються разом із нею.
+
+UNVERIFIED на проді: чекліст пройдено лише юніт-тестами
+(`agentauth_harden_test.go`, `agentauth_wave5_test.go`) і `-check-config` на
+стенді; на живому парку strict не вмикався.
+
+### 4.1 O4: поетапна викатка через автооновлення (канарка, ворота, зупинка)
+
+Альтернатива ручному `agent-deploy.ps1` для агентів, зібраних з
+`OO_UPDATE_PUBKEY` і запущених з `-auto-update-url`. Ланцюжок:
+
+1. Агент після swap на нову версію сам перевіряє здоров'я (S6/хвиля 2:
+   за `-auto-update-health-window` мусить підключитись до хаба; інакше
+   локальний відкат і deny версії). З `-auto-update-report-url
+   https://<хаб>/rollout/report` (+ env `OO_ROLLOUT_REPORT_TOKEN`) він POST-ить
+   вердикт `ok` / `fail` / `inconclusive` (Committed / RolledBack або
+   RollbackFailed / Inconclusive). Звіт best-effort: помилка лише в лог.
+2. `oo-rollout serve -listen 127.0.0.1:8095 -reports /var/lib/oo-rollout/reports.jsonl`
+   (env `OO_ROLLOUT_REPORT_TOKEN`) — приймає звіти, перевіряє токен/поля,
+   час ставить свій. nginx: `location /rollout/report { proxy_pass http://127.0.0.1:8095; }`.
+3. Підписати реліз (`oo-update-sign ... -rollout 0`), потім
+   `deploy/agent-rollout.sh init <manifest.json>` — маніфест перепідписано
+   на перший етап (типово 1 %).
+4. `deploy/agent-rollout.sh step <manifest.json>` з cron/systemd timer
+   (або `watch` — цикл кожні `INTERVAL` с). Кожен крок:
+   - частка `fail/(ok+fail)` по ВСІХ звітах версії > `-max-fail-rate` (5 %) →
+     **halt**: маніфест перепідписано з `rollout_percent 0`, код 3,
+     викликається `OO_ROLLOUT_ON_HALT "<рядок рішення>"`; halt липкий;
+   - етап відстояв `-soak` (2 год) і зібрав ≥ `-min-reports` (3) вердиктів
+     ok/fail з початку етапу → наступний етап (1 → 10 → 50 → 100);
+   - за `-max-stage-time` (48 год) не набралось звітів → halt (тиша ≠ зелене світло).
+   Маніфест має лежати там, звідки його роздає `-auto-update-url`
+   (запис атомарний: temp + rename).
+5. Після halt: виправити, випустити НОВУ версію (вищу), `FORCE=1 ... init`.
+
+Що halt робить і чого ні: нові вузли версію більше не беруть; вузли з `fail`
+уже відкотились самі; вузли, що прийняли версію (`ok`), лишаються на ній до
+наступного релізу — масового «відкату назад» немає (агент не ставить версію
+≤ поточної). Звіти довіряються власнику токена (спільний токен на флот).
+Перевірено: юніт-тести `internal/rollout`, `agent/cmd/oo-rollout`,
+`agent/cmd/oo-agent` (вердикт/POST) і `deploy/test/agent-rollout-test.sh`
+(справжні бінарі, згенерований ключ). На живих ПК/хабі не перевірялось.
+
 ## 7. Відкат
 
 - **Хаб, автоматично**: `hub-deploy.sh` сам повертає симлінк, якщо нова версія
@@ -166,11 +233,17 @@ sudo sh -c 'umask 077; grep ^OO_SCREEN_AGENT_SECRET= /etc/oo-screen/hub.env | cu
 | `OO_SCREEN_AGENT_SECRET` **нова** | = `OO_SCREEN_T1_TOKEN` | master для токенів нод (HMAC) |
 | `OO_SCREEN_AGENT_AUTH` **нова** | (не strict) | `strict` — лише токени нод, легасі-токен відхиляється |
 | `OO_SCREEN_LEGACY_AGENT_TOKEN` **нова** | вимк. | `1` — дозволити легасі-токен навіть при strict (аварійно) |
+| `OO_SCREEN_AGENT_SECRET_FILE` | порожньо | master файлом (читається раз на старті; права 0600 — у strict обовʼязково) |
+| `OO_SCREEN_AGENT_SECRET_PREV` | порожньо | старий master на час ротації (його токени приймаються з WARNING) |
+| `OO_SCREEN_AGENT_REVOKED_FILE` | порожньо | список відкликаних node_id (§6.1 п.10) |
 | `OO_SCREEN_AGENT_NODE_ID` | порожньо | node для старого агента без `-node` |
 | `OO_SCREEN_ERP_BASE` | порожньо | URL ERP; непорожній вмикає ticket-режим для глядачів |
 | `OO_SCREEN_HUB_KEY` | порожньо | ключ хаба для ERP |
 | `OO_SCREEN_REVOKE_STALE_AFTER` | `90s` | скільки терпіти недоступність ERP, перш ніж рвати сесії (fail-closed) |
 | `OO_SCREEN_REVOKE_TIMEOUT` | `8s` | таймаут одного запиту відкликань до ERP |
+| `OO_SCREEN_AUDIT_LOG` | порожньо (вимк.) | S4: журнал аудиту JSONL з хеш-ланцюгом |
+| `OO_SCREEN_AUDIT_TOKEN` | порожньо | Bearer для `GET /admin/audit` (без нього ендпоінт — 404) |
+| `OO_SCREEN_AUDIT_ANCHOR` | порожньо (вимк.) | S4: файл якоря хвоста (seq+hash останнього запису); обрізаний/переписаний журнал = хаб не стартує. Класти на інше монтування, ніж журнал |
 | `OO_SCREEN_ICE_PORT` | = `OO_SCREEN_UDP_PORT_MIN` або `4544` | єдиний UDP-порт ICE-mux |
 | `OO_SCREEN_UDP_PORT_MIN` | `4544` | легасі, дефолт для ICE_PORT |
 | `OO_SCREEN_ICE_TCP_PORT` | `0` (вимк.) | порт ICE-TCP |
@@ -192,9 +265,13 @@ sudo sh -c 'umask 077; grep ^OO_SCREEN_AGENT_SECRET= /etc/oo-screen/hub.env | cu
 | `OO_SCREEN_BITRATE_FASTUP` | вимк. | `1` — швидке відновлення бітрейту |
 | `OO_SCREEN_STRICT_CODEC` | вимк. | `1`/`true` — рвати сесію при неузгодженому профілі H.264 |
 | `OO_SCREEN_AUDIO` | вимк. | `1` — аудіо-доріжка (і на агенті) |
+| `OO_SCREEN_AUDIO_CODEC` | `opus` | кодек звуку: `opus` (48 кГц стерео, F1) або `pcmu` (запасний G.711 8 кГц моно). Хаб і агент мусять мати однаковий |
 | `OO_SCREEN_INPUT` | вимк. | `1` — канал вводу (і на агенті) |
 | `OO_SCREEN_RECORD` | вимк. | `1` — запис сесій у MKV |
 | `OO_SCREEN_RECORD_DIR` | `recordings` | каталог записів (0700, файли 0600; 14 днів / 8 ГіБ) |
+| `OO_SCREEN_RECORD_KEY_FILE` / `OO_SCREEN_RECORD_KEY` | вимк. | S5: ключ AES-256 (32 байти сирі / 64 hex / base64; файл 0600) — записи `.mkv.enc`; задано, але битий = запис НЕ пишеться. Розшифровка: `oo-rec-decrypt -key-file K f.mkv.enc -o f.mkv` |
+| `OO_SCREEN_RECORD_MAX_AGE` | `14d` | S5: скільки живуть записи (`Nd` або Go duration, ≥1h) |
+| `OO_SCREEN_RECORD_MAX_BYTES` | `8G` | S5: стеля архіву (байти або K/M/G/T, ≥1M) |
 | `OO_SCREEN_PPROF_ADDR` | порожньо | адреса pprof (окремий слухач); ставити лише 127.0.0.1:порт |
 | `OO_SCREEN_METRICS_ADDR` | порожньо (вимк.) | адреса окремого слухача Prometheus `/metrics` (мітка `node`: ноди, глядачі, ingress bps/fps, keyframes/хв, ціль бітрейту + причина, loss/RTT max/avg, NACK/PLI, кеш GOP, TTFF, черги egress/глядачів, процес); ставити лише 127.0.0.1:порт |
 
@@ -207,6 +284,7 @@ sudo sh -c 'umask 077; grep ^OO_SCREEN_AGENT_SECRET= /etc/oo-screen/hub.env | cu
 | `OO_AGENT_INPUT_BLOCK_KEYS` **нова** | порожньо | скан-коди через кому (`0xE05B,0xE05C`), які агент не вводить; помилка в списку = відмова |
 | `OO_SCREEN_PACER` **нова** | вимк. | `1` = рівномірна відправка RTP (~2× цілі бітрейту, черга ≤ 75 мс); допомагає під стелею каналу ~8 Мбіт/с, додає до 75 мс затримки |
 | `OO_SCREEN_AUDIO` | вимк. | `1` = `-audio` |
+| `OO_SCREEN_AUDIO_CODEC` | `opus` | `opus` (48 кГц стерео) або `pcmu` (запасний); має збігатися з хабом |
 | `OO_SCREEN_INPUT` | вимк. | `1` = `-input` |
 
 Стендові: `OO_SCREEN_HUB_URL` (corpus-player), `OO_SCREEN_T1_TOKEN` у `hub-wt`/`loadgen`.
@@ -408,3 +486,101 @@ TCP лишається **запасним** шляхом, а UDP має пріо
 SNI, корпоративні DPI і явні HTTP-проксі (через CONNECT ICE-TCP не пройде;
 TURN-TLS — лише якщо браузер сам піде через проксі), справжня динаміка TCP
 (cwnd, RTO) замість моделі.
+
+## Моніторинг (O1)
+
+`deploy/monitoring/oo-screen-dashboard.json` — імпорт у Grafana (Dashboards → Import, вибрати Prometheus-джерело).
+`deploy/monitoring/oo-screen-alerts.yml` — `rule_files` у prometheus.yml; scrape job має називатись `oo-screen-hub`
+(target = `OO_SCREEN_METRICS_ADDR`). Перевірка: `promtool check rules deploy/monitoring/oo-screen-alerts.yml`.
+Пороги — стартові, підібрати після тижня реального трафіку.
+
+## O2: резервний хаб (standby) і перемикання
+
+Стан: код агента й плеєра є, типово **вимкнено**. Перевірено лише юніт-тестами
+(Go: `agent/cmd/oo-agent/failover_test.go`; JS: `__tests__/standby.test.mjs`).
+На реальних ПК, у Chrome і з двома живими хабами **НЕ перевірялось**.
+Сесії НЕ переносяться: коли основний хаб падає, глядачі й агенти
+перепідключаються до резервного (новий ICE, новий IDR), тож обрив триває секунди.
+
+### 1. Резервний хаб
+Друга машина з тим самим `hub-webrtc` і **тими самими** секретами, інакше
+резерв відкине і агентів, і ticket-и глядачів:
+`OO_SCREEN_HUB_KEY`, `OO_SCREEN_AGENT_SECRET` (і схема токенів агентів),
+`OO_SCREEN_AGENT_AUTH`, `OO_SCREEN_ERP_BASE` (відкликання), `OO_SCREEN_RECORD_KEY`
+(якщо запис увімкнено). Власний `OO_SCREEN_PUBLIC_IP`. Хаб запущений
+постійно (warm standby): `/healthz` має віддавати `{"ok":true}`.
+
+### 2. Агент
+```
+oo-agent -hub https://hub-a.example/offer/agent ^
+         -hub-standby https://hub-b.example/offer/agent ^
+         -failover-after 3
+```
+або env `OO_HUB_STANDBY` (кілька адрес через кому). Після `-failover-after`
+невдалих dial поспіль агент робить `GET /healthz` резерву (таймаут 3 с) і
+переходить на перший здоровий. Якщо здорових нема, лишається на поточному.
+Автоматичного повернення на основний, поки резерв живий, нема (зайвий обрив);
+повернення відбувається при збої резерву. Лише `-transport webrtc`. `-multimon`
+передає прапорець дочірнім процесам.
+
+### 3. Глядач (ERP)
+У конфіг шару `createOoWebrtcLayer` додати
+`standbySignalUrls: ['https://hub-b.example/offer/viewer']`. Або (краще) повернути
+`standbySignalUrls` з ERP-ендпоінта ticket-а поруч із `signalUrl` — `requestTicket()`
+віддає його шару, і він має пріоритет над конфігом. Увага: зараз у total-erp-app
+немає жодного виклику `createOoWebrtcLayer` і PHP-ендпоінта ticket-а, тож ці поля
+має заповнити той, хто підключатиме шар. Без них
+робиться одна спроба, як раніше. Наступний URL пробується при мережевій
+помилці, таймауті спроби (blackhole/завислий хаб; кожна спроба має власний
+`offerTimeoutMs`), 502/503/504 і 404 `no publisher for node` (агент після
+failover лишається на резерві й сам на основний не повертається, тож живий
+основний відповідає 404 — глядач іде далі). При 400/401/403 (ticket/ACL) — ні.
+Кожна наступна спроба бере **новий** одноразовий ticket через `requestTicket()`:
+той самий ticket ніколи не шлеться на другий хаб (облік використаних ticket-ів
+у кожного хаба свій, тож повтор дав би подвійне погашення).
+
+### 4. nginx (варіант без змін клієнтів)
+Один публічний сигнальний вхід, nginx сам іде на резерв. Медіа (UDP/ICE-TCP)
+йде напряму на IP хаба з його SDP-кандидатів, тому проксіюється лише HTTP.
+```nginx
+upstream oo_hub {
+    server 10.0.0.11:4470 max_fails=2 fail_timeout=10s;
+    server 10.0.0.12:4470 backup;
+}
+server {
+    listen 443 ssl;
+    server_name hub.example;
+    location /offer/ {
+        proxy_pass http://oo_hub;
+        # БЕЗ non_idempotent: POST повторюється лише якщо до upstream
+        # не вдалося навіть надіслати запит (connect refused/timeout).
+        proxy_next_upstream error timeout;
+        proxy_next_upstream_tries 2;
+        proxy_set_header X-Forwarded-For $remote_addr;
+    }
+    location = /healthz { proxy_pass http://oo_hub; }
+}
+```
+`non_idempotent` НЕ ставити: offer несе одноразовий ticket, а used-ticket облік
+у кожного хаба свій. З `non_idempotent` (або `http_50x`, `timeout` після
+надсилання) nginx перешле той самий ticket на backup після того, як основний
+його вже міг спожити — ticket погаситься двічі. Без нього nginx повторює POST
+лише коли запит не дійшов до основного (тоді ticket точно не спожитий).
+Обмеження варіанту: backup вмикається лише коли основний недоступний; якщо
+основний живий, а агент сидить на резерві (split-brain), nginx віддасть 404 —
+для цього випадку потрібен `standbySignalUrls` у глядача.
+Активних health-check
+у open-source nginx нема (лише пасивні `max_fails`). Додайте IP nginx у
+`OO_SCREEN_TRUSTED_PROXIES` на обох хабах.
+
+### 5. DNS (варіант без nginx)
+Один запис `hub.example` з низьким TTL (30–60 с); перемикає зовнішній
+health-checker (напр. Route53/Cloudflare health check по `/healthz`).
+Мінус: кешовані резолвери тримають старий IP довше за TTL, тому агенту краще
+явний `-hub-standby` на окремий запис `hub-b.example`.
+
+### 6. Перевірка на стенді (не виконувалась)
+1. Обидва хаби запущені, агент з `-hub-standby`, глядач підключений.
+2. `systemctl stop` основного → у лозі агента `failover: A -> B`, глядач
+   перепідключається (через `standbySignalUrls` або nginx backup).
+3. `curl https://hub-b.example/healthz` → `agents` ≥ 1.

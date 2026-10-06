@@ -66,9 +66,12 @@ func stalledViewer(t *testing.T, ns *nodeSession, pc *webrtc.PeerConnection) *vi
 // waitSent чекає, поки pump ноги віддасть у трек рівно want пакетів.
 func waitSent(t *testing.T, vl *viewerLeg, want uint64, what string) {
 	t.Helper()
-	deadline := time.Now().Add(2 * time.Second)
+	deadline := time.Now().Add(eventGuard)
 	for time.Now().Before(deadline) {
-		if got := atomic.LoadUint64(&vl.sent); got == want {
+		if got := atomic.LoadUint64(&vl.sent); got >= want {
+			if got != want {
+				t.Fatalf("%s: sent = %d, want %d (перевищення — негайний FAIL, не чекаємо eventGuard)", what, got, want)
+			}
 			return
 		}
 		time.Sleep(2 * time.Millisecond)
@@ -148,7 +151,7 @@ func TestFanoutViewerLeaveKeepsOther(t *testing.T) {
 }
 
 // TestFanoutGateZeroPauseFirstResume — гейтинг: "pause" лише коли глядачів
-// НУЛЬ, "resume" на ПЕРШОМУ. Перевіряємо предикат sendGate (hasReadyViewerLocked)
+// НУЛЬ, "resume" на ПЕРШОМУ. Перевіряємо предикат sendGate (hasVisibleViewerLocked)
 // і ознаку "перший", по якій setupViewerLeg вирішує скидати стелю бітрейту.
 func TestFanoutGateZeroPauseFirstResume(t *testing.T) {
 	ns := &nodeSession{nodeID: "gate"}
@@ -159,7 +162,7 @@ func TestFanoutGateZeroPauseFirstResume(t *testing.T) {
 	present := func() bool {
 		ns.mu.Lock()
 		defer ns.mu.Unlock()
-		return hasReadyViewerLocked(ns)
+		return hasVisibleViewerLocked(ns)
 	}
 
 	if present() {
@@ -227,7 +230,7 @@ func TestFanoutSlowViewerDoesNotBlockOthers(t *testing.T) {
 	}()
 	select {
 	case <-done:
-	case <-time.After(2 * time.Second):
+	case <-time.After(eventGuard):
 		t.Fatalf("forwardToViewers заблокувався на повільному глядачі")
 	}
 

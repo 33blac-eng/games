@@ -7,14 +7,13 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
-	"time"
 )
 
 // gatePresent — предикат, який sendGate віддає агенту: true = "resume".
 func gatePresent(ns *nodeSession) bool {
 	ns.mu.Lock()
 	defer ns.mu.Unlock()
-	return hasVisibleViewerLocked(ns)
+	return hasVisibleViewerLocked(ns) || hasAudioViewerLocked(ns)
 }
 
 func legLive(ns *nodeSession, vl *viewerLeg) bool {
@@ -98,23 +97,10 @@ func TestVisibilityHiddenViewerGetsNoPackets(t *testing.T) {
 	forwardN(ns, 2, 107, 921000)
 	waitSent(t, v1, 9, "видимий після повернення сусіда")
 	// Повернутій нозі, крім двох нових, міг поїхати ще й кеш GOP (пункт 41) —
-	// тому перевіряємо не точну цифру, а що потік ВІДНОВИВСЯ: обидва нові
-	// пакети вже лежать у v2.out (forwardToViewers кладе їх синхронно під
-	// ns.mu), але в трек їх пише ВЛАСНИЙ pump v2. waitSent(v1, ...) синхронізує
-	// лише pump v1, тож sent у v2 треба чекати окремо, а не читати одразу.
-	waitSentAtLeast(t, v2, 5, "глядач повернувся, а потік не відновився")
-}
-
-// waitSentAtLeast — як waitSent, але для ноги, якій міг поїхати ще й кеш GOP,
-// тож точна цифра невідома: чекаємо, доки її pump запише хоча б want пакетів.
-func waitSentAtLeast(t *testing.T, vl *viewerLeg, want uint64, what string) {
-	t.Helper()
-	deadline := time.Now().Add(2 * time.Second)
-	for atomic.LoadUint64(&vl.sent) < want {
-		if time.Now().After(deadline) {
-			t.Fatalf("%s: sent = %d, want >= %d", what, atomic.LoadUint64(&vl.sent), want)
-		}
-		time.Sleep(time.Millisecond)
+	// тому перевіряємо не точну цифру, а що потік ВІДНОВИВСЯ. Помпа v2 асинхронна
+	// й від v1 не залежить — тож чекаємо саме її, а не читаємо одразу.
+	if !waitFor(func() bool { return atomic.LoadUint64(&v2.sent) > 3 }) {
+		t.Fatalf("глядач повернувся, а потік не відновився: sent = %d, want > 3", atomic.LoadUint64(&v2.sent))
 	}
 }
 

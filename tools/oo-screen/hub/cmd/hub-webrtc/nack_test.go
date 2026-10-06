@@ -39,7 +39,7 @@ func seqRange(from uint16, count int) []uint16 {
 // ще не писав) і перехід через межу uint16 — саме на них наївне порівняння
 // ламається.
 func TestNackRecoverableWindow(t *testing.T) {
-	const window = nackBufferSize
+	const window = sharedNackSize // типовий nackBufferSize
 	cases := []struct {
 		name    string
 		highest uint16
@@ -69,11 +69,11 @@ func TestNackWindowForShortLeg(t *testing.T) {
 	if got := nackWindowFor(10); got != 10 {
 		t.Fatalf("nackWindowFor(10) = %d, want 10", got)
 	}
-	if got := nackWindowFor(nackBufferSize - 1); got != nackBufferSize-1 {
+	if got := nackWindowFor(uint64(nackBufferSize - 1)); got != uint16(nackBufferSize-1) {
 		t.Fatalf("nackWindowFor(%d) = %d, want %d", nackBufferSize-1, got, nackBufferSize-1)
 	}
-	if got := nackWindowFor(5000); got != nackBufferSize {
-		t.Fatalf("nackWindowFor(5000) = %d, want %d", got, nackBufferSize)
+	if got := nackWindowFor(10000); got != uint16(nackBufferSize) {
+		t.Fatalf("nackWindowFor(10000) = %d, want %d", got, nackBufferSize)
 	}
 }
 

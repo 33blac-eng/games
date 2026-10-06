@@ -311,11 +311,11 @@ func TestTilesAgentToViewer(t *testing.T) {
 	}
 
 	got, vdc := dialTilesViewer(t)
-	if !waitFor(20*time.Second, func() bool { return vdc.ReadyState() == webrtc.DataChannelStateOpen }) {
+	if !waitForD(20*time.Second, func() bool { return vdc.ReadyState() == webrtc.DataChannelStateOpen }) {
 		t.Fatal("viewer tiles channel never opened")
 	}
 	ns := reg.get(agentNodeIDEnv)
-	if !waitFor(5*time.Second, func() bool {
+	if !waitForD(5*time.Second, func() bool {
 		ns.mu.Lock()
 		defer ns.mu.Unlock()
 		for _, vl := range ns.viewers {
@@ -360,7 +360,7 @@ func TestTilesAgentToViewer(t *testing.T) {
 func TestTilesFlagOff(t *testing.T) {
 	withTilesFlag(t, false)
 	_, vdc := dialTilesViewer(t)
-	waitFor(3*time.Second, func() bool { return vdc.ReadyState() == webrtc.DataChannelStateOpen })
+	waitForD(3*time.Second, func() bool { return vdc.ReadyState() == webrtc.DataChannelStateOpen })
 	for _, ns := range []*nodeSession{reg.get(agentNodeIDEnv)} {
 		if ns == nil {
 			continue
@@ -406,7 +406,7 @@ func TestOnAgentTilesStillNotCachedAndWins(t *testing.T) {
 func TestTilesDuplicateViewerChannels(t *testing.T) {
 	withTilesFlag(t, true)
 	agentDC := dialTilesAgent(t, agentNodeIDEnv)
-	if !waitFor(20*time.Second, func() bool { return agentDC.ReadyState() == webrtc.DataChannelStateOpen }) {
+	if !waitForD(20*time.Second, func() bool { return agentDC.ReadyState() == webrtc.DataChannelStateOpen }) {
 		t.Fatal("agent tiles channel never opened")
 	}
 	basePumps := tilesPumps.Load()
@@ -431,7 +431,7 @@ func TestTilesDuplicateViewerChannels(t *testing.T) {
 	exchange(t, remote, "viewer", offerReq{Token: token})
 
 	// Хаб закриває всі, крім одного.
-	if !waitFor(20*time.Second, func() bool {
+	if !waitForD(20*time.Second, func() bool {
 		open, closed := 0, 0
 		for _, dc := range dcs {
 			switch dc.ReadyState() {
@@ -457,7 +457,7 @@ func TestTilesDuplicateViewerChannels(t *testing.T) {
 			_ = dc.Close()
 		}
 	}
-	if !waitFor(10*time.Second, func() bool { return tilesPumps.Load() == basePumps }) {
+	if !waitForD(10*time.Second, func() bool { return tilesPumps.Load() == basePumps }) {
 		t.Fatalf("pump survived its channel: %d", tilesPumps.Load()-basePumps)
 	}
 }

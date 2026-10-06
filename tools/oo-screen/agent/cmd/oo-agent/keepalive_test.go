@@ -7,6 +7,8 @@ import (
 	"io"
 	"testing"
 	"time"
+
+	"github.com/organicoils/oo-screen/agent/encode"
 )
 
 // На нерухомому екрані DXGI не віддає кадрів узагалі, а сторож у браузері рве
@@ -253,6 +255,26 @@ func TestAdmissionFloorLeavesRoomForDelivery(t *testing.T) {
 	}
 }
 
+// keepalive-AU, яке повторюється на локу, мусить бути справді «нічого не
+// змінилось»: кадр, уже закодований раніше. Кадр, викинутий max_fps/admission
+// до кодування, дає P-кадр з реальною дельтою — повтор наклав би її вдруге.
+// Прибери sameFrameEncodedBefore з keepStillAU — впаде перший випадок.
+func TestKeepStillAUOnlyForRepeatedFrame(t *testing.T) {
+	p := []encode.AU{{Data: []byte{0, 0, 0, 1, 0x41}}}
+	if keepStillAU(true, false, p) {
+		t.Fatal("keepalive кадру, який ще не кодувався (дропнутий), збережено як «нічого не змінилось»")
+	}
+	if !keepStillAU(true, true, p) {
+		t.Fatal("повтор уже закодованого кадру не збережено — на локу не буде чим тримати сесію")
+	}
+	if keepStillAU(false, true, p) {
+		t.Fatal("звичайний кадр збережено як keepalive")
+	}
+	if keepStillAU(true, true, []encode.AU{{Keyframe: true}}) {
+		t.Fatal("IDR збережено як keepalive-P-кадр")
+	}
+}
+
 // Refine, відкладений через зайнятий канал, не має з'їдати keepalive (baseline:
 // на дедлайні keepaliveAfter keepalive іде завжди, admission вирішує далі).
 func TestRefineWakeDoesNotStarveKeepalive(t *testing.T) {
@@ -276,6 +298,40 @@ func TestRefineWakeDoesNotStarveKeepalive(t *testing.T) {
 	for _, c := range cases {
 		if got := refineWakeAction(c.due, c.paused, c.haveLast, c.queued, c.since); got != c.want {
 			t.Errorf("%s: got %d, want %d", c.name, got, c.want)
+		}
+	}
+}
+
+// Кеш keepalive не має пережити IDR: глядач, що підключився на IDR, отримав би
+// на локу P-кадр, який посилається на кадри ДО IDR, — недекодовне сміття.
+// Прибери гілку Keyframe з nextStillAU — тест впаде.
+func TestNextStillAUReplacedByIDR(t *testing.T) {
+	p := []encode.AU{{Data: []byte{0, 0, 0, 1, 0x41}}}
+	cache := nextStillAU(nil, true, true, p)
+	if cache == nil || cache.Keyframe {
+		t.Fatal("still-P-кадр не закешовано")
+	}
+	idr := []encode.AU{{Data: []byte{0, 0, 0, 1, 0x65}, Keyframe: true}}
+	cache = nextStillAU(cache, false, false, idr)
+	if cache == nil || !cache.Keyframe {
+		t.Fatal("keepalive після IDR — P-кадр до IDR: недекодовний для глядача, що приєднався на IDR")
+	}
+	// наступний still-P після IDR знову замінює кеш
+	cache = nextStillAU(cache, true, true, p)
+	if cache.Keyframe {
+		t.Fatal("still-P після IDR не замінив IDR у кеші")
+	}
+	// звичайний P-кадр кеш не чіпає
+	if got := nextStillAU(cache, false, true, p); got != cache {
+		t.Fatal("рухомий P-кадр змінив кеш")
+	}
+}
+
+// Q-11 типово вимкнено: лише точне "1" вмикає IDR за часом.
+func TestGopTimeEnabled(t *testing.T) {
+	for v, want := range map[string]bool{"": false, "0": false, "true": false, "1": true} {
+		if got := gopTimeEnabled(func(string) string { return v }); got != want {
+			t.Fatalf("OO_SCREEN_GOP_TIME=%q: %v, хочу %v", v, got, want)
 		}
 	}
 }

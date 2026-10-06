@@ -9,17 +9,17 @@ agent/capture (DXGI, zero-copy: SetCPUReadback(false))
 agent/encode  (hardware MFT, той самий D3DDevice)
         │ []AU{Data, Keyframe, PTS}
         ▼
-транспорт (-transport wt|webrtc, обидва кандидати в одному бінарі)
+транспорт (-transport webrtc; легасі-бенч wt — лише у збірці `-tags wt`)
 ```
 
 ## Запуск
 
 ```
-oo-agent -transport wt     -hub localhost:4460                    -fps 60 -bitrate 8000000
+oo-agent -transport wt     -hub localhost:4460                    -fps 60 -bitrate 8000000   # бінар з go build -tags wt
 oo-agent -transport webrtc -hub http://127.0.0.1:4470/offer/agent -fps 60 -bitrate 8000000
 ```
 
-Прапорці: `-transport wt|webrtc` (дефолт `wt`), `-hub` (дефолт залежить від
+Прапорці: `-transport wt|webrtc` (дефолт `webrtc`; `wt` вимикає перевірку TLS і в прод-бінар не входить — `transport_wt.go`, `-tags wt`), `-hub` (дефолт залежить від
 транспорту), `-fps 60`, `-bitrate 8000000`, `-width/-height` (дефолт
 1920x1080 — енкодер сам масштабує з нативної роздільності через
 `Config.SrcWidth/SrcHeight`), `-output 0` (індекс DXGI-виводу на старті;

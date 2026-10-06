@@ -30,9 +30,11 @@ import (
 	"github.com/pion/interceptor"
 	"github.com/pion/interceptor/pkg/nack"
 	"github.com/pion/rtcp"
+	"github.com/pion/rtp"
 	"github.com/pion/webrtc/v4"
 
 	"github.com/organicoils/oo-screen/bench/impair"
+	"github.com/organicoils/oo-screen/internal/ulpfec"
 )
 
 type ctlPoint struct {
@@ -49,14 +51,20 @@ type phaseOut struct {
 	RecvMbps     float64 `json:"recv_mbps"`
 }
 
+const (
+	fecRedPT = 116
+	fecUlpPT = 117
+)
+
 type result struct {
-	Name   string         `json:"name"`
-	Args   map[string]any `json:"args"`
-	Warm   phaseOut       `json:"warm"`
-	Imp    phaseOut       `json:"imp"`
-	Post   phaseOut       `json:"post"`
-	Ctl    []ctlPoint     `json:"ctl"`
-	CtlImp struct {
+	FECRecovered int64          `json:"fec_recovered"`
+	Name         string         `json:"name"`
+	Args         map[string]any `json:"args"`
+	Warm         phaseOut       `json:"warm"`
+	Imp          phaseOut       `json:"imp"`
+	Post         phaseOut       `json:"post"`
+	Ctl          []ctlPoint     `json:"ctl"`
+	CtlImp       struct {
 		Changes      int     `json:"changes"`
 		FirstCutS    float64 `json:"first_cut_s"` // -1 = не різав
 		MinBps       uint64  `json:"min_bps"`
@@ -121,6 +129,11 @@ func main() {
 	agentLoss := flag.Float64("agent-loss", 0, "рівномірні втрати на нозі агент<->хаб, 0..1")
 	agentRTT := flag.Duration("agent-rtt", 0, "доданий RTT на нозі агент<->хаб")
 	hubEnv := flag.String("hub-env", "", "додаткові env хаба через кому (K=V,K=V)")
+	// FEC: глядач пропонує red+ulpfec (як Chrome) і сам декодує ULPFEC
+	// (internal/ulpfec). Хабу треба OO_SCREEN_FEC=1 (у -hub-env), інакше він
+	// red/ulpfec просто не узгодить.
+	fecOn := flag.Bool("fec", false, "глядач пропонує red/ulpfec і декодує FEC")
+	twccOn := flag.Bool("twcc", false, "глядач шле transport-cc фідбек, як Chrome (для OO_SCREEN_DELAYBWE)")
 	flag.Parse()
 
 	if *logdir == "" {
@@ -295,7 +308,7 @@ func main() {
 
 	rec := impair.NewRecorder()
 	var recMu sync.Mutex
-	var nackPkts, pliPkts atomic.Int64
+	var nackPkts, pliPkts, fecRecovered atomic.Int64
 	tap := &tapI{nack: &nackPkts, pli: &pliPkts}
 
 	m := &webrtc.MediaEngine{}
@@ -306,12 +319,20 @@ func main() {
 			RTCPFeedback: []webrtc.RTCPFeedback{{Type: "nack"}, {Type: "nack", Parameter: "pli"}},
 		}, PayloadType: 102,
 	}, webrtc.RTPCodecTypeVideo))
+	if *fecOn {
+		must(m.RegisterCodec(webrtc.RTPCodecParameters{RTPCodecCapability: webrtc.RTPCodecCapability{MimeType: "video/red", ClockRate: 90000}, PayloadType: fecRedPT}, webrtc.RTPCodecTypeVideo))
+		must(m.RegisterCodec(webrtc.RTPCodecParameters{RTPCodecCapability: webrtc.RTPCodecCapability{MimeType: webrtc.MimeTypeUlpFEC, ClockRate: 90000}, PayloadType: fecUlpPT}, webrtc.RTPCodecTypeVideo))
+	}
 	ir := &interceptor.Registry{}
 	ir.Add(tapFactory{tap})
 	// NACK-генератор pion: дефолт — опит дірок раз на 100 мс; -nack-interval
 	// дозволяє наблизитись до libwebrtc (NACK одразу на дірку, повтор раз на RTT).
 	must(webrtc.ConfigureNackWithOptions(m, ir, []nack.GeneratorOption{nack.GeneratorInterval(*nackIvl)}))
 	must(webrtc.ConfigureRTCPReports(ir))
+	if *twccOn {
+		// Як Chrome: transport-cc фідбек раз на ~100 мс (pion twcc).
+		must(webrtc.ConfigureTWCCSender(m, ir))
+	}
 	// Вікно SRTP replay — як у libwebrtc (1024). Дефолт pion 64: NACK-ретрансмісія,
 	// що приходить через >64 пакети (800 пак/с x RTT), мовчки відкидалась би
 	// SRTP-шаром — такої втрати браузер не має.
@@ -345,6 +366,7 @@ func main() {
 		missing := map[uint64]time.Time{}
 		var lastPLI time.Time
 		var u impair.Unwrapper
+		var dec *ulpfec.Decoder
 		for {
 			p, _, err := t.ReadRTP()
 			if err != nil {
@@ -352,18 +374,54 @@ func main() {
 			}
 			now := time.Now()
 			startOnce.Do(func() { tStream = now; close(started) })
-			recMu.Lock()
-			rec.Add(p.SequenceNumber, p.Timestamp, p.Marker, p.Payload, now, px.Stats.SentAt(p.SequenceNumber, now))
-			recMu.Unlock()
-			e := u.Ext(p.SequenceNumber)
-			if high != 0 && e > high+1 {
-				for s := high + 1; s < e; s++ {
-					missing[s] = now
+			// seen — seq зайнятий (медіа, FEC чи відновлений FEC-ом): для
+			// емуляції PLI браузера.
+			seen := func(seq uint16) {
+				e := u.Ext(seq)
+				if high != 0 && e > high+1 {
+					for s := high + 1; s < e; s++ {
+						missing[s] = now
+					}
+				}
+				delete(missing, e)
+				if e > high {
+					high = e
 				}
 			}
-			delete(missing, e)
-			if e > high {
-				high = e
+			media := func(q *rtp.Packet) {
+				recMu.Lock()
+				rec.Add(q.SequenceNumber, q.Timestamp, q.Marker, q.Payload, now, px.Stats.SentAt(q.SequenceNumber, now))
+				recMu.Unlock()
+				seen(q.SequenceNumber)
+			}
+			var recovered [][]byte
+			if *fecOn && p.PayloadType == fecRedPT && len(p.Payload) > 0 {
+				if dec == nil {
+					dec = ulpfec.NewDecoder(uint32(t.SSRC()))
+				}
+				blk, inner := p.Payload[0]&0x7f, p.Payload[1:]
+				if blk == fecUlpPT {
+					recMu.Lock()
+					rec.AddFiller(p.SequenceNumber, len(p.Payload), now)
+					recMu.Unlock()
+					seen(p.SequenceNumber)
+					recovered = dec.AddFEC(inner)
+				} else {
+					p.PayloadType, p.Payload = blk, inner
+					media(p)
+					if raw, err := p.Marshal(); err == nil {
+						recovered = dec.AddMedia(raw)
+					}
+				}
+			} else {
+				media(p)
+			}
+			for _, raw := range recovered {
+				var q rtp.Packet
+				if q.Unmarshal(raw) == nil {
+					media(&q)
+					fecRecovered.Add(1)
+				}
 			}
 			for s, at := range missing {
 				if now.Sub(at) > giveUp {
@@ -545,6 +603,8 @@ func main() {
 	}
 	nk.QueueDrops = px.Stats.QueueDrops()
 	nk.NackPktsSent = nackPkts.Load() - nack0
+	res.FECRecovered = fecRecovered.Load()
+	res.Args["fec"] = *fecOn
 
 	f, err := os.OpenFile(*out, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644)
 	must(err)

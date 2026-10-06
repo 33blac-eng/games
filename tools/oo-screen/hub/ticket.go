@@ -13,11 +13,12 @@ import (
 	"regexp"
 	"strings"
 	"time"
+	"unicode/utf8"
 )
 
 // TicketClaims — те, що повертає ERP при успішному consume single-use тікета.
-// Grant — довільний рядок-опис дозволу (наприклад "view"/"control"), hub його
-// не інтерпретує зараз, лише передає для майбутнього логування.
+// Grant — дозвіл ("view"/"control"). Hub його інтерпретує: це засувка вводу —
+// подія від глядача з grant != "control" рве сесію (cmd/hub-webrtc/input.go).
 type TicketClaims struct {
 	UserID string `json:"user_id"`
 	OrgID  string `json:"org_id"`
@@ -117,4 +118,20 @@ func ConsumeTicket(erpBase, hubKey, jti string) (*TicketClaims, error) {
 		return nil, fmt.Errorf("consume ticket: erp response has no claims (%d bytes)", len(respBody))
 	}
 	return &claims, nil
+}
+
+// truncBody — початок тіла відповіді для логу; причина збою ERP вміщається в
+// перші байти, решта — HTML-обгортка.
+func truncBody(b []byte) string {
+	const max = 256
+	if len(b) <= max {
+		return string(b)
+	}
+	// Ріжемо на межі символу: кирилиця в тілі ERP — 2 байти на літеру, і
+	// розрізана навпіл дала б у журналі «�».
+	n := max
+	for n > 0 && !utf8.RuneStart(b[n]) {
+		n--
+	}
+	return string(b[:n]) + "…"
 }

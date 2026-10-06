@@ -31,10 +31,12 @@
 package main
 
 import (
+	"bytes"
 	"crypto/subtle"
 	"encoding/json"
 	"log"
 	"os"
+	"sync/atomic"
 	"time"
 
 	"github.com/pion/webrtc/v4"
@@ -44,6 +46,15 @@ import (
 // inputChannelLabel — мітка каналу вводу на ОБОХ ногах: глядач відкриває його
 // до хаба, агент — до хаба. Одна мітка, бо це один і той самий потік подій.
 const inputChannelLabel = "oosc-input"
+
+// inputMoveChannelLabel — ДРУГИЙ канал вводу глядача (контракт C2), ненадійний
+// і невпорядкований ({ordered:false, maxRetransmits:0} на боці браузера): рух
+// миші, який загубився, не вартий того, щоб за ним у черзі стояв наступний, —
+// саме ретрансмісія старих рухів і тягла курсор. Лише viewer-нога; далі до
+// агента рух іде тим самим шляхом, що й з "oosc-input". Засувки ті самі, плюс
+// одна: у цьому каналі живе ЛИШЕ mouse_move — кнопка чи клавіша, що
+// загубилась без ретрансмісії, лишилась би затиснутою на чужому ПК.
+const inputMoveChannelLabel = "oosc-input-move"
 
 // grantControl — єдине значення grant, яке відчиняє канал вводу. Рядок, а не
 // bool: у квитку вже є поле довільного дозволу, і чесніше звірятися з ним, ніж
@@ -133,6 +144,22 @@ func judgeInput(data []byte, ticket, grant string, lim *rate.Limiter, now time.T
 	return inputAccept, m.Event, ""
 }
 
+// judgeViewerInput — judgeInput плюс правило каналу. Спершу всі три засувки
+// (чужий тікет у move-каналі рве сесію так само), потім — тип події.
+func judgeViewerInput(label string, data []byte, ticket, grant string, lim *rate.Limiter, now time.Time) (inputVerdict, json.RawMessage, string) {
+	v, ev, why := judgeInput(data, ticket, grant, lim, now)
+	if v != inputAccept || label != inputMoveChannelLabel {
+		return v, ev, why
+	}
+	var e struct {
+		Type string `json:"type"`
+	}
+	if json.Unmarshal(ev, &e) != nil || e.Type != "mouse_move" {
+		return inputDrop, nil, "у " + inputMoveChannelLabel + " дозволено лише mouse_move"
+	}
+	return v, ev, why
+}
+
 // viewerInputHandler — обробник каналу вводу ноги. Кличеться ЛИШЕ під
 // прапорцем і ЛИШЕ для ноги з тікетом; setupViewerLeg кличе його
 // зі спільного OnDataChannel (pion тримає лише один такий колбек на PC).
@@ -148,32 +175,71 @@ func viewerInputHandler(ns *nodeSession, vl *viewerLeg, ticket, grant string) fu
 	// щоб причина знайшлась із першого `journalctl | grep input`.
 	noChanLim := rate.NewLimiter(rate.Every(30*time.Second), 1)
 
+	// Глядач, що зник посеред drag-у чи з затиснутим Ctrl (обрив, стеля сесії,
+	// inputKill, закрита вкладка), key-up не пришле НІКОЛИ — і клавіша лишилась
+	// би затиснутою на чужому ПК, доки людина за ним не натисне її сама. Тому
+	// на зникненні ноги, яка хоч раз керувала, агентові йде release_all: він
+	// відпускає все, що тримає (agent/input.Injector.ReleaseAll).
+	// ponytail: інʼєктор агента один на ногу агента, тож release_all відпускає
+	// й клавіші ІНШОГО глядача з керуванням, якщо такий є одночасно. Двоє
+	// керуючих одночасно — не сценарій ЕРП; окремий облік на глядача — коли стане.
+	var controlled atomic.Bool
+	go func() {
+		<-vl.done
+		if controlled.Load() {
+			sendInputToAgent(ns, releaseAllEvent)
+		}
+	}()
+
 	return func(dc *webrtc.DataChannel) {
-		log.Printf("input: viewer channel open [node=%s]", ns.nodeID)
+		label := dc.Label()
+		log.Printf("input: viewer channel %s open [node=%s]", label, ns.nodeID)
+		// lim — один на обидва канали: стеля подій на КЛІЄНТА, а не на канал,
+		// інакше другий канал подвоював би її.
 		dc.OnMessage(func(msg webrtc.DataChannelMessage) {
 			now := time.Now()
-			verdict, ev, why := judgeInput(msg.Data, ticket, grant, lim, now)
+			verdict, ev, why := judgeViewerInput(label, msg.Data, ticket, grant, lim, now)
 			switch verdict {
 			case inputAccept:
+				vl.audit.Count("input_accepted", 1)
 				// F-39: людина клацає — отже, дивиться. Знімаємо прихованість,
 				// навіть якщо її POST /viewer/visibility загубився або прийшов
 				// не в тому порядку. Це страховка в бік «слати», а не «різати».
 				unhideViewer(ns, vl)
+				controlled.Store(true)
 				if !sendInputToAgent(ns, ev) && noChanLim.AllowN(now, 1) {
 					log.Printf("input: агент цієї ноди НЕ має каналу вводу [node=%s] — "+
 						"події глядача летять у нікуди (ПК розкочено без -input?)", ns.nodeID)
 				}
 			case inputDrop:
+				vl.audit.Count("input_dropped", 1)
 				if logLim.AllowN(now, 1) {
 					log.Printf("input: подію відкинуто [node=%s]: %s", ns.nodeID, why)
 				}
 			case inputKill:
+				vl.audit.Count("input_killed", 1)
 				log.Printf("input: РВУ СЕСІЮ ГЛЯДАЧА [node=%s]: %s", ns.nodeID, why)
 				dropViewer(ns, vl, "input: "+why)
 			}
 		})
 	}
 }
+
+// isMouseMove — чи подія лише рух миші (її можна слати без ретрансмісії).
+// Швидкий префільтр без JSON-розбору: кнопки/клавіші не містять "mouse_move".
+func isMouseMove(ev []byte) bool {
+	if !bytes.Contains(ev, []byte("mouse_move")) {
+		return false
+	}
+	var e struct {
+		Type string `json:"type"`
+	}
+	return json.Unmarshal(ev, &e) == nil && e.Type == "mouse_move"
+}
+
+// releaseAllEvent — подія протоколу вводу агента (agent/input.KindReleaseAll).
+// Старий агент її відкине як невідомий тип — рівно як і до неї.
+var releaseAllEvent = []byte(`{"v":1,"type":"release_all"}`)
 
 // sendInputToAgent пише подію в канал вводу агента ЦІЄЇ ноди. Немає каналу
 // (старий агент, прапорець у нього вимкнений, агент саме перепідключається) —
@@ -187,8 +253,15 @@ func viewerInputHandler(ns *nodeSession, vl *viewerLeg, ticket, grant string) fu
 // єдиний, хто знав правду, нічого про неї не сказав.
 func sendInputToAgent(ns *nodeSession, ev []byte) bool {
 	ns.mu.Lock()
-	dc := ns.agentInput
+	dc, mv := ns.agentInput, ns.agentInputMove
 	ns.mu.Unlock()
+	// Хвиля 10: рух — ненадійним невпорядкованим каналом агента, коли він
+	// відкритий (інакше — надійним, як раніше).
+	if mv != nil && mv.ReadyState() == webrtc.DataChannelStateOpen && isMouseMove(ev) {
+		if err := mv.Send(ev); err == nil {
+			return true
+		}
+	}
 	// H-09: закритий канал (агент саме перепідключається) — теж «нема куди».
 	if dc == nil {
 		return false
@@ -205,3 +278,15 @@ func sendInputToAgent(ns *nodeSession, ev []byte) bool {
 // inputSendErrLim — тротлінг логу невдалих Send: одна подія миші = один рядок
 // давало 534 записи за 72 год на кожному реконекті агента (H-09).
 var inputSendErrLim = rate.NewLimiter(rate.Every(5*time.Second), 1)
+
+// attachViewerInput — самостійний OnDataChannel лише для каналів вводу. Прод
+// (setupViewerLeg) диспетчеризує зі спільного колбека через viewerInputHandler;
+// ця обгортка лишилась для тестів, що піднімають лише ввід на голому PC.
+func attachViewerInput(ns *nodeSession, vl *viewerLeg, pc *webrtc.PeerConnection, ticket, grant string) {
+	h := viewerInputHandler(ns, vl, ticket, grant)
+	pc.OnDataChannel(func(dc *webrtc.DataChannel) {
+		if l := dc.Label(); l == inputChannelLabel || l == inputMoveChannelLabel {
+			h(dc)
+		}
+	})
+}

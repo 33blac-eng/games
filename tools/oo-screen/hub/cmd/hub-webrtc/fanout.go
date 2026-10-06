@@ -11,6 +11,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/organicoils/oo-screen/hub"
 	"github.com/pion/rtp"
 	"github.com/pion/webrtc/v4"
 )
@@ -55,10 +56,16 @@ type viewerLeg struct {
 	trk    *webrtc.TrackLocalStaticRTP
 	userID string // user_id з claims тікета — для runtime-revoke за user
 
+	// audit — S4: лічильники сесії для журналу аудиту (nil = аудит вимкнено).
+	audit *hub.AuditSession
+
 	// ready — ця нога у PeerConnectionStateConnected; live — ready І є publisher
 	// ноди (єдине місце запису live — recomputeBinding, як і раніше).
 	ready bool
 	live  bool
+	// joinSent — "viewer-join" для цієї ноги вже пішов агенту (S3): шлемо
+	// рівно раз на ногу, а не на кожен транзієнтний Disconnected->Connected.
+	joinSent bool
 
 	// hidden — F-39: вкладка ЦЬОГО глядача прихована, він сам про це сказав
 	// (POST /viewer/visibility, visibility.go). Прихована нога НЕ отримує
@@ -68,6 +75,15 @@ type viewerLeg struct {
 	// мапи (removeViewer), прихований — на місці й повертається без нового
 	// квитка. Дефолт false: нога, яка нічого не сказала, дивиться. Під ns.mu.
 	hidden bool
+
+	// wantAudio — глядач прихований для ВІДЕО, але просить ЗВУК (POST
+	// /viewer/visibility {hidden:true, audio:true}). Так консоль ЕРП дає звук
+	// ПК, поки картинку показує Mesh: без цього прихованість глушила і звук, і
+	// агента (замір 16.09.2026: звук стояв на тих самих байтах). Дефолт false —
+	// поведінка F-39 без змін. audioLive — кому зараз іде звук; пише лише
+	// recomputeBinding. Обидва під ns.mu.
+	wantAudio bool
+	audioLive bool
 
 	// sessionID — секрет ренегоціації ЦІЄЇ ноги (F-11, main.go). Пишеться раз,
 	// одразу після addViewer, під ns.mu.
@@ -161,6 +177,14 @@ type viewerLeg struct {
 	// tilesLossy — з останнього TypeKeep глядач втратив хоч один тайл: його
 	// сховище може не мати тайлів, які агент вважає утриманими (tiles.go).
 	tilesLossy atomic.Bool
+
+	// probe — поточна проба смуги цієї ноги (probe.go); nil — проби немає.
+	probe atomic.Pointer[legProbe]
+	// tcc — transport-cc стан ноги (delaybwe.go, OO_SCREEN_DELAYBWE); nil — вимкнено.
+	tcc atomic.Pointer[twccLeg]
+	// probeKick будить pump, коли пробу виставлено: інакше на тихій нозі
+	// (статичний екран) pump спить у select до наступного пакета й не дописує.
+	probeKick chan struct{}
 }
 
 // addViewer реєструє нову viewer-ногу ноди й піднімає її pump. Нога ще НЕ live:
@@ -182,6 +206,8 @@ func addViewerLimit(ns *nodeSession, pc *webrtc.PeerConnection, trk *webrtc.Trac
 		out:    make(chan *rtp.Packet, viewerQueueDepth+gopMaxPackets), // + місце під кеш GOP
 		done:   make(chan struct{}),
 		born:   time.Now(),
+
+		probeKick: make(chan struct{}, 1),
 	}
 	// Черга звуку існує ЛИШЕ під прапорцем: без нього нога має бути бітово
 	// такою, як до появи звуку (nil-канал forwardAudioToViewers пропускає).
@@ -202,6 +228,7 @@ func addViewerLimit(ns *nodeSession, pc *webrtc.PeerConnection, trk *webrtc.Trac
 	ns.viewerCount.Store(int32(n))
 	ns.mu.Unlock()
 	log.Printf("viewer leg added [node=%s]: %d viewer(s)", ns.nodeID, n)
+	refreshCursorGrant(ns) // F9: новий глядач без шару — агент знову малює вказівник
 
 	go vl.pump(ns)
 	// Стелю читаємо ТУТ, синхронно, а не в горутині сторожа: інакше читання
@@ -232,19 +259,19 @@ var sessionCap = envDuration("OO_SCREEN_SESSION_CAP", 120*time.Minute)
 
 // watchSessionCap рве ногу глядача, коли її час вичерпано. Нуль або відʼємне
 // значення вимикає стелю зовсім — для налагодження, коли сесію треба тримати
-// довго свідомо.
-func watchSessionCap(ns *nodeSession, vl *viewerLeg, limit time.Duration) {
-	if limit <= 0 {
+// довго свідомо. capD — значення sessionCap на момент додавання ноги.
+func watchSessionCap(ns *nodeSession, vl *viewerLeg, capD time.Duration) {
+	if capD <= 0 {
 		return
 	}
-	t := time.NewTimer(limit)
+	t := time.NewTimer(capD)
 	defer t.Stop()
 	select {
 	case <-vl.done:
 		// Нога знята раніше — звичайний шлях, нічого робити.
 	case <-t.C:
-		log.Printf("viewer leg [node=%s]: стеля сесії %s вичерпана — рву", ns.nodeID, limit)
-		dropViewer(ns, vl, "стеля сесії "+limit.String())
+		log.Printf("viewer leg [node=%s]: стеля сесії %s вичерпана — рву", ns.nodeID, capD)
+		dropViewer(ns, vl, "стеля сесії "+capD.String())
 	}
 }
 
@@ -258,9 +285,13 @@ func removeViewer(ns *nodeSession, vl *viewerLeg) bool {
 	if ok {
 		delete(ns.viewers, vl.pc)
 	}
-	vl.ready, vl.live = false, false
+	vl.ready, vl.live, vl.audioLive = false, false, false
 	left := len(ns.viewers)
 	ns.viewerCount.Store(int32(left))
+	hadFps := false
+	if ok && left == 0 {
+		hadFps = clearViewerCapsLocked(ns)
+	}
 	if !hasLiveViewerLocked(ns) {
 		ns.gop.reset() // B3: див. recomputeBinding — кеш без глядачів застаріває
 	}
@@ -269,8 +300,13 @@ func removeViewer(ns *nodeSession, vl *viewerLeg) bool {
 		return false
 	}
 	close(vl.done)
+	vl.audit.End("viewer removed")
+	refreshCursorGrant(ns)
 	if left == 0 {
 		scheduleRecordClose(ns)
+		if hadFps {
+			sendMaxFps(ns, maxFpsCeil) // знімаємо стелю в агента; нема каналу — агент і так стартує без неї
+		}
 	}
 	return true
 }
@@ -310,6 +346,25 @@ func markViewerReady(ns *nodeSession, vl *viewerLeg) bool {
 	return first
 }
 
+// sendViewerJoin — S3: повідомляє агенту, що підключилась НОВА нога глядача
+// (на кожну, не лише на перехід 0->1), щоб агент із політикою згоди перепитав
+// користувача ПК: згода першого глядача не покриває другого. Викликати ДО
+// recomputeBinding, щоб сигнал по впорядкованому control-каналу випередив
+// ввід цього глядача. Старий агент текст не розпізнає й ігнорує.
+func sendViewerJoin(ns *nodeSession, vl *viewerLeg) {
+	ns.mu.Lock()
+	dc := ns.agentCtrl
+	already := vl.joinSent
+	vl.joinSent = true
+	ns.mu.Unlock()
+	if already || dc == nil || dc.ReadyState() != webrtc.DataChannelStateOpen {
+		return
+	}
+	if err := dc.SendText("viewer-join"); err != nil {
+		log.Printf("sendViewerJoin [node=%s]: %v", ns.nodeID, err)
+	}
+}
+
 // viewerPrimed — чи поїхав цій нозі кеш GOP (пункт 41). Читання під ns.mu, бо
 // пише його recomputeBinding під тим самим локом.
 func viewerPrimed(ns *nodeSession, vl *viewerLeg) bool {
@@ -327,29 +382,29 @@ func markViewerNotReady(ns *nodeSession, vl *viewerLeg) {
 	ns.mu.Unlock()
 }
 
-// hasReadyViewerLocked — чи є у ноди ХОЧА Б ОДИН Connected глядач, БЕЗ огляду
-// на те, дивиться він зараз чи згорнув вкладку. Це відповідь на питання «чи
-// хтось іще тут», а НЕ предикат гейтингу (ним із F-39 став
-// hasVisibleViewerLocked). Кликати під ns.mu.
-func hasReadyViewerLocked(ns *nodeSession) bool {
+// hasVisibleViewerLocked — чи є у ноди ХОЧА Б ОДИН глядач, який реально
+// дивиться: Connected І не сховався (F-39). Це і є предикат гейтингу — "pause"
+// лише коли таких НУЛЬ, "resume" від ПЕРШОГО, хто повернувся. Кликати під ns.mu.
+//
+// Свідомо не «будь-який Connected глядач» (hasReadyViewerLocked у тестах):
+// сплутати ці два предикати означало б
+// або тримати агента в кодуванні заради згорнутих вкладок (нічого не змінилось
+// би), або вважати згорнутого глядача таким, що пішов, — і рвати йому сесію.
+func hasVisibleViewerLocked(ns *nodeSession) bool {
 	for _, vl := range ns.viewers {
-		if vl.ready {
+		if vl.ready && !vl.hidden {
 			return true
 		}
 	}
 	return false
 }
 
-// hasVisibleViewerLocked — чи є у ноди ХОЧА Б ОДИН глядач, який реально
-// дивиться: Connected І не сховався (F-39). Це і є предикат гейтингу — "pause"
-// лише коли таких НУЛЬ, "resume" від ПЕРШОГО, хто повернувся. Кликати під ns.mu.
-//
-// Свідомо окремо від hasReadyViewerLocked: сплутати ці два предикати означало б
-// або тримати агента в кодуванні заради згорнутих вкладок (нічого не змінилось
-// би), або вважати згорнутого глядача таким, що пішов, — і рвати йому сесію.
-func hasVisibleViewerLocked(ns *nodeSession) bool {
+// hasAudioViewerLocked — чи є Connected глядач, що просить звук, навіть
+// прихований для відео. Тримає агента в "resume": звук агент знімає тим самим
+// гейтом, що й відео. Кликати під ns.mu.
+func hasAudioViewerLocked(ns *nodeSession) bool {
 	for _, vl := range ns.viewers {
-		if vl.ready && !vl.hidden {
+		if vl.ready && vl.wantAudio {
 			return true
 		}
 	}
@@ -503,10 +558,16 @@ func notePLI(ns *nodeSession, vl *viewerLeg) {
 // НАЙГІРШІ preLoss/plis серед свіжих ніг — те саме правило, що worstViewerRR.
 // preLoss = унікальні NACK-нуті seq / відправлені за інтервал: втрати ДО
 // ретрансмісії, яких RR FractionLost не показує (див. bitrate.go, B4).
-func legCongestion(ns *nodeSession, vl *viewerLeg, now time.Time) congSignals {
-	sent := atomic.LoadUint64(&vl.sent)
+//
+// mediaSSRC — щоб із FEC знаменник був у тому ж вихідному просторі seq, що й
+// NACK-нуті seq (legOutSent), інакше preLoss завищено на частку FEC.
+func legCongestion(ns *nodeSession, vl *viewerLeg, mediaSSRC uint32, now time.Time) congSignals {
+	sent := legOutSent(vl, mediaSSRC)
 	ns.mu.Lock()
 	defer ns.mu.Unlock()
+	if sent < vl.sentAtRR {
+		vl.sentAtRR = sent // лічильник змінився (FEC стартував) — новий відлік
+	}
 	if d := sent - vl.sentAtRR; d >= legMinSent {
 		vl.preLoss = float64(len(vl.nackSeen)) / float64(d)
 		if vl.preLoss > 1 {
@@ -536,14 +597,112 @@ func legCongestion(ns *nodeSession, vl *viewerLeg, now time.Time) congSignals {
 // стояв у циклі форвардингу. Помилка запису = ця нога мертва: рвемо ЇЇ, джерело
 // й інші глядачі не зачіпаються.
 func (vl *viewerLeg) pump(ns *nodeSession) {
+	var (
+		ring    [probeRing]*rtp.Packet // останні відправлені — джерело дублів проби
+		ringN   int
+		pc      pacer
+		paceAt  time.Time
+		stopTk  func() // nil — тікер проби не запущено
+		tickC   <-chan time.Time
+		padNext int
+	)
+	pace := paceEnabled // знімок: тести перемикають глобаль до addViewer
+	defer func() {
+		if stopTk != nil {
+			stopTk()
+		}
+	}()
+	write := func(pkt *rtp.Packet) bool {
+		if err := vl.trk.WriteRTP(pkt); err != nil {
+			dropViewer(ns, vl, "WriteRTP: "+err.Error())
+			return false
+		}
+		return true
+	}
+	// pad дописує дублі до швидкості проби. Дублі — не «відправлені» для
+	// vl.sent (preLoss B4 і NACK_recovered_ratio рахують унікальні пакети).
+	pad := func(now time.Time) bool {
+		p := vl.probe.Load()
+		if p == nil || now.Before(p.start) || !now.Before(p.end) || p.aborted.Load() || ringN == 0 {
+			return true
+		}
+		owed := padOwed(p.bps, p.start, now, p.sentBytes.Load())
+		// Не більше за ~2 тики наперед: дублі мають іти рівно, а не сплеском.
+		maxBurst := int64(float64(p.bps) / 8 * (2 * probeTick).Seconds())
+		if owed > maxBurst {
+			owed = maxBurst
+		}
+		n := ringN
+		if n > probeRing {
+			n = probeRing
+		}
+		for owed > 0 {
+			// Найсвіжіші пакети по колу: дубль свіжого ще й страхує його втрату.
+			idx := (ringN - 1 - padNext%n) % probeRing
+			if idx < 0 {
+				idx += probeRing
+			}
+			padNext++
+			dup := ring[idx]
+			if !write(dup) {
+				return false
+			}
+			sz := uint64(pktSize(dup))
+			p.sentBytes.Add(sz)
+			p.padBytes.Add(sz)
+			owed -= int64(sz)
+		}
+		return true
+	}
 	for {
+		probeOn := vl.probe.Load() != nil
+		if probeOn && stopTk == nil {
+			tickC, stopTk = newProbeTicker()
+		} else if !probeOn && stopTk != nil {
+			stopTk()
+			stopTk, tickC = nil, nil
+		}
 		select {
 		case <-vl.done:
 			return
-		case pkt := <-vl.out:
-			if err := vl.trk.WriteRTP(pkt); err != nil {
-				dropViewer(ns, vl, "WriteRTP: "+err.Error())
+		case <-vl.probeKick:
+			// Лише перечитати vl.probe на початку циклу (запустити тікер).
+		case now := <-tickC:
+			if !pad(now) {
 				return
+			}
+		case pkt := <-vl.out:
+			if pace && len(vl.out) < paceBacklog && time.Since(vl.born) > paceWarmup {
+				now := time.Now()
+				if now.Sub(paceAt) >= paceRefreshInt {
+					pc.setRate(bitrateTarget(ns))
+					paceAt = now
+				}
+				if d := pc.wait(pktSize(pkt), now); d > 0 {
+					t := time.NewTimer(d)
+					select {
+					case <-vl.done:
+						t.Stop()
+						return
+					case <-t.C:
+					}
+				}
+			}
+			wpkt := pkt
+			if t := vl.tcc.Load(); t != nil {
+				// N3: копія з transport-wide seq (дублі проби — без нього).
+				wpkt = t.stamp(pkt, time.Now())
+			}
+			if !write(wpkt) {
+				return
+			}
+			ring[ringN%probeRing] = pkt
+			ringN++
+			if p := vl.probe.Load(); p != nil {
+				now := time.Now()
+				if !now.Before(p.start) && now.Before(p.end) {
+					p.sentBytes.Add(uint64(pktSize(pkt)))
+				}
 			}
 			// lastSeq — найновіший seq у буфері ретрансмісії ЦІЄЇ ноги: рівно
 			// те, що pion назве highestAdded. Пишемо тут, а не в

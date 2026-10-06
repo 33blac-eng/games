@@ -21,7 +21,7 @@ func TestPublisherLostClearsGop(t *testing.T) {
 
 	remote := dialAgentLeg(t, "lostA")
 	ns := reg.get("lostA")
-	if ns == nil || !waitFor(15*time.Second, ns.hasAgent) {
+	if ns == nil || !waitForD(15*time.Second, ns.hasAgent) {
 		t.Fatal("агентська нога не піднялась")
 	}
 
@@ -49,7 +49,7 @@ func TestPublisherLostClearsGop(t *testing.T) {
 		defer ns.mu.Unlock()
 		return ns.agentPC == nil && ns.gop.pkts == nil && ns.gop.bytes == 0 && len(ns.gop.auPkts) == 0
 	}
-	if !waitFor(15*time.Second, gopEmpty) {
+	if !waitForD(15*time.Second, gopEmpty) {
 		t.Fatalf("після publisher lost кеш GOP досі тримає %d пакетів мертвого агента", len(ns.gop.pkts))
 	}
 

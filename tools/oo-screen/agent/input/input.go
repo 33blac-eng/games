@@ -83,6 +83,11 @@ const (
 	KindMouseButton Kind = "mouse_button"
 	KindMouseWheel  Kind = "mouse_wheel"
 	KindKey         Kind = "key"
+	// KindReleaseAll releases every key and button this injector still holds
+	// down. The hub sends it when a controlling viewer's leg goes away: a
+	// viewer that vanished mid-drag or with Ctrl held never sends the key-up,
+	// and the key would stay stuck on someone else's PC until they pressed it.
+	KindReleaseAll Kind = "release_all"
 )
 
 // Button names a physical mouse button. x1 and x2 are the side buttons.
@@ -180,6 +185,8 @@ func (e Event) Validate() error {
 		if e.WheelX == 0 && e.WheelY == 0 {
 			return fmt.Errorf("%w: wheel event scrolls nothing", ErrInvalidEvent)
 		}
+	case KindReleaseAll:
+		// No fields: it names no key, it undoes all of them.
 	case KindKey:
 		if e.Scancode == 0 && e.Unicode == 0 {
 			return fmt.Errorf("%w: key with neither scancode nor unicode", ErrInvalidEvent)
@@ -447,19 +454,19 @@ func normalizeScancode(scan uint16, extended bool) (uint16, bool) {
 	return scan, extended
 }
 
-// wheelData converts notches to the WHEEL_DELTA units mouseData carries, with
-// clamping so a hostile value off the wire cannot overflow the field.
+// wheelMaxNotches caps one wheel event, see wheelData.
+const wheelMaxNotches = 50
+
+// wheelData converts notches to the WHEEL_DELTA units mouseData carries,
+// clamped to ±wheelMaxNotches. The hub's limiter counts events, not their
+// size: without the clamp a single wheel_y:1e6 would scroll millions of lines.
+// 50 notches is more than the fastest trackpad flick produces in one event.
 func wheelData(notches float64) uint32 {
-	v := math.Round(notches * wheelDeltaUnit)
-	switch {
-	case math.IsNaN(v):
+	if math.IsNaN(notches) {
 		return 0
-	case v > math.MaxInt32:
-		v = math.MaxInt32
-	case v < math.MinInt32:
-		v = math.MinInt32
 	}
-	return uint32(int32(v))
+	notches = max(-wheelMaxNotches, min(notches, wheelMaxNotches))
+	return uint32(int32(math.Round(notches * wheelDeltaUnit)))
 }
 
 // Injector feeds validated events into the local input queue. It is safe for
@@ -489,9 +496,9 @@ func New() (*Injector, error) {
 // SetSurface declares which rectangle of the virtual desktop the operator's
 // video is showing, in the same pixel space VirtualScreen reports. Until it is
 // called the whole virtual desktop is assumed, which is right for a
-// single-monitor host and wrong the moment a second monitor appears; the agent
-// sets it from the bounds of the DXGI output it is capturing, and again when
-// select_output switches monitors.
+// single-monitor host and wrong the moment a second monitor appears. The agent
+// does not call it yet: capture.OutputInfo carries no Left/Top to call it with
+// (see the ponytail in oo-agent dialWebRTC), so multi-monitor input stays off.
 //
 // Both rectangles must come from a process with the same DPI awareness — a mix
 // of physical DXGI bounds and DPI-virtualised metrics puts the pointer in the
@@ -524,14 +531,19 @@ func (in *Injector) Inject(ev Event) error {
 	if err := ev.Validate(); err != nil {
 		return err
 	}
+	if ev.Kind == KindReleaseAll {
+		return in.ReleaseAll()
+	}
 	if in.isBlocked(ev) {
 		return ErrKeyBlocked
 	}
-	if err := in.inject(ev); err != nil {
-		return err
+	err := in.inject(ev)
+	// A press Windows refused is not held; a release is forgotten either way,
+	// or ReleaseAll would keep retrying a key that is already up.
+	if err == nil || !ev.Down {
+		in.mu.Lock()
+		in.held.track(ev)
+		in.mu.Unlock()
 	}
-	in.mu.Lock()
-	in.held.track(ev)
-	in.mu.Unlock()
-	return nil
+	return err
 }

@@ -29,7 +29,9 @@ enum {
     OOS_ENC_AGAIN     = 1, /* poll: nothing ready yet, feed more input */
     OOS_ENC_EOS       = 2, /* poll after drain: stream finished */
     OOS_ENC_NOHW      = 3, /* no hardware H.264 MFT on this machine */
-    OOS_ENC_ERROR     = 4  /* real failure, see err buffer */
+    OOS_ENC_ERROR     = 4, /* real failure, see err buffer */
+    OOS_ENC_WEDGED    = 5  /* submit: the MFT stopped raising events (A-12);
+                              only a rebuild recovers it */
 };
 
 typedef struct {
@@ -56,6 +58,11 @@ typedef struct {
      * gate to exercise the software sync path on a machine that also has
      * hardware. Zero -> hardware first, software only as an automatic fallback. */
     int32_t force_software;
+
+    /* TASK.md крок 4: >0 — CODECAPI_AVEncVideoGradualIntraRefresh на цю
+     * кількість кадрів (best effort, UNVERIFIED; oos_enc_intra_refresh каже,
+     * чи MFT прийняв). 0 — лише періодичний IDR, як раніше. */
+    int32_t intra_refresh;
 } oos_enc_cfg;
 
 typedef struct {
@@ -65,7 +72,9 @@ typedef struct {
     int64_t        pts_100ns;
 } oos_enc_au;
 
-/* Opens the first hardware H.264 MFT. OOS_ENC_NOHW when none exists. */
+/* Opens the hardware H.264 MFT of the capture's adapter, else the software one
+ * (always with force_software). OOS_ENC_NOHW when no MFT fits at all, or the
+ * hardware one is not D3D11-aware (A-19). */
 int oos_enc_open(const oos_enc_cfg *cfg, oos_enc **out, char *err, int32_t err_len);
 
 /* Submits one NV12 frame from CPU memory (copied into an IMFMediaBuffer). */
@@ -109,6 +118,15 @@ int oos_enc_set_bitrate(oos_enc *e, int32_t bps, char *err, int32_t err_len);
  * still reported through err. */
 int oos_enc_set_refine_qp(oos_enc *e, int32_t qp, char *err, int32_t err_len);
 
+/* TASK.md крок 4: межі QP rate control поза refine (CODECAPI_AVEncVideoMinQP /
+ * MaxQP). 0 = без межі (MinQP 0 / MaxQP 51). Refine тимчасово перекриває обидві
+ * й відновлює саме ці. Відмова MFT — OOS_ENC_ERROR з HRESULT у err; межа, яку
+ * не прийняли, не запам'ятовується. */
+int oos_enc_set_qp_bounds(oos_enc *e, int32_t min_qp, int32_t max_qp, char *err, int32_t err_len);
+
+/* 1 — MFT прийняв GradualIntraRefresh (cfg.intra_refresh). */
+int32_t oos_enc_intra_refresh(oos_enc *e);
+
 /* Drain + MFT_MESSAGE_COMMAND_FLUSH + restart streaming; next frame is an IDR. */
 int oos_enc_flush(oos_enc *e, char *err, int32_t err_len);
 
@@ -121,6 +139,7 @@ void oos_enc_headers(oos_enc *e, const uint8_t **out, int32_t *len);
 /* Diagnostics for the gate report. */
 const char *oos_enc_name(oos_enc *e);     /* MFT friendly name */
 const char *oos_enc_cfg_report(oos_enc *e); /* A-14: knobs the MFT refused ("" = none) */
+const char *oos_enc_caps_report(oos_enc *e); /* C2: "Name=M|S|-" per probed CODECAPI property */
 int32_t oos_enc_is_async(oos_enc *e);     /* 1 when async MFT */
 int32_t oos_enc_is_hardware(oos_enc *e);  /* 1 when a hardware MFT (MFTEnumEx HARDWARE) */
 int32_t oos_enc_is_d3d(oos_enc *e);       /* 1 when the DXGI zero-copy path is live */

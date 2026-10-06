@@ -6,7 +6,6 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
-	"time"
 
 	"github.com/pion/webrtc/v4"
 )
@@ -93,7 +92,7 @@ func dialAgentProfile(t *testing.T, node, plid string) {
 	}
 	// Publisher вважається живим лише після Connected — глядача до того не
 	// пустить authorizeViewer (fail-closed).
-	if !waitFor(15*time.Second, reg.getOrCreate(node).hasAgent) {
+	if !waitFor(reg.getOrCreate(node).hasAgent) {
 		t.Fatalf("агентська нога [%s] не піднялась", node)
 	}
 }
@@ -271,5 +270,57 @@ func TestViewerWrongProfileWarnsByDefault(t *testing.T) {
 	}
 	if got := rejectedProfileTotal.Load(); got <= before {
 		t.Fatalf("лічильник неузгоджень не зріс (%d -> %d) — детекцію теж загубили", before, got)
+	}
+}
+
+// TestAgentLevelRiseDropsViewers — рішення «рвати наявних глядачів» на новому
+// offer-і агента. Той самий профіль Main, але рівень зріс (енкодер відкрився на
+// 2560x1440 і агент перепідключився з 4d0033): глядач, що домовився під 4d001f,
+// потоку 5.1 не тягне — рвати. Нижчий рівень і той самий — не рвати.
+func TestAgentLevelRiseDropsViewers(t *testing.T) {
+	for _, tc := range []struct {
+		before, after string
+		drop          bool
+	}{
+		{"4d001f", "4d0033", true},  // рівень 3.1 -> 5.1
+		{"4d0033", "4d001f", false}, // нижчий декодер тягне
+		{"4d001f", "4d001f", false},
+		{"4d001f", "64001f", true}, // інший профіль
+		{"", wantedProfileLevelID, false},
+	} {
+		ns := &nodeSession{agentProfile: tc.before}
+		if got := setAgentProfile(ns, tc.after); got != tc.drop {
+			t.Errorf("%q -> %q: рвати=%v, want %v", tc.before, tc.after, got, tc.drop)
+		}
+	}
+}
+
+// TestViewerRegisteredAfterLevelRiseIsDropped — вікно між читанням профілю в
+// handleOffer і addViewer (R3-G6 ⚪1). Глядач прочитав 4d001f, а поки він
+// піднімав PeerConnection, offer агента підняв ноду до 4d0033 і вже відпрацював
+// dropAllViewers — цієї ноги в ns.viewers тоді ще не було. Нога не має
+// лишитись зареєстрованою з оголошеним 3.1 при потоці 5.1. Нижчий рівень
+// агента такого глядача не рве.
+func TestViewerRegisteredAfterLevelRiseIsDropped(t *testing.T) {
+	for _, tc := range []struct {
+		read, agentNow string
+		drop           bool
+	}{
+		{"4d001f", "4d0033", true},
+		{"4d001f", "64001f", true},
+		{"4d0033", "4d001f", false},
+		{"4d001f", "4d001f", false},
+	} {
+		ns := &nodeSession{nodeID: "toctou", agentProfile: tc.agentNow}
+		pc, err := webrtc.NewPeerConnection(webrtc.Configuration{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, err = setupViewerLeg(ns, pc, nil, "", tc.read)
+		if n := viewerCount(ns); (n == 0) != tc.drop || (err != nil) != tc.drop {
+			t.Errorf("прочитав %q, агент уже %q: ніг %d, err=%v; want рвати=%v", tc.read, tc.agentNow, n, err, tc.drop)
+		}
+		dropAllViewers(ns, "кінець кейсу") // зупинити pump, закрити pc
+		_ = pc.Close()
 	}
 }

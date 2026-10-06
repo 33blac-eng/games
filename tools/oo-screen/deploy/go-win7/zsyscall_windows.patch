@@ -1,0 +1,24 @@
+--- a/src/internal/syscall/windows/zsyscall_windows.go
++++ b/src/internal/syscall/windows/zsyscall_windows.go
+@@ -66,6 +66,7 @@
+ 	procSetNamedSecurityInfoW             = modadvapi32.NewProc("SetNamedSecurityInfoW")
+ 	procSetTokenInformation               = modadvapi32.NewProc("SetTokenInformation")
+ 	procProcessPrng                       = modbcryptprimitives.NewProc("ProcessPrng")
++	procRtlGenRandomW7                    = modadvapi32.NewProc("SystemFunction036")
+ 	procGetAdaptersAddresses              = modiphlpapi.NewProc("GetAdaptersAddresses")
+ 	procCreateEventW                      = modkernel32.NewProc("CreateEventW")
+ 	procCreateIoCompletionPort            = modkernel32.NewProc("CreateIoCompletionPort")
+@@ -276,7 +277,12 @@
+ 	if len(buf) > 0 {
+ 		_p0 = &buf[0]
+ 	}
+-	r1, _, e1 := syscall.SyscallN(procProcessPrng.Addr(), uintptr(unsafe.Pointer(_p0)), uintptr(len(buf)))
++	proc := procProcessPrng
++	if proc.Find() != nil {
++		// go-win7 (OrganicOils): Windows 7 fallback, see runtime/os_windows.go.
++		proc = procRtlGenRandomW7
++	}
++	r1, _, e1 := syscall.SyscallN(proc.Addr(), uintptr(unsafe.Pointer(_p0)), uintptr(len(buf)))
+ 	if r1 == 0 {
+ 		err = errnoErr(e1)
+ 	}

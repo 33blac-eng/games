@@ -43,7 +43,7 @@ CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
 
 echo "agent -> $dist/oo-agent-windows-amd64.exe ($sha)"
 CGO_ENABLED=1 GOOS=windows GOARCH=amd64 CC="$cc_win" \
-	go build -trimpath -ldflags "$ldflags -H windowsgui" -o "$dist/oo-agent-windows-amd64.exe" ./agent/cmd/oo-agent
+	go build -trimpath -ldflags "$ldflags -H windowsgui -X main.agentVersion=${AGENT_VERSION:-0.0.0} -X main.updatePubKey=${OO_UPDATE_PUBKEY:-}" -o "$dist/oo-agent-windows-amd64.exe" ./agent/cmd/oo-agent
 
 echo "$sha" >"$dist/VERSION"
 (cd "$dist" && sha256sum hub-linux-amd64 oo-node-token-linux-amd64 oo-agent-windows-amd64.exe VERSION >SHA256SUMS)

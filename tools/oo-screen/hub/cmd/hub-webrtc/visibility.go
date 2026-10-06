@@ -56,6 +56,9 @@ type visibilityReq struct {
 	// Hidden — true: вкладка прихована, відео мені не потрібне. Відсутнє поле =
 	// false = видимий (безпечний бік).
 	Hidden bool `json:"hidden"`
+	// Audio — при hidden=true звук усе одно потрібен. Відсутнє поле = false =
+	// стара F-39 поведінка (прихований не отримує нічого).
+	Audio bool `json:"audio"`
 }
 
 // visibilityResp — що хаб реально зробив. Повертаємо СТАН, а не "ok": браузер
@@ -94,6 +97,21 @@ func setViewerHidden(ns *nodeSession, vl *viewerLeg, hidden bool) bool {
 	}
 	log.Printf("viewer visibility [node=%s]: hidden=%v", ns.nodeID, hidden)
 	return true
+}
+
+// setViewerAudio — ЄДИНЕ місце, де змінюється vl.wantAudio. Кожен виклик сам
+// перераховує прив'язку і гейт агента, тож порядок відносно setViewerHidden
+// вирішує, чи побачить гейт на мить «нуль присутніх» (див.
+// handleViewerVisibility).
+func setViewerAudio(ns *nodeSession, vl *viewerLeg, want bool) {
+	ns.mu.Lock()
+	changed := vl.wantAudio != want
+	vl.wantAudio = want
+	ns.mu.Unlock()
+	if changed {
+		recomputeBinding(ns)
+		sendGate(ns)
+	}
 }
 
 // unhideViewer — безумовне «цей глядач точно дивиться». Кличеться з шляху
@@ -144,10 +162,21 @@ func handleViewerVisibility(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	setViewerHidden(ns, vl, req.Hidden)
+	// Порядок — щоб між двома викликами гейт не бачив «нуль присутніх» і агент
+	// не отримав "pause" з одразу слідом "resume" (Suspend DXGI і перевідкриття
+	// WASAPI за дарма). Ховаючись — спершу звук: прихована нога вже тримає
+	// агента, якщо звук їй потрібен. Повертаючись — спершу видимість: видима
+	// нога тримає агента й без звуку.
+	if req.Hidden {
+		setViewerAudio(ns, vl, req.Audio)
+		setViewerHidden(ns, vl, true)
+	} else {
+		setViewerHidden(ns, vl, false)
+		setViewerAudio(ns, vl, false)
+	}
 
 	ns.mu.Lock()
-	resp := visibilityResp{Hidden: vl.hidden, AgentPaused: !hasVisibleViewerLocked(ns)}
+	resp := visibilityResp{Hidden: vl.hidden, AgentPaused: !hasVisibleViewerLocked(ns) && !hasAudioViewerLocked(ns)}
 	ns.mu.Unlock()
 	writeJSON(w, resp)
 }

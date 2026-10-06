@@ -6,6 +6,7 @@
 package main
 
 import (
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -96,4 +97,47 @@ func TestAcquireSingleInstanceDetectsDuplicate(t *testing.T) {
 		t.Fatal("імʼя лишилось зайнятим після release — мʼютекс не звільняється")
 	}
 	release3()
+}
+
+// Знахідка G6-4: «заблоковано» зі стартового опиту (UAC/secure desktop, а не
+// лок) мусить знятись переопитом — WTS-unlock для нього не прийде ніколи.
+// Прибери reprobe з Locked — сесія лишиться «заблокованою» назавжди.
+func TestProbedLockClearsWithoutWTSUnlock(t *testing.T) {
+	var denied atomic.Bool
+	denied.Store(true) // на екрані UAC-запит
+	w := &sessionWatch{probe: denied.Load}
+	w.locked.Store(true)
+	w.probed.Store(true)
+
+	if !w.Locked() {
+		t.Fatal("стіл недоступний, а Locked() = false")
+	}
+	denied.Store(false) // UAC закрили; WTS мовчить
+	w.lastProbe.Store(0)
+	if w.Locked() {
+		t.Fatal("стіл знову доступний, а сесія лишилась «заблокованою» — reacquire не буде")
+	}
+	if !w.takeUnlocked() {
+		t.Fatal("зняття за опитом не дало «спробуй зараз», як дав би WTS-unlock")
+	}
+
+	// Справжній лок (WTS) опитом НЕ знімається: його знімає WTS-unlock.
+	w.locked.Store(true)
+	w.probed.Store(false)
+	w.lastProbe.Store(0)
+	if !w.Locked() {
+		t.Fatal("WTS-лок зняв опит — на лок-скріні почались би приречені reacquire")
+	}
+
+	// Опит не частіше за sessionReprobe.
+	calls := 0
+	w2 := &sessionWatch{probe: func() bool { calls++; return true }}
+	w2.locked.Store(true)
+	w2.probed.Store(true)
+	for i := 0; i < 50; i++ {
+		w2.Locked()
+	}
+	if calls != 1 {
+		t.Fatalf("OpenInputDesktop на %d викликів Locked(): %d, want 1", 50, calls)
+	}
 }

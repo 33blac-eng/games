@@ -49,6 +49,7 @@ import (
 
 	"github.com/organicoils/oo-screen/hub"
 	"github.com/organicoils/oo-screen/internal/cursorproto"
+	"github.com/organicoils/oo-screen/internal/p2p"
 )
 
 const (
@@ -229,6 +230,13 @@ type offerReq struct {
 	// не заходив перший глядач. Відсутнє поле = старий агент без звуку, і
 	// тоді глядач отримує запасний тон (audio.go).
 	Audio bool `json:"audio,omitempty"`
+	// Monitor — F6 (multimon.go, лише viewer//control): який монітор ноди
+	// дивитись. 0/відсутнє = як раніше. Нода — з квитка, монітор лише звужує.
+	Monitor int `json:"monitor,omitempty"`
+	// Caps — C1 (caps.go): що браузер глядача оголошує в
+	// RTCRtpReceiver.getCapabilities('video'). Лише телеметрія, на переговори
+	// не впливає; рахується тільки з OO_SCREEN_CAPS_TELEMETRY=1.
+	Caps *viewerCaps `json:"caps,omitempty"`
 }
 
 // outputInfo — монітор ПК агента. Форма 1-в-1 з capture.OutputInfo, але
@@ -246,21 +254,36 @@ type answerResp struct {
 	// SessionID — ідентифікатор ЦІЄЇ viewer-ноги для ренегоціації (F-11).
 	// Порожній для agent-ноги.
 	SessionID string `json:"session_id,omitempty"`
+	// Leg — той самий ключ ноги під іменем контракту C3 (ICE restart через
+	// /offer/viewer/restart). Одне значення, а не другий секрет: ренегоціація
+	// F-11 уже вміє саме це, і два ключі на одну ногу = два шляхи відкликання.
+	Leg string `json:"leg,omitempty"`
+	// Type — "answer" (C3: браузер кладе відповідь у setRemoteDescription як є).
+	Type string `json:"type,omitempty"`
 }
 
 // nodeSession — стан ОДНІЄЇ ноди: агентська нога (publisher) + УСІ viewer-ноги
 // цієї ноди + пересилка RTP від першої до других. Кожен node_id у реєстрі має
 // власний nodeSession; ноди повністю ізольовані одна від одної.
 type nodeSession struct {
-	nodeID string // незмінний ключ у реєстрі
+	nodeID string    // незмінний ключ у реєстрі
+	recCfg recordCfg // знімок налаштувань запису на момент створення; лише читання
+
+	// touched — UnixNano останнього getOrCreate цієї ноди (R5, nodereap.go):
+	// жнець не прибирає ноду, до якої щойно прийшов offer і агент ще
+	// домовляється (agentPC == nil до Connected).
+	touched atomic.Int64
 
 	mu      sync.Mutex
 	agentPC *webrtc.PeerConnection
 	// viewers — УСІ глядачі цієї ноди (fanout, див. fanout.go). Ключ — їхній
 	// PeerConnection. Нога форвардиться лише поки vl.live (Connected + є
 	// publisher); публікацію вмикає/вимикає тільки recomputeBinding().
-	viewers   map[*webrtc.PeerConnection]*viewerLeg
-	agentSSRC webrtc.SSRC // SSRC агентського треку (ціль для PLI вгору)
+	viewers map[*webrtc.PeerConnection]*viewerLeg
+	// unavailable — агент сказав, чому картинки зараз не буде (unavailable.go),
+	// напр. "session-locked". Непорожнє = нода не в /nodes. Під mu.
+	unavailable string
+	agentSSRC   webrtc.SSRC // SSRC агентського треку (ціль для PLI вгору)
 
 	// agentCtrl — control-DataChannel до агента (label "oosc-ctl"). Hub шле
 	// сюди "resume"/"pause" за присутністю глядача (on-demand гейтинг): агент
@@ -273,6 +296,10 @@ type nodeSession struct {
 	// агента без цього каналу — тоді ввід просто нікуди не йде, а Mesh працює
 	// як працював.
 	agentInput *webrtc.DataChannel
+	// agentInputMove — хвиля 10: ненадійний невпорядкований канал агента
+	// "oosc-input-move" лише для mouse_move (без head-of-line за загубленим
+	// пакетом). nil у старого агента — рух іде agentInput, як раніше.
+	agentInputMove *webrtc.DataChannel
 	// agentChanPC — PeerConnection, якому належать agentCtrl/agentInput (H-09):
 	// на Failed/Closed канали обнуляються лише якщо вони ще його.
 	agentChanPC *webrtc.PeerConnection
@@ -301,6 +328,12 @@ type nodeSession struct {
 	// kfTrailing — у дебаунс-вікні вже заплановано ОДИН відкладений
 	// keyframe-запит (requestKeyframe). Під ns.mu.
 	kfTrailing bool
+
+	// capBps / maxFps — стелі «Якості» і «Швидкості» з тулбара глядача (C1,
+	// outputs.go). 0 = стелі немає. Живуть, поки є хоч один глядач
+	// (clearViewerCapsLocked у removeViewer). Під ns.mu.
+	capBps uint64
+	maxFps int
 
 	// lastPLI — окремий годинник дебаунсу PLI від глядачів (pliGate, nack.go).
 	// Під ns.mu.
@@ -385,18 +418,43 @@ func (ns *nodeSession) videoProfile() string {
 }
 
 // setAgentProfile запамʼятовує профіль з offer-а агента і повертає true, якщо
-// він ЗМІНИВСЯ проти того, під яким уже могли домовитись наявні глядачі
-// (порожній == дефолт хаба: саме його оголошують глядачам ноди без агента).
+// наявні глядачі, що домовились під попередній, його вже не тягнуть: змінився
+// профіль АБО зріс рівень (порожній == дефолт хаба: саме його оголошують
+// глядачам ноди без агента). Рівень — не косметика: агент перепідключається з
+// вищим level_idc, коли енкодер відкрився на більшій роздільності (fmtpStale,
+// A-26), і глядач зі старим 3.1 отримав би потік 5.1. Нижчий рівень декодер
+// тягне — там рвати нікого не треба.
 // Пишемо на КОЖНОМУ offer-і — правда про агента це його останній offer.
 func setAgentProfile(ns *nodeSession, plid string) bool {
 	ns.mu.Lock()
 	defer ns.mu.Unlock()
 	before := ns.agentProfile
 	ns.agentProfile = plid
-	return !sameProfile(effectiveProfile(before), effectiveProfile(plid))
+	return profileOutgrown(before, plid)
 }
 
-// effectiveProfile — що саме хаб оголошує глядачеві при такому стані ноди.
+// profileOutgrown — чи не тягне глядач, що домовився під had, потік агента з
+// now: інший профіль або вищий рівень. Одне правило для обох сторін гонки:
+// setAgentProfile (рве вже зареєстрованих) і setupViewerLeg (нога, що саме
+// реєструється).
+func profileOutgrown(had, now string) bool {
+	before, after := effectiveProfile(had), effectiveProfile(now)
+	return !sameProfile(before, after) || profileLevel(after) > profileLevel(before)
+}
+
+// profileLevel — level_idc з profile-level-id ("4d0033" -> 0x33); 0, якщо не
+// розібрався.
+func profileLevel(plid string) byte {
+	if len(plid) < 6 {
+		return 0
+	}
+	b, err := hex.DecodeString(plid[4:6])
+	if err != nil {
+		return 0
+	}
+	return b[0]
+}
+
 // strictCodec — чи різати сесію при неузгодженому профілі H.264.
 // Дефолт — НІ (лише журнал і лічильник у /healthz), див. коментар у
 // обробнику offer/viewer.
@@ -405,6 +463,7 @@ func strictCodec() bool {
 	return v == "1" || strings.EqualFold(v, "true") || strings.EqualFold(v, "yes")
 }
 
+// effectiveProfile — що саме хаб оголошує глядачеві при такому стані ноди.
 func effectiveProfile(plid string) string {
 	if plid == "" {
 		return wantedProfileLevelID
@@ -455,12 +514,14 @@ func (r *registry) getOrCreateNew(nodeID string) (*nodeSession, bool) {
 	defer r.mu.Unlock()
 	ns := r.nodes[nodeID]
 	if ns != nil {
+		ns.touched.Store(time.Now().UnixNano())
 		return ns, false
 	}
 	if len(r.nodes) >= maxNodes {
 		return nil, false
 	}
-	ns = &nodeSession{nodeID: nodeID}
+	ns = &nodeSession{nodeID: nodeID, recCfg: currentRecordCfg()}
+	ns.touched.Store(time.Now().UnixNano())
 	r.nodes[nodeID] = ns
 	return ns, true
 }
@@ -535,9 +596,10 @@ func (r *registry) nodesForUser(userID string) []*nodeSession {
 // closeNode рве живі ноги ЦІЄЇ ноди (viewer + publisher) і прибирає її з
 // реєстру. Викликається з runtime-revoke: hub нічого не вирішує сам, лише
 // виконує "закрити" за наказом ERP (SubscribeRevoke -> onRevoke).
-// PeerConnection.Close() сам зачищає ns.agentPC/ns.viewerPC через наявні
-// OnConnectionStateChange-колбеки (Failed/Closed) — тут лише знімаємо
-// поточні вказівники під локом ноди й закликаємо Close() поза ним.
+// PeerConnection.Close() сам зачищає ns.agentPC і ноги в ns.viewers
+// (dropViewer) через наявні OnConnectionStateChange-колбеки (Failed/Closed) —
+// тут лише знімаємо поточні вказівники під локом ноди й закликаємо Close()
+// поза ним.
 func closeNode(ns *nodeSession) {
 	ns.mu.Lock()
 	agentPC := ns.agentPC
@@ -558,9 +620,9 @@ func closeNode(ns *nodeSession) {
 }
 
 // dropUserViewers рве ноги САМЕ цього користувача на цій ноді (runtime-revoke
-// kind="user"). З fanout-ом закривати всю ноду тут не можна: у неї можуть
-// дивитись інші, законні глядачі — відкликання одного не має ні класти
-// publisher-а, ні вибивати решту.
+// kind="user" і "node_user"). З fanout-ом закривати всю ноду тут не можна: у
+// неї можуть дивитись інші, законні глядачі — відкликання одного не має ні
+// класти publisher-а, ні вибивати решту.
 func dropUserViewers(ns *nodeSession, userID string) {
 	ns.mu.Lock()
 	var legs []*viewerLeg
@@ -705,13 +767,13 @@ func advertiseICETCPPort(sdp string) string {
 // newAPI будує API для ОДНІЄЇ ноги. profile — profile-level-id, який ця нога
 // оголошує ("" = дефолт h264FmtpLine). Хаб не перекодовує, тож глядачеві ноди
 // оголошується рівно те, чим кодує агент САМЕ ЦІЄЇ ноди.
-func newAPI(profile string) (*webrtc.API, error) {
+func newAPI(profile string, offerSDP ...string) (*webrtc.API, error) {
 	m := &webrtc.MediaEngine{}
 	if err := m.RegisterCodec(webrtc.RTPCodecParameters{
 		RTPCodecCapability: webrtc.RTPCodecCapability{
 			MimeType:    webrtc.MimeTypeH264,
 			ClockRate:   90000,
-			SDPFmtpLine: h264FmtpFor(profile),
+			SDPFmtpLine: fecH264Fmtp(profile, strings.Join(offerSDP, "")),
 			// Без цього interceptor-ланцюг Pion не будує NACK/PLI generator+responder
 			// для нашого кастомного PT 102 — RTCPFeedback з RTPCodecParameters мапиться
 			// напряму в interceptor.RTPCodecCapability (mediaengine.go RegisterCodec ->
@@ -728,11 +790,7 @@ func newAPI(profile string) (*webrtc.API, error) {
 			// натомість потік зворотного звʼязку, який нікуди не йде.
 			// Апгрейд робиться на місці: зʼявиться оцінювач — додається
 			// {Type: "transport-cc"} і ConfigureTWCCSender.
-			RTCPFeedback: []webrtc.RTCPFeedback{
-				{Type: "nack"},
-				{Type: "nack", Parameter: "pli"},
-				{Type: "goog-remb"},
-			},
+			RTCPFeedback: videoFeedback(),
 		},
 		PayloadType: 102,
 	}, webrtc.RTPCodecTypeVideo); err != nil {
@@ -742,6 +800,10 @@ func newAPI(profile string) (*webrtc.API, error) {
 	// Opus — лише під OO_SCREEN_AUDIO (audio.go). Без прапорця MediaEngine
 	// лишається бітово тим самим, що й до появи звуку.
 	if err := registerAudioCodec(m); err != nil {
+		return nil, err
+	}
+	// red+ulpfec — лише під OO_SCREEN_FEC (fec.go).
+	if err := registerFECCodecs(m, strings.Join(offerSDP, "")); err != nil {
 		return nil, err
 	}
 
@@ -846,7 +908,11 @@ func authorizeViewer(req offerReq) (*nodeSession, *hub.TicketClaims, int, string
 		if !tokenMatches(req.Token) {
 			return nil, nil, http.StatusUnauthorized, "bad token"
 		}
-		ns := reg.getOrCreate(agentNodeIDEnv)
+		node, ok := viewerStreamNode(agentNodeIDEnv, req.Monitor)
+		if !ok {
+			return nil, nil, http.StatusBadRequest, "bad monitor"
+		}
+		ns := reg.getOrCreate(node)
 		if ns == nil {
 			return nil, nil, http.StatusServiceUnavailable, "too many nodes"
 		}
@@ -858,7 +924,7 @@ func authorizeViewer(req offerReq) (*nodeSession, *hub.TicketClaims, int, string
 	if req.Ticket == "" {
 		return nil, nil, http.StatusForbidden, "ticket required"
 	}
-	claims, err := hub.ConsumeTicket(erpBase, hubKey, req.Ticket)
+	claims, err := consumeViewerTicket(req.Ticket)
 	if err != nil {
 		log.Printf("viewer ticket consume failed: %v", err)
 		return nil, nil, http.StatusForbidden, "ticket consume failed"
@@ -870,6 +936,10 @@ func authorizeViewer(req offerReq) (*nodeSession, *hub.TicketClaims, int, string
 	if node == "" {
 		log.Printf("viewer ticket has empty node_id, fail-closed")
 		return nil, nil, http.StatusForbidden, "node required"
+	}
+	node, ok := viewerStreamNode(node, req.Monitor)
+	if !ok {
+		return nil, nil, http.StatusBadRequest, "bad monitor"
 	}
 	ns := reg.get(node)
 	if ns == nil || !ns.hasAgent() {
@@ -942,6 +1012,7 @@ func handleOffer(leg string) http.HandlerFunc {
 			}
 			// SEC: стеля глядачів на ноду. Без неї кожна viewer-нога = PeerConnection,
 			// черга й дві горутини без жодної межі (DoS памʼяттю/CPU хаба).
+			recordViewerCaps(req.Caps)
 			if viewerCapReached(ns) {
 				http.Error(w, "too many viewers for node", http.StatusTooManyRequests)
 				return
@@ -969,7 +1040,7 @@ func handleOffer(leg string) http.HandlerFunc {
 			if node == "" {
 				node = agentNodeIDEnv
 			}
-			if !agentAuthorized(node, req.Token) {
+			if !validAgentNodeID(node) || !agentAuthorized(agentAuthNode(node), req.Token) {
 				http.Error(w, "bad token", http.StatusUnauthorized)
 				return
 			}
@@ -992,13 +1063,14 @@ func handleOffer(leg string) http.HandlerFunc {
 			// вимкненим OO_SCREEN_AUDIO поле лишається false, аудіо-доріжки
 			// в глядача немає взагалі, і читати це нема кому.
 			setAgentAudio(ns, audioEnabled && req.Audio)
-			// Профіль H.264 ЦІЄЇ ноди — з її ж offer-а. Змінився (агент
-			// перезібрано з іншим профілем) — рвемо наявні viewer-ноги: вони
-			// домовились про старий профіль, і мовчки лишити їх означало б
-			// віддавати потік, який вони не декодують.
+			// Профіль H.264 ЦІЄЇ ноди — з її ж offer-а. Змінився профіль чи
+			// зріс рівень (агент перезібрано або енкодер відкрився на більшій
+			// роздільності) — рвемо наявні viewer-ноги: вони домовились про
+			// старий, і мовчки лишити їх означало б віддавати потік, який вони
+			// не декодують.
 			legProfile = sdpVideoProfile(req.SDP)
 			if setAgentProfile(ns, legProfile) {
-				if n := dropAllViewers(ns, "профіль H.264 ноди змінився"); n > 0 {
+				if n := dropAllViewers(ns, "профіль/рівень H.264 ноди змінився"); n > 0 {
 					log.Printf("offer/agent [node=%s]: профіль %q — рву %d viewer-ніг зі старим профілем",
 						ns.nodeID, effectiveProfile(legProfile), n)
 				}
@@ -1009,7 +1081,7 @@ func handleOffer(leg string) http.HandlerFunc {
 			}
 		}
 
-		api, err := newAPI(legProfile)
+		api, err := newAPI(legProfile, req.SDP)
 		if err != nil {
 			internalError(w, "newAPI", err)
 			return
@@ -1036,7 +1108,7 @@ func handleOffer(leg string) http.HandlerFunc {
 			}
 		case "viewer":
 			var err error
-			if sessionID, err = setupViewerLeg(ns, pc, viewerClaims, viewerTicket, legProfile); err != nil {
+			if sessionID, err = setupViewerLeg(ns, pc, viewerClaims, viewerTicket, legProfile, req.SDP); err != nil {
 				if errors.Is(err, errViewerCap) {
 					http.Error(w, "too many viewers for node", http.StatusTooManyRequests)
 					return
@@ -1052,6 +1124,9 @@ func handleOffer(leg string) http.HandlerFunc {
 			http.Error(w, "bad offer sdp", http.StatusBadRequest)
 			log.Printf("offer/%s: SetRemoteDescription: %v", leg, err)
 			return
+		}
+		if leg == "viewer" {
+			bindViewerFEC(pc)
 		}
 		answer, err := pc.CreateAnswer(nil)
 		if err != nil {
@@ -1109,7 +1184,7 @@ func handleOffer(leg string) http.HandlerFunc {
 		}
 
 		answered = true
-		writeJSON(w, answerResp{SDP: advertiseICETCPPort(pc.LocalDescription().SDP), SessionID: sessionID})
+		writeJSON(w, answerResp{SDP: advertiseICETCPPort(pc.LocalDescription().SDP), SessionID: sessionID, Leg: sessionID, Type: "answer"})
 	}
 }
 
@@ -1216,16 +1291,22 @@ func setupAgentLeg(ns *nodeSession, pc *webrtc.PeerConnection) error {
 			ns.mu.Lock()
 			ns.agentCtrl, ns.agentChanPC = dc, pc
 			ns.mu.Unlock()
-			// Агент -> hub: content_mode (режим «Відео», videoboost.go).
-			dc.OnMessage(func(msg webrtc.DataChannelMessage) {
-				handleAgentCtl(ns, msg.Data, time.Now())
-			})
+			setAgentUnavailable(ns, "") // нова нога — агент повторить причину сам
+			dc.OnMessage(func(msg webrtc.DataChannelMessage) { handleAgentCtl(ns, msg.Data, time.Now()) })
 			// Пульс заводиться разом із гейтом і живе рівно стільки, скільки
 			// цей канал (heartbeat.go). Без нього агент на паузі не має ЖОДНОЇ
 			// ознаки, що хаб іще живий.
 			dc.OnOpen(func() {
 				sendGate(ns)
 				startHubHeartbeat(ns, dc)
+				// C1: агент після реконекту стартує без стелі fps, а глядач
+				// її досі бачить у тулбарі — повторюємо, інакше хаб брехав би.
+				ns.mu.Lock()
+				fps := ns.maxFps
+				ns.mu.Unlock()
+				if fps > 0 {
+					sendMaxFps(ns, fps)
+				}
 			})
 		case inputChannelLabel:
 			// Ввід від глядача (input.go) — ЛИШЕ під прапорцем. З вимкненим
@@ -1239,6 +1320,14 @@ func setupAgentLeg(ns *nodeSession, pc *webrtc.PeerConnection) error {
 			ns.agentInput, ns.agentChanPC = dc, pc
 			ns.mu.Unlock()
 			log.Printf("input: agent channel open [node=%s]", ns.nodeID)
+		case inputMoveChannelLabel:
+			if !inputEnabled {
+				return
+			}
+			ns.mu.Lock()
+			ns.agentInputMove = dc
+			ns.mu.Unlock()
+			log.Printf("input: agent move channel open [node=%s]", ns.nodeID)
 		case tilesLabel:
 			// Текстові тайли (tiles.go) — лише під OO_SCREEN_TILES.
 			if !tilesOn {
@@ -1263,7 +1352,7 @@ func setupAgentLeg(ns *nodeSession, pc *webrtc.PeerConnection) error {
 		// веде відео. Тут лише читач і фанаут (audio.go).
 		if track.Kind() == webrtc.RTPCodecTypeAudio {
 			log.Printf("agent audio track [node=%s]: %s", ns.nodeID, track.Codec().MimeType)
-			go drainRTCP(receiver.Read, "agent-audio-rtcp")
+			go drainRTCP(receiver.Read)
 			go readAgentAudio(ns, track)
 			return
 		}
@@ -1289,12 +1378,11 @@ func setupAgentLeg(ns *nodeSession, pc *webrtc.PeerConnection) error {
 		}
 
 		// Обовʼязковий RTCP read-loop агентської ноги — інакше interceptors мертві.
-		go drainRTCP(receiver.Read, "agent-rtcp")
+		go drainRTCP(receiver.Read)
 
 		// Запис сесії (record.go). nil без OO_SCREEN_RECORD, і тоді все нижче —
-		// два порівняння з nil. Файл закриває defer ТІЄЇ Ж горутини, що читає
-		// RTP: інших виходів у неї немає, тож розрив агента, витіснення новим
-		// агентом і closeNode ведуть в один і той самий коректний фінал.
+		// два порівняння з nil. Закривають файл два шляхи — defer цієї горутини
+		// і таймер scheduleRecordClose; подробиці в заголовку record.go.
 		//
 		// 15.09.2026: файл більше НЕ живе стільки, скільки агентська нога. Агент
 		// тримає ногу добами, і в один файл зливались сеанси різних днів (файл від
@@ -1331,11 +1419,11 @@ func setupAgentLeg(ns *nodeSession, pc *webrtc.PeerConnection) error {
 				// те, що прислав кодер. Send неблокуючий — диск не стоїть на
 				// шляху глядача.
 				rec := ns.rec.Load()
-				if rec == nil && recordEnabled.Load() && ns.viewerCount.Load() > 0 && time.Now().After(nextTry) {
+				if rec == nil && ns.recCfg.on && ns.viewerCount.Load() > 0 && time.Now().After(nextTry) {
 					// ponytail: повтор не частіше за 30 с — startRecording при тісному
 					// диску відмовляє, а питати диск на кожному пакеті дорого.
 					nextTry = time.Now().Add(30 * time.Second)
-					if rec = startRecording(ns.nodeID); rec != nil {
+					if rec = startRecording(ns.nodeID, ns.recCfg); rec != nil {
 						mine = rec
 						ns.rec.Store(rec)
 					}
@@ -1356,24 +1444,36 @@ func setupAgentLeg(ns *nodeSession, pc *webrtc.PeerConnection) error {
 	// перемкнено на Mesh» (інцидент 30.08). Стенди мовчали, бо static-token
 	// гілка authorizeViewer hasAgent() не перевіряє взагалі.
 	//
-	// Заміну агента лишаємо в OnTrack: SSRC відомий лише з треку, і саме той,
-	// хто приніс трек, має право витіснити попередника. Тому тут — тільки коли
-	// publisher-а немає зовсім (ns.agentPC == nil): нога, що піднялась поруч із
-	// живою, чекає свого треку, як і раніше.
+	// Нова нога, що піднялась поруч із живою, ВИТІСНЯЄ її одразу, не чекаючи
+	// треку. Раніше чекала — і на простої (агент на паузі треку не шле) стара
+	// нога, яку агент уже покинув, доживала на хабі до consent-failed (25–30 с),
+	// а тоді знімала publisher-а з-під здорової нової: нода зникала з /nodes, а
+	// shutdown ішов у канал нової ноги, і агент робив другий, зайвий реконект.
+	// Агент тримає одну ногу на ноду, тож новіша Connected = та, що жива.
 	pc.OnConnectionStateChange(func(s webrtc.PeerConnectionState) {
 		switch s {
 		case webrtc.PeerConnectionStateConnected:
 			ns.mu.Lock()
-			up := ns.agentPC == nil
-			if up {
-				ns.agentPC = pc
-				// B2: новий publisher починає з порожнього кешу — що б там не
-				// лишилось від попереднього, його кадри цьому потоку чужі.
+			prev := ns.agentPC
+			ns.agentPC = pc
+			if prev != pc {
+				// B2: новий publisher починає з порожнього кешу GOP — кадри
+				// попереднього кодера цьому потоку чужі.
 				ns.gop.reset()
 			}
 			ns.mu.Unlock()
-			if up {
-				log.Printf("publisher up [node=%s]: agent leg connected -> node available (media may lag until first viewer)", ns.nodeID)
+			if prev != pc {
+				if prev != nil {
+					// Покоління — щоб read loop старої ноги не форвардив уже зараз,
+					// а не лише коли Close() дорве його ReadRTP.
+					// Close — в окремій горутині: ми в колбеку pion, а Close старої
+					// ноги смикне її власний колбек стану, який бере ns.mu.
+					atomic.AddUint64(&ns.generation, 1)
+					go func() { _ = prev.Close() }()
+					log.Printf("publisher replaced [node=%s]: new agent leg connected, old leg closed", ns.nodeID)
+				} else {
+					log.Printf("publisher up [node=%s]: agent leg connected -> node available (media may lag until first viewer)", ns.nodeID)
+				}
 				recomputeBinding(ns)
 			}
 		// На Failed/Closed знімаємо publisher-а цієї ноди (fail-closed: viewer,
@@ -1390,12 +1490,6 @@ func setupAgentLeg(ns *nodeSession, pc *webrtc.PeerConnection) error {
 				// genSwitched у forwardToViewers встигне скинути кеш), а нода без
 				// агента до кінця життя тримає до gopMaxBytes чужих payload-ів.
 				ns.gop.reset()
-			}
-			// H-09: канали цього PC мертві — обнуляємо, інакше кожна подія
-			// вводу до реконекту агента била в «closed pipe» (534 рядки/72 год).
-			// Лише якщо їх не встиг перевідкрити НОВИЙ PC того ж агента.
-			if ns.agentChanPC == pc {
-				ns.agentCtrl, ns.agentInput, ns.agentChanPC = nil, nil, nil
 			}
 			ns.mu.Unlock()
 			if gone && tilesOn {
@@ -1418,11 +1512,21 @@ func setupAgentLeg(ns *nodeSession, pc *webrtc.PeerConnection) error {
 				// Close. Close із колбека стану — тільки в окремій горутині:
 				// колбеки pion виконуються на його горутинах, і синхронне
 				// закриття звідси і реентрантне, і блокує обробку STUN.
-				sendShutdown(ns, "publisher lost: "+s.String())
+				sendShutdown(ns, pc, "publisher lost: "+s.String())
 				go func() { _ = pc.Close() }()
 				// Немає publisher -> знімаємо публікацію з УСІХ глядачів ноди.
 				recomputeBinding(ns)
 			}
+			// H-09: канали цього PC мертві — обнуляємо, інакше кожна подія
+			// вводу до реконекту агента била в «closed pipe» (534 рядки/72 год).
+			// Лише якщо їх не встиг перевідкрити НОВИЙ PC того ж агента. Після
+			// shutdown-а: той адресований саме цим каналам.
+			ns.mu.Lock()
+			if ns.agentChanPC == pc {
+				ns.agentCtrl, ns.agentInput, ns.agentChanPC = nil, nil, nil
+				ns.agentInputMove = nil
+			}
+			ns.mu.Unlock()
 		}
 	})
 
@@ -1443,7 +1547,7 @@ func setupAgentLeg(ns *nodeSession, pc *webrtc.PeerConnection) error {
 // ticket — одноразовий квиток ЦІЄЇ ноги; ним підписане кожне повідомлення
 // каналу вводу (input.go). Порожній (T1 static-token режим) = каналу вводу в
 // цієї ноги немає взагалі.
-func setupViewerLeg(ns *nodeSession, pc *webrtc.PeerConnection, claims *hub.TicketClaims, ticket, profile string) (string, error) {
+func setupViewerLeg(ns *nodeSession, pc *webrtc.PeerConnection, claims *hub.TicketClaims, ticket, profile string, offerSDP ...string) (string, error) {
 	// node-binding вже застосовано у handleOffer (вибір ns за node тікета);
 	// тут лише запам'ятовуємо user_id для runtime-revoke за user (kind="user").
 	viewerUserID := ""
@@ -1454,7 +1558,7 @@ func setupViewerLeg(ns *nodeSession, pc *webrtc.PeerConnection, claims *hub.Tick
 	trk, err := webrtc.NewTrackLocalStaticRTP(webrtc.RTPCodecCapability{
 		MimeType:    webrtc.MimeTypeH264,
 		ClockRate:   90000,
-		SDPFmtpLine: h264FmtpFor(profile),
+		SDPFmtpLine: fecH264Fmtp(profile, strings.Join(offerSDP, "")),
 	}, "video", "oo-screen-hub")
 	if err != nil {
 		return "", err
@@ -1483,6 +1587,21 @@ func setupViewerLeg(ns *nodeSession, pc *webrtc.PeerConnection, claims *hub.Tick
 	if vl == nil {
 		return "", errViewerCap
 	}
+	if delayBWEEnabled {
+		vl.tcc.Store(newTwccLeg(sender))
+	}
+	// Профіль глядач прочитав у handleOffer ДО реєстрації. Offer агента зі
+	// зрослим рівнем між тим читанням і addViewer рве лише ноги, що вже були в
+	// ns.viewers, — цю він не побачив. Перевіряємо після реєстрації: або
+	// dropAllViewers агента вже бачить нас, або ми бачимо його новий профіль.
+	ns.mu.Lock()
+	outgrown := profileOutgrown(profile, ns.agentProfile)
+	ns.mu.Unlock()
+	if outgrown {
+		dropViewer(ns, vl, "профіль/рівень H.264 ноди змінився під час offer-а")
+		return "", fmt.Errorf("профіль H.264 ноди змінився під час offer-а (%s) — повторіть підключення",
+			effectiveProfile(profile))
+	}
 	// F-11: секрет ЦІЄЇ ноги. Він не дає нічого, крім права переукласти
 	// ICE/SDP на PeerConnection, яка вже існує і вже авторизована: node, user і
 	// grant у неї ті самі, а зникає нога з реєстру — зникає й дія цього
@@ -1494,6 +1613,7 @@ func setupViewerLeg(ns *nodeSession, pc *webrtc.PeerConnection, claims *hub.Tick
 	ns.mu.Lock()
 	vl.sessionID = sessionID
 	ns.mu.Unlock()
+	auditViewerStart(ns, vl, claims)
 	if atrk != nil {
 		go vl.audioPump(ns, atrk)
 	}
@@ -1520,7 +1640,7 @@ func setupViewerLeg(ns *nodeSession, pc *webrtc.PeerConnection, claims *hub.Tick
 	// -cursor-layer. Без каналу від браузера обробник просто не спрацьовує.
 	pc.OnDataChannel(func(dc *webrtc.DataChannel) {
 		switch {
-		case dc.Label() == inputChannelLabel && onInput != nil:
+		case (dc.Label() == inputChannelLabel || dc.Label() == inputMoveChannelLabel) && onInput != nil:
 			onInput(dc)
 		case dc.Label() == tilesLabel && tilesOn:
 			viewerTilesHandler(ns, vl, dc)
@@ -1534,6 +1654,7 @@ func setupViewerLeg(ns *nodeSession, pc *webrtc.PeerConnection, claims *hub.Tick
 		switch s {
 		case webrtc.PeerConnectionStateConnected:
 			first := markViewerReady(ns, vl)
+			sendViewerJoin(ns, vl) // S3: агент перепитує згоду на КОЖНОГО нового глядача
 			recomputeBinding(ns)
 			sendGate(ns) // зʼявився глядач → агент кодує (resume — вже на ПЕРШОМУ)
 			if first {
@@ -1595,6 +1716,9 @@ func setupViewerLeg(ns *nodeSession, pc *webrtc.PeerConnection, claims *hub.Tick
 					if st.escalate {
 						propagatePLI(ns)
 					}
+				case *rtcp.TransportLayerCC:
+					// N3: transport-cc фідбек -> детектор затримки (delaybwe.go).
+					onTWCC(ns, vl, pkt, time.Now())
 				case *rtcp.ReceiverEstimatedMaximumBitrate:
 					// Пункт 40. REMB — це ПРЯМА оцінка смуги hub->глядач від
 					// самого приймача, і вона приходить раніше за втрати в RR:
@@ -1619,7 +1743,7 @@ func setupViewerLeg(ns *nodeSession, pc *webrtc.PeerConnection, claims *hub.Tick
 						loss, jitter, rttExcess := worstViewerRR(ns, vl, float64(rr.FractionLost)/256, rr.Jitter, rtt, now)
 						prev := bitrateTarget(ns)
 						// B4: втрати до ретрансмісії та PLI — RR їх не бачить.
-						sig := legCongestion(ns, vl, now)
+						sig := legCongestion(ns, vl, rr.SSRC, now)
 						onReceiverReportSig(ns, loss, jitter, rttExcess, sig, now)
 						metricsNoteBitrate(ns, prev, bitrateReason(ns), loss)
 					}
@@ -1722,10 +1846,45 @@ func renegotiateViewer(w http.ResponseWriter, req offerReq) {
 		return
 	}
 	log.Printf("renegotiate [node=%s]: viewer leg ICE restarted", ns.nodeID)
-	writeJSON(w, answerResp{SDP: advertiseICETCPPort(pc.LocalDescription().SDP), SessionID: req.SessionID})
+	writeJSON(w, answerResp{SDP: advertiseICETCPPort(pc.LocalDescription().SDP), SessionID: req.SessionID, Type: "answer"})
 }
 
-func drainRTCP(read func([]byte) (int, interceptor.Attributes, error), tag string) {
+// restartReq — тіло POST /offer/viewer/restart (контракт C3).
+type restartReq struct {
+	Leg  string `json:"leg"`
+	SDP  string `json:"sdp"`
+	Type string `json:"type"`
+}
+
+// handleViewerRestart — C3: ICE restart наявної viewer-ноги за її leg. Це та
+// сама ренегоціація F-11 (renegotiateViewer: той самий PeerConnection, квиток
+// не споживається, невідомий/мертвий leg -> 404), лише окремим маршрутом і
+// полями контракту, щоб браузер не вгадував, чи старий хаб зрозуміє
+// session_id у /offer/viewer.
+func handleViewerRestart(w http.ResponseWriter, r *http.Request) {
+	corsHeaders(w)
+	if r.Method == http.MethodOptions {
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+	if r.Method != http.MethodPost {
+		http.Error(w, "POST only", http.StatusMethodNotAllowed)
+		return
+	}
+	r.Body = http.MaxBytesReader(w, r.Body, maxOfferBody) // H-03
+	var req restartReq
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "bad json: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+	if req.Type != "" && req.Type != "offer" {
+		http.Error(w, "type must be offer", http.StatusBadRequest)
+		return
+	}
+	renegotiateViewer(w, offerReq{SessionID: req.Leg, SDP: req.SDP})
+}
+
+func drainRTCP(read func([]byte) (int, interceptor.Attributes, error)) {
 	buf := make([]byte, 1500)
 	for {
 		if _, _, err := read(buf); err != nil {
@@ -1913,6 +2072,7 @@ func recomputeBinding(ns *nodeSession) {
 		// правд про «кому йде потік» стало б дві, і повернення з прихованого
 		// пройшло б повз праймінг GOP нижче — тобто рівно в сірий екран.
 		vl.live = hasAgent && vl.ready && !vl.hidden
+		vl.audioLive = hasAgent && vl.ready && (!vl.hidden || vl.wantAudio)
 		// Пункт 41: перехід «не публікуємо» -> «публікуємо» — ЄДИНИЙ момент,
 		// коли нозі можна віддати кеш. Робиться саме тут і саме під цим локом:
 		// forwardToViewers пише в черги під ним же, тож між кешем і першим
@@ -1975,7 +2135,7 @@ func primeViewerLocked(ns *nodeSession, vl *viewerLeg) bool {
 func sendGate(ns *nodeSession) {
 	ns.mu.Lock()
 	dc := ns.agentCtrl
-	present := hasVisibleViewerLocked(ns)
+	present := hasVisibleViewerLocked(ns) || hasAudioViewerLocked(ns)
 	ns.mu.Unlock()
 	if dc == nil || dc.ReadyState() != webrtc.DataChannelStateOpen {
 		return
@@ -2030,9 +2190,10 @@ var wantedProfileLevelID = fmtpParam(h264FmtpLine, "profile-level-id")
 // з констрейнтів, які додає Chrome, він і так не порушує.
 //
 // ponytail: свідомо НЕ реалізую повну таблицю еквівалентності профілів із
-// libwebrtc (baseline↔constrained-baseline через constraint_set1 тощо). Хаб
-// оголошує рівно один профіль — High; усе, що треба, — не відкидати його ж
-// самого в чужому записі. Знадобиться більше — тоді й таблиця.
+// libwebrtc (baseline↔constrained-baseline через constraint_set1 тощо). Кожній
+// нозі хаб оголошує рівно один профіль — той, що прислав агент ноди (h264FmtpFor;
+// без профілю агента — Main, wantedProfileLevelID); усе, що треба, — не
+// відкидати його ж самого в чужому записі. Знадобиться більше — тоді й таблиця.
 func h264ProfileCompatible(got, want string) bool {
 	gIDC, gIOP, ok1 := splitProfile(got)
 	wIDC, wIOP, ok2 := splitProfile(want)
@@ -2076,13 +2237,6 @@ func fmtpParam(fmtp, name string) string {
 	return ""
 }
 
-// videoCodecMismatch перевіряє, що у ВІДПОВІДІ лишилась відеодоріжка з H.264 і
-// саме нашим profile-level-id. Порожній рядок — усе гаразд; інакше повертається
-// ЛЮДСЬКА причина, яку не соромно віддати клієнту в тілі 415.
-//
-// Розбираємо текст SDP, а не стан pion, свідомо: у відповідь піде рівно те, що
-// тут написано, і перевіряти треба саме його. Дивимось ЛИШЕ на секцію m=video —
-// H.264 у секції звуку не буває, а от Opus із власним fmtp там є завжди.
 // codecMismatch — причина відмови в машинно-читаному вигляді. Саме ЦЕ їде в
 // тілі 415: фронт 05.09.2026 бачив голе «415» без причини і мовчки падав у
 // MeshCentral (де звуку немає взагалі), а причину шукали 2.5 години в журналі
@@ -2167,6 +2321,10 @@ func sdpVideoProfile(sdp string) string {
 // саме тим profile-level-id, який хаб оголошує ЦІЙ нозі (want). Nil — усе
 // гаразд; інакше повертається ЛЮДСЬКА причина, яку не соромно віддати клієнту
 // в тілі 415.
+//
+// Розбираємо текст SDP, а не стан pion, свідомо: у відповідь піде рівно те, що
+// тут написано, і перевіряти треба саме його. Дивимось ЛИШЕ на секцію m=video —
+// H.264 у секції звуку не буває, а от Opus із власним fmtp там є завжди.
 func videoCodecMismatch(sdp, want string) *codecMismatch {
 	profiles, haveVideo, rejected := h264VideoProfiles(sdp)
 	switch {
@@ -2263,32 +2421,51 @@ func startRevokeSubscription(ctx context.Context) {
 		return
 	}
 	// 3 с замість 2: за 72 год пол не вкладався 891 раз у власний таймаут
-	// (H-32). Таймаут клієнта = інтервал − 0.5 с (revoke.go), щоб тіки не
-	// накладались.
-	go hub.SubscribeRevoke(ctx, erpBase, hubKey, 3*time.Second, func(kind, val string) {
-		switch kind {
-		case "node":
-			if ns := reg.get(val); ns != nil {
-				closeNode(ns)
-			}
-		case "user":
-			for _, ns := range reg.nodesForUser(val) {
-				dropUserViewers(ns, val)
-			}
-		case hub.RevokeKindStale:
-			// ERP мовчить довше за поріг — жоден дозвіл більше не підтверджений,
-			// тож рвемо ВСЕ тим самим closeNode. Причина й тривалість уже в журналі
-			// (revoke.go, staleGate.observe); тут — лише скільки нод це зачепило.
-			all := reg.all()
-			dropped := 0
-			for _, ns := range all {
-				dropped += dropAllViewers(ns, "runtime-revoke stale: ERP unreachable "+val)
-			}
-			log.Printf("runtime-revoke: fail-closed через недоступність ERP (%s) — знято %d глядацьких ніг на %d нодах; агенти лишаються", val, dropped, len(all))
-		default:
-			log.Printf("runtime-revoke: невідомий kind %q, ігноровано", kind)
+	// (H-32). Таймаут одного запиту — окремо: 8 с, env OO_SCREEN_REVOKE_TIMEOUT
+	// (revokeTimeoutFromEnv у revoke.go).
+	go hub.SubscribeRevoke(ctx, erpBase, hubKey, 3*time.Second, applyRevoke)
+}
+
+// applyRevoke виконує один наказ ERP (контракт C5): "node" — уся нода,
+// "user" — ноги користувача на всіх нодах, node_user — лише ноги користувача на
+// одній ноді (обрив колеги з консолі: решта глядачів і агент живуть).
+func applyRevoke(kind, val string) {
+	switch kind {
+	case "node":
+		p2pRevoke(func(g p2p.Grant) bool { return g.Node == val })
+		if ns := reg.get(val); ns != nil {
+			closeNode(ns)
 		}
-	})
+		// F6: потоки додаткових моніторів — та сама нода.
+		for _, ns := range monitorStreamSessions(val) {
+			closeNode(ns)
+		}
+	case "user":
+		for _, ns := range reg.nodesForUser(val) {
+			dropUserViewers(ns, val)
+		}
+		p2pRevoke(func(g p2p.Grant) bool { return g.User == val })
+	case hub.RevokeKindNodeUser:
+		nodeID, userID := hub.SplitNodeUser(val)
+		if ns := reg.get(nodeID); ns != nil {
+			dropUserViewers(ns, userID)
+		}
+		p2pRevoke(func(g p2p.Grant) bool { return g.Node == nodeID && g.User == userID })
+	case hub.RevokeKindStale:
+		// ERP мовчить довше за поріг — жоден дозвіл більше не підтверджений,
+		// тож знімаємо ВСІХ глядачів (агенти лишаються: вони дозволу не
+		// потребують). Причина й тривалість уже в журналі (revoke.go,
+		// staleGate.observe); тут — лише скільки нод це зачепило.
+		p2pRevoke(func(p2p.Grant) bool { return true })
+		all := reg.all()
+		dropped := 0
+		for _, ns := range all {
+			dropped += dropAllViewers(ns, "runtime-revoke stale: ERP unreachable "+val)
+		}
+		log.Printf("runtime-revoke: fail-closed через недоступність ERP (%s) — знято %d глядацьких ніг на %d нодах; агенти лишаються", val, dropped, len(all))
+	default:
+		log.Printf("runtime-revoke: невідомий kind %q, ігноровано", kind)
+	}
 }
 
 func main() {
@@ -2297,9 +2474,27 @@ func main() {
 	if token == defaultToken {
 		log.Fatal("hub-webrtc: OO_SCREEN_T1_TOKEN не задано (дефолт заборонено) — задай у EnvironmentFile сервісу")
 	}
+	// S1: strict, у якому не пройде жоден агент, — помилка конфігурації, а
+	// не тихе відхилення всього парку.
+	if err := agentAuthConfigError(); err != nil {
+		log.Fatal("hub-webrtc: ", err)
+	}
+	log.Print(agentAuthModeSummary())
+	for _, w := range agentAuthWarnings() {
+		log.Print("WARNING agent-auth: ", w)
+	}
+	// S1 (хвиля 8): `hub-webrtc -check-config` — та сама перевірка, що й на
+	// старті (токен, strict, master, права, файл відкликань), без слухачів:
+	// код 0 — хаб із цим env стартує; помилка — log.Fatal вище (код 1).
+	if len(os.Args) > 1 && os.Args[1] == "-check-config" {
+		log.Print("hub-webrtc: check-config OK")
+		return
+	}
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	startRevokeSubscription(ctx)
+	// R5: ноди без агента й глядачів не живуть вічно (nodereap.go).
+	go reapIdleNodesLoop(ctx)
 
 	// pprof — ОКРЕМИЙ слухач і лише за явним OO_SCREEN_PPROF_ADDR. Не на mux
 	// сигналінгу: /debug/pprof віддає дампи горутин і профілі, і на проді він
@@ -2324,6 +2519,7 @@ func main() {
 	// SEC #21: per-IP rate-limit (ratelimit.go) — кожен viewer-offer це виклик ERP.
 	mux.HandleFunc("/offer/agent", rateLimited(offerLimiter, handleOffer("agent")))
 	mux.HandleFunc("/offer/viewer", rateLimited(offerLimiter, handleOffer("viewer")))
+	mux.HandleFunc("/offer/viewer/restart", handleViewerRestart)
 	mux.HandleFunc("/control", handleControl)
 	// F-39: глядач каже «моя вкладка прихована/знову видима» — хаб на цей час
 	// не шле йому відео, а коли приховані ВСІ, ставить агента на паузу.
@@ -2334,12 +2530,15 @@ func main() {
 	mux.HandleFunc("/nodes", handleNodes)
 	// H-16: здоровʼя для моніторингу: скільки нод, чи свіжий пол ревокацій.
 	mux.HandleFunc("/healthz", handleHealthz)
+	startAudit(mux) // S4: лише за OO_SCREEN_AUDIT_LOG
 
 	if ticketModeEnabled() {
 		// H-01: токен у журнал НЕ пишемо — journald читає будь-хто з групи adm.
+		log.Printf("hub-webrtc: bitrate probe=%v pace=%v (x%.2f)", probeEnabled, paceEnabled, paceMul)
 		log.Printf("hub-webrtc listening on %s (ticket-mode: erp=%s, agent token=…%s, multi-publisher; env fallback node=%q)", listenAddr, erpBase, tokenTail(), agentNodeIDEnv)
 	} else {
 		log.Printf("WARNING: static-token mode, not for prod (OO_SCREEN_ERP_BASE not set — viewer offers accept a static OO_SCREEN_T1_TOKEN, default is public/predictable)")
+		log.Printf("hub-webrtc: bitrate probe=%v pace=%v (x%.2f)", probeEnabled, paceEnabled, paceMul)
 		log.Printf("hub-webrtc listening on %s (T1 static-token mode, token=…%s, multi-publisher; env fallback node=%q)", listenAddr, tokenTail(), agentNodeIDEnv)
 	}
 	// H-03: голий ListenAndServe = без жодного таймауту на публічному порту
@@ -2357,21 +2556,37 @@ func main() {
 	// чекає на consent-таймаут, перш ніж перепідключитись.
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGTERM, syscall.SIGINT)
-	go func() {
-		s := <-sigCh
-		log.Printf("hub-webrtc: %s — graceful shutdown", s)
+	if err := serveUntilSignal(srv, sigCh, func() {
 		for _, ns := range reg.all() {
-			sendShutdown(ns, "hub shutting down")
+			sendShutdown(ns, nil, "hub shutting down")
 		}
+	}); err != nil {
+		log.Fatal(err)
+	}
+	cancel()
+	time.Sleep(300 * time.Millisecond) // дати control-повідомленням вийти
+}
+
+// serveUntilSignal слухає srv, а на сигнал кличе beforeShutdown і закриває
+// слухач. Повертається лише тоді, коли Shutdown дочекався запитів у дорозі (до
+// 5 с): ListenAndServe віддає ErrServerClosed ОДРАЗУ, і вихід main по ньому
+// рвав би /offer/*, що саме чекають ICE-gathering.
+func serveUntilSignal(srv *http.Server, sig <-chan os.Signal, beforeShutdown func()) error {
+	drained := make(chan struct{})
+	go func() {
+		s := <-sig
+		log.Printf("hub-webrtc: %s — graceful shutdown", s)
+		beforeShutdown()
 		shutdownCtx, cancelShutdown := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancelShutdown()
 		_ = srv.Shutdown(shutdownCtx)
-		cancel()
+		close(drained)
 	}()
-	if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-		log.Fatal(err)
+	if err := srv.ListenAndServe(); err != http.ErrServerClosed {
+		return err
 	}
-	time.Sleep(300 * time.Millisecond) // дати control-повідомленням вийти
+	<-drained
+	return nil
 }
 
 // handleHealthz — H-16. 200 = живий і пол ревокацій свіжий (або ticket-mode

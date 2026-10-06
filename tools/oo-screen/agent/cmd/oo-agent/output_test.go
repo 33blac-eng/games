@@ -4,7 +4,10 @@
 // монітора — інструкція в звіті/README.
 package main
 
-import "testing"
+import (
+	"math"
+	"testing"
+)
 
 func TestResolveOutput(t *testing.T) {
 	cases := []struct {
@@ -47,22 +50,6 @@ func TestClampStartOutput(t *testing.T) {
 	for _, c := range cases {
 		if got := clampStartOutput(c.idx, c.count); got != c.want {
 			t.Fatalf("clampStartOutput(%d, %d) = %d, хотіли %d", c.idx, c.count, got, c.want)
-		}
-	}
-}
-
-func TestNextOutput(t *testing.T) {
-	cases := []struct{ cur, count, want int }{
-		{0, 2, 1},
-		{1, 2, 0}, // по колу
-		{2, 3, 0},
-		{0, 1, 0},  // один монітор — нікуди перемикатись
-		{0, 0, 0},  // енумерація порожня
-		{-1, 2, 0}, // невідомий поточний
-	}
-	for _, c := range cases {
-		if got := nextOutput(c.cur, c.count); got != c.want {
-			t.Fatalf("nextOutput(%d, %d) = %d, хотіли %d", c.cur, c.count, got, c.want)
 		}
 	}
 }
@@ -292,8 +279,16 @@ func TestFallbackSize(t *testing.T) {
 		wantOK       bool
 	}{
 		{"авто, рідні 1440p", true, 2560, 1440, 1920, 1080, true},
-		{"авто, рідні 1920x1200", true, 1920, 1200, 1920, 1080, true},
+		// Q-05 (research/QUALITY-AUDIT.md): було 1920x1080 — сплющення 16:10
+		// по вертикалі ×0.9. Тепер пропорції збережено.
+		{"авто, рідні 1920x1200", true, 1920, 1200, 1728, 1080, true},
 		{"авто, рідні 4K", true, 3840, 2160, 1920, 1080, true},
+		{"авто, рідні 2560x1600", true, 2560, 1600, 1728, 1080, true},
+		{"авто, ultrawide 3440x1440", true, 3440, 1440, 1920, 804, true},
+		{"авто, портрет 1080x1920", true, 1080, 1920, 608, 1080, true},
+		{"авто, 5:4 1280x1024 влазить", true, 1280, 1024, 1920, 1080, true},
+		// Влазить у бокс, але MFT відмовив — як і раніше, рівно 1920x1080.
+		{"авто, рідні 1680x1050", true, 1680, 1050, 1920, 1080, true},
 		// Другого кола немає: відмова вже на 1920x1080 — не про роздільність.
 		{"авто, вже 1920x1080", true, 1920, 1080, 1920, 1080, false},
 		// Явний запит оператора не підмінюємо мовчки.
@@ -307,6 +302,45 @@ func TestFallbackSize(t *testing.T) {
 					c.auto, c.w, c.h, w, h, ok, c.wantW, c.wantH, c.wantOK)
 			}
 		})
+	}
+}
+
+// Q-05: відступ для будь-якої геометрії зберігає пропорції (похибка — лише
+// округлення до парного), не виходить за бокс 1920x1080 і не має більше
+// макроблоків, ніж сам 1920x1080 (тобто для MFT не важчий за перевірений).
+// Негативний контроль: стара реалізація (рівно 1920x1080) валить перевірку
+// пропорцій уже на 1920x1200.
+func TestFallbackSizeKeepsAspect(t *testing.T) {
+	mbs := func(w, h int) int { return ((w + 15) / 16) * ((h + 15) / 16) }
+	limit := mbs(fallbackW, fallbackH)
+	for w := 1090; w <= 7680; w += 26 {
+		for h := 482; h <= 4320; h += 34 {
+			if w <= fallbackW && h <= fallbackH {
+				continue // влазить — інша гілка (рівно 1920x1080)
+			}
+			fw, fh, ok := fallbackSize(true, w, h)
+			if !ok {
+				t.Fatalf("%dx%d: немає відступу", w, h)
+			}
+			if fw%2 != 0 || fh%2 != 0 || fw > fallbackW || fh > fallbackH || fw < 2 || fh < 2 {
+				t.Fatalf("%dx%d -> %dx%d: не парне або поза боксом", w, h, fw, fh)
+			}
+			if m := mbs(fw, fh); m > limit {
+				t.Fatalf("%dx%d -> %dx%d: %d MB > %d", w, h, fw, fh, m, limit)
+			}
+			// Одна сторона впирається в бокс, друга — точна пропорція з
+			// похибкою округлення до парного (≤ 1 піксель + float).
+			if fw != fallbackW && fh != fallbackH {
+				t.Fatalf("%dx%d -> %dx%d: жодна сторона не впирається в бокс", w, h, fw, fh)
+			}
+			if fw == fallbackW {
+				if d := math.Abs(float64(fh) - float64(h)*float64(fw)/float64(w)); d > 1.0001 {
+					t.Fatalf("%dx%d -> %dx%d: висота зсунута на %.2f px", w, h, fw, fh, d)
+				}
+			} else if d := math.Abs(float64(fw) - float64(w)*float64(fh)/float64(h)); d > 1.0001 {
+				t.Fatalf("%dx%d -> %dx%d: ширина зсунута на %.2f px", w, h, fw, fh, d)
+			}
+		}
 	}
 }
 

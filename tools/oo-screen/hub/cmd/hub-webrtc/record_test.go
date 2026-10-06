@@ -15,6 +15,7 @@ import (
 	"github.com/pion/webrtc/v4"
 
 	"github.com/organicoils/oo-screen/internal/h264"
+	"github.com/organicoils/oo-screen/internal/opusenc"
 	"github.com/organicoils/oo-screen/internal/pcmu"
 )
 
@@ -67,7 +68,7 @@ func TestRecordFlagOffChangesNothing(t *testing.T) {
 
 	dir := withRecordFlag(t, false)
 
-	rec := startRecording("n1")
+	rec := startRecording("n1", currentRecordCfg())
 	if rec != nil {
 		t.Fatalf("startRecording без прапорця віддав %v, want nil", rec)
 	}
@@ -83,7 +84,7 @@ func TestRecordFlagOffChangesNothing(t *testing.T) {
 	ns.mu.Lock()
 	ns.agentPC = &webrtc.PeerConnection{}
 	ns.mu.Unlock()
-	ns.rec.Store(startRecording(ns.nodeID))
+	ns.rec.Store(startRecording(ns.nodeID, currentRecordCfg()))
 	if ns.rec.Load() != nil {
 		t.Fatal("ns.rec не nil без прапорця — audioPump знайшов би рекордер")
 	}
@@ -126,13 +127,20 @@ func TestRecordFlagOffChangesNothing(t *testing.T) {
 // до останнього байта й падає, щойно якийсь елемент заявив більше, ніж лишилось
 // — тобто рівно на обрізаному хвості, який плеєр і не відкриє.
 func TestRecordWritesClosedMKVWithBothTracks(t *testing.T) {
+	for _, c := range []opusenc.Codec{opusenc.CodecOpus, opusenc.CodecPCMU} {
+		t.Run(string(c), func(t *testing.T) { recordBothTracks(t, c) })
+	}
+}
+
+func recordBothTracks(t *testing.T, codec opusenc.Codec) {
 	dir := withRecordFlag(t, true)
 	withAudioFlag(t, true) // друга доріжка існує лише разом зі своїм прапорцем
+	withHubAudioCodec(t, codec)
 
 	aus := corpusAUs(t)
 	tone := toneFrames(t)
 
-	rec := startRecording("../../etc/passwd") // заодно перевірка санітизації імені
+	rec := startRecording("../../etc/passwd", currentRecordCfg()) // заодно перевірка санітизації імені
 	if rec == nil {
 		t.Fatal("під прапорцем startRecording віддав nil")
 	}
@@ -173,8 +181,12 @@ func TestRecordWritesClosedMKVWithBothTracks(t *testing.T) {
 	s.blocks = map[byte]int{}
 	ebmlWalk(t, blob, &s, "")
 
-	if len(s.codecIDs) != 2 || s.codecIDs[0] != codecIDH264 || s.codecIDs[1] != codecIDPCM {
-		t.Fatalf("доріжки = %v, want [%s %s]", s.codecIDs, codecIDH264, codecIDPCM)
+	wantAudio := codecIDPCM
+	if codec == opusenc.CodecOpus {
+		wantAudio = codecIDOpus
+	}
+	if len(s.codecIDs) != 2 || s.codecIDs[0] != codecIDH264 || s.codecIDs[1] != wantAudio {
+		t.Fatalf("доріжки = %v, want [%s %s]", s.codecIDs, codecIDH264, wantAudio)
 	}
 	if s.width != 1920 || s.height != 1080 {
 		t.Fatalf("розмір у файлі %dx%d, want 1920x1080 (SPS корпусу)", s.width, s.height)
@@ -201,7 +213,7 @@ func TestRecordWritesClosedMKVWithBothTracks(t *testing.T) {
 // одному: без цього N глядачів написали б N копій тону в одну доріжку.
 func TestRecordAudioSlotIsExclusive(t *testing.T) {
 	withRecordFlag(t, true)
-	rec := startRecording("slot")
+	rec := startRecording("slot", currentRecordCfg())
 	t.Cleanup(rec.Close)
 
 	if !rec.claimAudio() {
@@ -213,6 +225,63 @@ func TestRecordAudioSlotIsExclusive(t *testing.T) {
 	rec.releaseAudio()
 	if !rec.claimAudio() {
 		t.Fatal("після releaseAudio слот не звільнився — нова нога лишилась би без звуку")
+	}
+}
+
+// TestRecordAudioStaysInSyncAfterPause — R5-G6: глядач сховав вкладку без
+// звуку -> агент на паузі хвилину -> повернувся. Відео у файлі йде за RTP-часом
+// агента (стінний годинник) і стрибає на +60 с; звук мусить стрибнути разом із
+// ним, а не продовжити з місця паузи. Мітки приходу задаємо самі (push замість
+// offer*), бо чекати хвилину в тесті — ні. Прибери переякорення в handleAudio —
+// звук відстане на ~60 с.
+func TestRecordAudioStaysInSyncAfterPause(t *testing.T) {
+	dir := withRecordFlag(t, true)
+	withAudioFlag(t, true)
+	aus := corpusAUs(t)
+	tone := toneFrames(t)
+
+	rec := startRecording("node-pause", currentRecordCfg())
+	if rec == nil {
+		t.Fatal("під прапорцем startRecording віддав nil")
+	}
+	t0 := time.Now()
+	var seq uint16
+	frame := func(au []byte, at time.Duration) {
+		for _, p := range packetizeAU(au, uint32(at*90000/time.Second), &seq) {
+			rec.push(recItem{pkt: p, at: t0.Add(at)})
+		}
+		// Пʼять 20-мс кадрів звуку на кожні 100 мс відео, як від живого агента.
+		for k := 0; k < 5; k++ {
+			a := at + time.Duration(k)*20*time.Millisecond
+			rec.push(recItem{aud: tone[k], dur: 20 * time.Millisecond, at: t0.Add(a)})
+		}
+	}
+	for i := 0; i < 6; i++ { // 0.0..0.5 с
+		frame(aus[i].Data, time.Duration(i)*100*time.Millisecond)
+	}
+	const gap = 60 * time.Second // пауза агента: ні відео, ні звуку
+	for i := 6; i < 12; i++ {
+		frame(aus[i].Data, gap+time.Duration(i)*100*time.Millisecond)
+	}
+	rec.Close()
+
+	path := recordedFile(t, dir)
+	if path == "" {
+		t.Fatal("файл не створився")
+	}
+	blob, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := mkvSummary{blocks: map[byte]int{}, blockTS: map[byte][]int64{}}
+	ebmlWalk(t, blob, &s, "")
+	v, a := s.blockTS[mkvVideoTrack], s.blockTS[mkvAudioTrack]
+	if len(v) == 0 || len(a) == 0 {
+		t.Fatalf("доріжки порожні: відео %d, звук %d", len(v), len(a))
+	}
+	// Останній кадр відео і останній кадр звуку зняті в одну мить (+80 мс звуку).
+	if d := a[len(a)-1] - v[len(v)-1]; d < -250 || d > 250 {
+		t.Fatalf("розсинхрон у кінці файлу: звук %d мс, відео %d мс (різниця %d мс)", a[len(a)-1], v[len(v)-1], d)
 	}
 }
 
@@ -250,8 +319,11 @@ func toneFrames(t *testing.T) [][]byte {
 	out := make([][]byte, 24)
 	for i := range out {
 		out[i] = tone.next()
-		if len(out[i]) != pcmu.FrameSamples {
+		if hubAudioCodec() == opusenc.CodecPCMU && len(out[i]) != pcmu.FrameSamples {
 			t.Fatalf("кадр тону %d байт, want %d", len(out[i]), pcmu.FrameSamples)
+		}
+		if hubAudioCodec() == opusenc.CodecOpus && opusenc.PacketDuration(out[i]) != 20*time.Millisecond {
+			t.Fatalf("Opus-кадр тону %d: тривалість %v", i, opusenc.PacketDuration(out[i]))
 		}
 	}
 	return out
@@ -303,6 +375,8 @@ type mkvSummary struct {
 	clusters      int
 	blocks        map[byte]int
 	width, height uint64
+	clusterTS     []uint64         // мітки кластерів по порядку, мс
+	blockTS       map[byte][]int64 // абсолютні мітки SimpleBlock за доріжкою, мс
 }
 
 // ebmlWalk обходить документ і ПАДАЄ, щойно елемент заявляє більше байтів, ніж
@@ -341,6 +415,8 @@ func ebmlWalk(t *testing.T, b []byte, s *mkvSummary, path string) {
 			ebmlWalk(t, body, s, fmt.Sprintf("%s/%X", path, id))
 		case idCodecID:
 			s.codecIDs = append(s.codecIDs, string(body))
+		case idClusterTS:
+			s.clusterTS = append(s.clusterTS, beUint(body))
 		case idPixelWidth:
 			s.width = beUint(body)
 		case idPixelHeight:
@@ -350,6 +426,11 @@ func ebmlWalk(t *testing.T, b []byte, s *mkvSummary, path string) {
 				t.Fatalf("SimpleBlock у %s/ має %d байтів — кадру в ньому немає", path, len(body))
 			}
 			s.blocks[body[0]&0x7F]++
+			if s.blockTS != nil && len(s.clusterTS) > 0 {
+				rel := int64(int16(uint16(body[1])<<8 | uint16(body[2])))
+				tr := body[0] & 0x7F
+				s.blockTS[tr] = append(s.blockTS[tr], int64(s.clusterTS[len(s.clusterTS)-1])+rel)
+			}
 		}
 	}
 }
@@ -422,9 +503,20 @@ func ffprobeMKV(t *testing.T, path string) {
 	}
 	got := string(out)
 	t.Logf("ffprobe:\n%s", got)
-	for _, want := range []string{"codec_name=h264", "codec_name=pcm_s16le", "width=1920", "height=1080"} {
+	audioName := "codec_name=pcm_s16le"
+	if hubAudioCodec() == opusenc.CodecOpus {
+		audioName = "codec_name=opus"
+	}
+	for _, want := range []string{"codec_name=h264", audioName, "width=1920", "height=1080"} {
 		if !strings.Contains(got, want) {
 			t.Fatalf("ffprobe не побачив %q:\n%s", want, got)
+		}
+	}
+	// Звук мусить не лише оголошуватись, а й ДЕКОДУВАТИСЬ без помилок.
+	if ff, err := exec.LookPath("ffmpeg"); err == nil {
+		out, err := exec.Command(ff, "-v", "error", "-i", path, "-map", "0:a", "-f", "null", "-").CombinedOutput()
+		if err != nil || len(bytes.TrimSpace(out)) != 0 {
+			t.Fatalf("ffmpeg не декодував звук %s: %v\n%s", path, err, out)
 		}
 	}
 }

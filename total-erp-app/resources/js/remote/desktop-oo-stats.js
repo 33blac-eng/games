@@ -65,6 +65,11 @@ export function computeVideoStats(report, prev) {
         framesDecoded: num(inb.framesDecoded),
         packetsReceived: num(inb.packetsReceived),
         packetsLost: num(inb.packetsLost),
+        // P-4: для інтервальних середніх буфера/декоду.
+        jitterBufferDelay: num(inb.jitterBufferDelay),
+        jitterBufferTargetDelay: num(inb.jitterBufferTargetDelay),
+        jitterBufferEmittedCount: num(inb.jitterBufferEmittedCount),
+        totalDecodeTime: num(inb.totalDecodeTime),
     };
     const dt = prev && ts !== null && prev.ts !== null && ts > prev.ts ? (ts - prev.ts) / 1000 : null;
     const delta = (k) => (dt && snap[k] !== null && prev[k] !== null ? snap[k] - prev[k] : null);
@@ -87,11 +92,27 @@ export function computeVideoStats(report, prev) {
         lossPct = lost + snap.packetsReceived > 0 ? (lost / (lost + snap.packetsReceived)) * 100 : 0;
     }
 
-    const jbd = num(inb.jitterBufferDelay);
-    const jbc = num(inb.jitterBufferEmittedCount);
-    const jitterBufferMs = jbd !== null && jbc ? (jbd / jbc) * 1000 : null;
-    const tdt = num(inb.totalDecodeTime);
-    const decodeMs = tdt !== null && snap.framesDecoded ? (tdt / snap.framesDecoded) * 1000 : null;
+    // PLAYER-QUALITY P-4: буфер і декод — середні ЗА ІНТЕРВАЛ (з дельт), а не
+    // за всю сесію. Кумулятивне середнє через годину роботи майже не рухається:
+    // сплеск буфера до 200 мс на втратах в оверлеї не видно взагалі. Перший
+    // тік (prev нема) або інтервал без кадрів — кумулятивне, як раніше.
+    const jbd = snap.jitterBufferDelay;
+    const jbc = snap.jitterBufferEmittedCount;
+    const dJbc = delta('jitterBufferEmittedCount');
+    const dJbd = delta('jitterBufferDelay');
+    let jitterBufferMs = jbd !== null && jbc ? (jbd / jbc) * 1000 : null;
+    if (dJbc > 0 && dJbd !== null && dJbd >= 0) jitterBufferMs = (dJbd / dJbc) * 1000;
+    // Ціль буфера, яку браузер реально тримає (jitterBufferTargetDelay, Chrome
+    // 113+): видно, чи послухався він jitterBufferTarget/playoutDelayHint.
+    let jitterTargetMs = null;
+    const jbt = snap.jitterBufferTargetDelay;
+    const dJbt = delta('jitterBufferTargetDelay');
+    if (dJbc > 0 && dJbt !== null && dJbt >= 0) jitterTargetMs = (dJbt / dJbc) * 1000;
+    else if (jbt !== null && jbc) jitterTargetMs = (jbt / jbc) * 1000;
+    const tdt = snap.totalDecodeTime;
+    let decodeMs = tdt !== null && snap.framesDecoded ? (tdt / snap.framesDecoded) * 1000 : null;
+    const dTdt = delta('totalDecodeTime');
+    if (dFrames > 0 && dTdt !== null && dTdt >= 0) decodeMs = (dTdt / dFrames) * 1000;
     const rttSec = pair ? num(pair.currentRoundTripTime) : null;
     const rttMs = rttSec !== null ? rttSec * 1000 : null;
 
@@ -109,6 +130,7 @@ export function computeVideoStats(report, prev) {
         freezeCount: num(inb.freezeCount),
         totalFreezesDurationMs: tfd !== null ? tfd * 1000 : null,
         jitterBufferMs,
+        jitterTargetMs,
         decodeMs,
         width: num(inb.frameWidth),
         height: num(inb.frameHeight),
@@ -136,13 +158,100 @@ export function formatStatsLines(s) {
         'Втрати: ' + fmt(s.lossPct, 2, ' %'),
         'NACK/PLI: ' + orDash(s.nackCount) + ' / ' + orDash(s.pliCount),
         'Фризи: ' + orDash(s.freezeCount) + ' (' + fmt(s.totalFreezesDurationMs, 0, ' мс') + ')',
-        'Jitter-буфер: ' + fmt(s.jitterBufferMs, 1, ' мс'),
+        'Jitter-буфер: ' + fmt(s.jitterBufferMs, 1, ' мс')
+            + (s.jitterTargetMs !== null && s.jitterTargetMs !== undefined ? ' (ціль ' + fmt(s.jitterTargetMs, 0, ' мс') + ')' : ''),
         'Декод: ' + fmt(s.decodeMs, 1, ' мс'),
         'Розмір: ' + (s.width && s.height ? s.width + '×' + s.height : '—'),
         'Кодек: ' + (s.codec || '—'),
         'RTT: ' + fmt(s.rttMs, 1, ' мс'),
         'Мережа+буфер: ' + fmt(s.networkBufferMs, 1, ' мс'),
     ];
+}
+
+// ── P-4: таймінги кадрів з requestVideoFrameCallback ───────────────────────
+// getStats дає СЕРЕДНІ за інтервал; rVFC — кожен показаний кадр:
+//   receiveTime          — коли прийшов останній пакет кадру (WebRTC-джерело);
+//   expectedDisplayTime  — коли композитор покаже кадр;
+//   processingDuration   — декод (с).
+// Різниця expectedDisplayTime − receiveTime = jitter-буфер + декод + черга
+// рендера — та частина затримки, що живе в БРАУЗЕРІ і яку ми крутимо
+// jitterBufferTarget. Обидва часи — одна шкала (performance.now()), тож без
+// синхронізації годинників. Мережу й агента це НЕ включає (див. M1 «скло-до-скла»).
+export const FRAME_TIMING_WINDOW = 120;
+
+function percentile(sorted, p) {
+    if (!sorted.length) return null;
+    const i = Math.min(sorted.length - 1, Math.max(0, Math.ceil((p / 100) * sorted.length) - 1));
+    return sorted[i];
+}
+
+/**
+ * createFrameTimingMeter — кільцевий буфер останніх `size` кадрів.
+ * onFrame(now, meta) — прямо з колбека rVFC; snapshot() → null (даних нема,
+ * напр. браузер без receiveTime) або { frames, recvToDisplayP50, recvToDisplayP95,
+ * processingP50 } у мс.
+ */
+export function createFrameTimingMeter(o) {
+    const size = (o && o.size > 0) ? o.size : FRAME_TIMING_WINDOW;
+    const lat = [];
+    const proc = [];
+    let frames = 0;
+    const push = (arr, v) => { arr.push(v); if (arr.length > size) arr.shift(); };
+    return {
+        onFrame(_now, meta) {
+            if (!meta) return;
+            frames += 1;
+            const r = num(meta.receiveTime);
+            const e = num(meta.expectedDisplayTime);
+            // receiveTime = 0 / відсутній — не WebRTC-кадр або старий браузер.
+            if (r !== null && r > 0 && e !== null && e >= r) push(lat, e - r);
+            const p = num(meta.processingDuration);
+            if (p !== null && p >= 0) push(proc, p * 1000);
+        },
+        snapshot() {
+            if (!lat.length && !proc.length) return null;
+            const ls = lat.slice().sort((a, b) => a - b);
+            const ps = proc.slice().sort((a, b) => a - b);
+            return {
+                frames,
+                recvToDisplayP50: percentile(ls, 50),
+                recvToDisplayP95: percentile(ls, 95),
+                processingP50: percentile(ps, 50),
+            };
+        },
+        reset() { lat.length = 0; proc.length = 0; frames = 0; },
+    };
+}
+
+/** Рядок оверлею для rVFC-таймінгів; null — нема даних. */
+export function formatFrameTimingLine(t) {
+    if (!t || (t.recvToDisplayP50 === null && t.processingP50 === null)) return null;
+    return 'Прийом→показ: ' + fmt(t.recvToDisplayP50, 0) + ' / ' + fmt(t.recvToDisplayP95, 0, ' мс')
+        + ' (p50/p95), декод ' + fmt(t.processingP50, 1, ' мс');
+}
+
+/**
+ * P-4/P-3: рядок масштабу — головна підказка, чому текст «милий»: кадр
+ * videoW×videoH показано на deviceW×deviceH ФІЗИЧНИХ пікселях. 1:1 — без
+ * ресемплу; <1 — зменшення (тонкі лінії гублять); >1 — збільшення.
+ * r: { videoW, videoH, cssW, cssH, dpr, rendering }.
+ */
+export function formatScaleLine(r) {
+    if (!r || !(r.videoW > 0) || !(r.cssW > 0) || !(r.dpr > 0)) return null;
+    const dw = Math.round(r.cssW * r.dpr);
+    const dh = Math.round(r.cssH * r.dpr);
+    const k = dw / r.videoW;
+    const exact = dw === r.videoW && dh === r.videoH;
+    return 'Показ: ' + dw + '×' + dh + ' фіз. @' + Number(r.dpr.toFixed(3)) + ' → '
+        + (exact ? '1:1' : k.toFixed(3) + '×') + (r.rendering === 'pixelated' ? ' (pixelated)' : '');
+}
+
+/** N6: рядок шляху медіа — direct (агент↔браузер напряму) чи relay (через хаб). */
+export function formatPathLine(path) {
+    if (path === 'direct') return 'Шлях: direct (P2P)';
+    if (path === 'relay') return 'Шлях: relay (хаб)';
+    if (path === 'direct-connecting') return 'Шлях: direct… (ICE)';
+    return 'Шлях: —';
 }
 
 /**
@@ -195,7 +304,14 @@ export function createStatsOverlay(o) {
             if (destroyed || timer === null) return;
             const r = computeVideoStats(report, prev);
             prev = r ? r.snap : null;
-            panel.textContent = formatStatsLines(r && r.stats).join('\n');
+            const lines = formatStatsLines(r && r.stats);
+            if (typeof o.getPath === 'function') lines.unshift(formatPathLine(o.getPath()));
+            // P-4: rVFC-таймінги й масштаб показу — лише коли шар їх дає.
+            const ft = typeof o.getFrameTiming === 'function' ? formatFrameTimingLine(o.getFrameTiming()) : null;
+            if (ft) lines.push(ft);
+            const sc = typeof o.getRender === 'function' ? formatScaleLine(o.getRender()) : null;
+            if (sc) lines.push(sc);
+            panel.textContent = lines.join('\n');
         } catch (e) { /* ignore */ } finally { busy = false; }
     }
 

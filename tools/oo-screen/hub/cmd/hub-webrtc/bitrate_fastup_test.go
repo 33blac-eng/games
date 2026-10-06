@@ -39,7 +39,7 @@ func TestFastUpRecoversFasterAfterCleanPeriod(t *testing.T) {
 }
 
 func TestFastUpNotBeforeCleanPeriodAndDebounced(t *testing.T) {
-	c := bitrateCtl{target: 1_000_000, startBps: 8_000_000, fastUp: true}
+	c := bitrateCtl{target: 2_000_000, startBps: 8_000_000, fastUp: true}
 	var last time.Time
 	for i := 1; i <= 40; i++ {
 		now := t0.Add(time.Duration(i) * time.Second)

@@ -4,7 +4,6 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
-	"time"
 
 	"github.com/organicoils/oo-screen/internal/h264"
 	"github.com/pion/rtp"
@@ -38,7 +37,7 @@ func TestRecordSkipsTornFirstKeyframe(t *testing.T) {
 	dir := withRecordFlag(t, true)
 	aus := corpusAUs(t)
 
-	rec := startRecording("node-torn")
+	rec := startRecording("node-torn", currentRecordCfg())
 	if rec == nil {
 		t.Fatal("під прапорцем startRecording віддав nil")
 	}
@@ -93,7 +92,7 @@ func TestRecordDropsOutOfOrderFrame(t *testing.T) {
 	dir := withRecordFlag(t, true)
 	aus := corpusAUs(t)
 
-	rec := startRecording("node-order")
+	rec := startRecording("node-order", currentRecordCfg())
 	if rec == nil {
 		t.Fatal("startRecording віддав nil")
 	}
@@ -142,7 +141,7 @@ func TestRecordKeepsMonotonicFrames(t *testing.T) {
 	dir := withRecordFlag(t, true)
 	aus := corpusAUs(t)
 
-	rec := startRecording("node-mono")
+	rec := startRecording("node-mono", currentRecordCfg())
 	if rec == nil {
 		t.Fatal("startRecording віддав nil")
 	}
@@ -156,8 +155,7 @@ func TestRecordKeepsMonotonicFrames(t *testing.T) {
 		ts += 9000
 	}
 	// Останній AU виллється лише на зміні мітки або на Close.
-	rec.Close()
-	time.Sleep(10 * time.Millisecond)
+	rec.Close() // чекає на писаря (<-fin), тож файл уже дописано
 
 	path := recordedFile(t, dir)
 	if path == "" {

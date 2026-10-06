@@ -16,6 +16,11 @@
 //     cursorproto.Validate: ≤64 KiB, форма ≤256x256) — інакше не йде нікуди;
 //   - частота від агента: rate.Limiter (агент коалесить до ≤125/с; стеля 2x);
 //   - глядачів на канал: maxViewers (дзеркало maxViewersPerNode);
+//   - F9, ПЕРЕГОВОРИ (лише для курсора): хаб шле агенту KindMode=1 тільки
+//     коли КОЖЕН глядач ноги (ns.viewers) має відкритий 'oosc-cursor' і
+//     OO_SCREEN_RECORD вимкнено; інакше KindMode=0, і агент вмальовує
+//     вказівник у кадр як без прапорця. Перерахунок — на зміну глядачів
+//     ноги/каналів і раз на секунду (запис міг увімкнутись перезавантаженням).
 //   - повільний глядач: поки в його каналі буферизовано > maxBuffered, НЕлипкі
 //     повідомлення (позиції) йому пропускаються — наступна позиція все одно
 //     абсолютна. Липкі (форма) йдуть завжди, поки не перевищено hardBuffered.
@@ -23,6 +28,7 @@ package main
 
 import (
 	"log"
+	"os"
 	"sync"
 	"time"
 
@@ -70,6 +76,18 @@ type dcRelay struct {
 	// каналу після відкриття нового не чіпає стан нового.
 	agent   any
 	dropped uint64
+
+	// agentTx — куди слати дозвіл агенту (F9); granted/grantSent — що
+	// агент від нас уже чув на цьому каналі.
+	agentTx   interface{ Send([]byte) error }
+	granted   bool
+	grantSent bool
+	// grantMu серіалізує весь перерахунок «обчислити бажане → Send →
+	// записати стан»: інакше два конкурентні refreshCursorGrant можуть
+	// доставити агенту Mode у зворотному порядку від записаного стану
+	// (хаб думає granted=false, агент лишився на шарі — курсора нема).
+	// Порядок блокувань: grantMu → ns.mu / r.mu.
+	grantMu sync.Mutex
 }
 
 func newDCRelay(cfg relayConfig) *dcRelay {
@@ -95,6 +113,8 @@ func (r *dcRelay) reset() {
 func (r *dcRelay) setAgent(a any) {
 	r.mu.Lock()
 	r.agent = a
+	r.agentTx, _ = a.(interface{ Send([]byte) error })
+	r.granted, r.grantSent = false, false
 	r.sticky = map[byte][]byte{}
 	r.order = nil
 	r.mu.Unlock()
@@ -107,6 +127,7 @@ func (r *dcRelay) agentGone(a any) {
 	r.mu.Lock()
 	if a == nil || r.agent == a {
 		r.agent = nil
+		r.agentTx = nil
 		r.sticky = map[byte][]byte{}
 		r.order = nil
 	}
@@ -211,6 +232,82 @@ func (r *dcRelay) removeViewer(s relaySink) {
 	r.mu.Unlock()
 }
 
+// grant шле агенту дозвіл/відкликання шару, якщо він змінився. Повертає,
+// чи було відправлено. Викликач тримає r.grantMu, тож Send іде в тому ж
+// порядку, що й записи granted.
+func (r *dcRelay) grant(on bool) bool {
+	r.mu.Lock()
+	tx := r.agentTx
+	if tx == nil || (r.grantSent && r.granted == on) {
+		r.mu.Unlock()
+		return false
+	}
+	r.granted, r.grantSent = on, true
+	r.mu.Unlock()
+	if err := tx.Send(cursorproto.EncodeMode(on)); err != nil {
+		r.mu.Lock()
+		r.grantSent = false // наступний перерахунок спробує ще
+		r.mu.Unlock()
+		return false
+	}
+	return true
+}
+
+// coversAll — у кожного з owners є живий канал у ретрансляторі. Порожній
+// список — false (нікому малювати курсор — нема чого й вимикати).
+func (r *dcRelay) coversAll(owners []any) bool {
+	if len(owners) == 0 {
+		return false
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for _, o := range owners {
+		s, ok := r.owners[o]
+		if !ok || s.ReadyState() != webrtc.DataChannelStateOpen {
+			return false
+		}
+	}
+	return true
+}
+
+// cursorLayerAllowed — аварійний вимикач F9 на хабі (шар типово ON з хвилі
+// 10): OO_SCREEN_CURSOR_LAYER=0 — хаб ніколи не дозволяє шар (шле агенту
+// KindMode=0), тож усі агенти вмальовують вказівник у кадр, як до F9.
+// Ретрансляція каналу лишається (без дозволу Publisher агента мовчить).
+var cursorLayerAllowed = os.Getenv("OO_SCREEN_CURSOR_LAYER") != "0"
+
+// cursorGrantWanted — правило F9: шар лише коли сесія не пишеться в MKV і
+// всі глядачі ноги вміють шар.
+func cursorGrantWanted(ns *nodeSession, r *dcRelay) bool {
+	if !cursorLayerAllowed || recordEnabled.Load() {
+		return false
+	}
+	ns.mu.Lock()
+	owners := make([]any, 0, len(ns.viewers))
+	for pc := range ns.viewers {
+		owners = append(owners, pc)
+	}
+	ns.mu.Unlock()
+	return r.coversAll(owners)
+}
+
+// refreshCursorGrant перераховує дозвіл для ноди (без ns.mu на вході).
+// Ретранслятора ще немає — агент без -cursor-layer, нема кому казати.
+func refreshCursorGrant(ns *nodeSession) {
+	v, ok := relays.Load(relayKey{ns, cursorproto.ChannelLabel})
+	if !ok {
+		return
+	}
+	r := v.(*dcRelay)
+	r.grantMu.Lock()
+	defer r.grantMu.Unlock()
+	// Бажане рахується під grantMu: рішення, обчислене до чужого Send,
+	// не може бути відправлене після нього.
+	if on := cursorGrantWanted(ns, r); r.grant(on) {
+		log.Printf("relay %s: cursor layer grant=%v [node=%s]", cursorproto.ChannelLabel, on, ns.nodeID)
+	}
+}
+
 func (r *dcRelay) viewerCount() int {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -261,7 +358,39 @@ func forgetRelays(ns *nodeSession) {
 func attachAgentRelay(ns *nodeSession, dc *webrtc.DataChannel, cfg relayConfig) {
 	r := relayFor(ns, cfg)
 	r.setAgent(dc)
-	dc.OnClose(func() { r.agentGone(dc) })
+	if cfg.label != cursorproto.ChannelLabel {
+		dc.OnClose(func() { r.agentGone(dc) })
+	} else {
+		// F9: агент стартує з вказівником у кадрі; перший дозвіл — щойно
+		// канал відкрито, далі — на події й раз на секунду. (pion тримає
+		// ОДИН обробник OnClose — тому agentGone теж тут.)
+		stop := make(chan struct{})
+		var once sync.Once
+		dc.OnClose(func() {
+			r.agentGone(dc)
+			once.Do(func() { close(stop) })
+		})
+		start := func() {
+			refreshCursorGrant(ns)
+			go func() {
+				t := time.NewTicker(time.Second)
+				defer t.Stop()
+				for {
+					select {
+					case <-stop:
+						return
+					case <-t.C:
+						refreshCursorGrant(ns)
+					}
+				}
+			}()
+		}
+		var startOnce sync.Once
+		dc.OnOpen(func() { startOnce.Do(start) })
+		if dc.ReadyState() == webrtc.DataChannelStateOpen {
+			startOnce.Do(start)
+		}
+	}
 	log.Printf("relay %s: agent channel open [node=%s]", cfg.label, ns.nodeID)
 	dc.OnMessage(func(m webrtc.DataChannelMessage) {
 		r.publish(m.Data, time.Now())
@@ -278,9 +407,10 @@ func viewerRelayHandler(ns *nodeSession, owner any, dc *webrtc.DataChannel, cfg 
 			log.Printf("relay %s: стеля глядачів або дубль каналу [node=%s] — канал закрито", cfg.label, ns.nodeID)
 			_ = dc.Close()
 		}
+		refreshCursorGrant(ns)
 	}
 	dc.OnOpen(open)
-	dc.OnClose(func() { r.removeViewer(dc) })
+	dc.OnClose(func() { r.removeViewer(dc); refreshCursorGrant(ns) })
 	if dc.ReadyState() == webrtc.DataChannelStateOpen {
 		open()
 	}

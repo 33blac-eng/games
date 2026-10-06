@@ -61,17 +61,53 @@ func nackGeneratorOptions() []nack.GeneratorOption {
 // GetStats для діагностики) — з тим самим NACK-генератором.
 func registerHubInterceptors(m *webrtc.MediaEngine, i *interceptor.Registry) error {
 	if os.Getenv("OO_SCREEN_PION_STATS") == "1" {
-		return webrtc.RegisterDefaultInterceptorsWithOptions(m, i,
-			webrtc.WithNackGeneratorOptions(nackGeneratorOptions()...))
+		if err := webrtc.RegisterDefaultInterceptorsWithOptions(m, i,
+			webrtc.WithNackGeneratorOptions(nackGeneratorOptions()...)); err != nil {
+			return err
+		}
+		// Тут FEC зовні відносно TWCC: з узгодженим transport-cc розширенням
+		// захищені байти не збіглися б із мережевими — діагностичний режим.
+		addFECInterceptor(i)
+		return nil
 	}
-	if err := webrtc.ConfigureNackWithOptions(m, i, nackGeneratorOptions()); err != nil {
+	if err := configureHubNack(m, i); err != nil {
 		return err
 	}
 	if err := webrtc.ConfigureRTCPReports(i); err != nil {
 		return err
 	}
+	// FEC (fec.go, OO_SCREEN_FEC): ЗОВНІ від NACK responder-а (той кешує вже
+	// перенумеровані RED-пакети) і ВСЕРЕДИНІ від розширень заголовка (захищені
+	// байти = мережеві). Порядок Add визначає вкладеність: останній — зовнішній.
+	addFECInterceptor(i)
 	if err := webrtc.ConfigureSimulcastExtensionHeaders(m); err != nil {
 		return err
 	}
 	return webrtc.ConfigureTWCCSender(m, i)
+}
+
+// configureHubNack — як webrtc.ConfigureNackWithOptions, але responder для
+// ніг без RTX — спільнопамʼятний sharedNackResponder (nackresp.go, R4).
+// Pion-responder лишається лише для ніг з RTX (хаб їх не узгоджує) або
+// повністю — за OO_SCREEN_NACK_RESPONDER=pion.
+func configureHubNack(m *webrtc.MediaEngine, i *interceptor.Registry) error {
+	if nackResponderPion {
+		return webrtc.ConfigureNackWithOptions(m, i, nackGeneratorOptions())
+	}
+	gen, err := nack.NewGeneratorInterceptor(nackGeneratorOptions()...)
+	if err != nil {
+		return err
+	}
+	rtx, err := nack.NewResponderInterceptor(nack.ResponderStreamsFilter(func(info *interceptor.StreamInfo) bool {
+		return streamHasNack(info) && info.SSRCRetransmission != 0
+	}))
+	if err != nil {
+		return err
+	}
+	m.RegisterFeedback(webrtc.RTCPFeedback{Type: "nack"}, webrtc.RTPCodecTypeVideo)
+	m.RegisterFeedback(webrtc.RTCPFeedback{Type: "nack", Parameter: "pli"}, webrtc.RTPCodecTypeVideo)
+	i.Add(sharedNackFactory{})
+	i.Add(rtx)
+	i.Add(gen)
+	return nil
 }

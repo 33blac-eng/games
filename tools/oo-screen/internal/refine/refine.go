@@ -22,7 +22,40 @@ type Config struct {
 	// MinGap — мінімальна пауза між refine-кадрами (не частіше за кадровий
 	// інтервал).
 	MinGap time.Duration
+
+	// AfterKeyframe — ключовий кадр від rate control (періодичний GOP
+	// енкодера, keyframe_request нового глядача, PLI) на НЕРУХОМОМУ екрані
+	// перезаписує вже дошліфоване зображення якістю rate control, а руху, що
+	// завів би refine, нема — текст лишався мильним до наступної зміни. З
+	// прапорцем такий IDR заводить refine заново (TASK.md крок 4).
+	AfterKeyframe bool
+	// QPAware — пропускати кроки refine, що не кращі за найгірший QP, який
+	// зараз лишився на екрані (Coded стежить за ним за QP кадрів з потоку).
+	// Refine QP 22 поверх кадру з QP 16 не покращує нічого, лише коштує біт.
+	// Невідомий QP (0) — кроки не пропускаються, як без прапорця.
+	QPAware bool
+
+	// Converge — C3 (WORLD-COMPARISON-2026 §5 п. 3, top-off як у CRD): після
+	// кроків QPs, доки найгірший ВИМІРЯНИЙ QP на екрані (Coded, QP з потоку)
+	// гірший за TargetQP, слати ще refine-кадри з TargetQP — щонайбільше
+	// MaxExtra і в межах ByteBudget байтів на епізод. Рятує там, де MFT
+	// ігнорує QP семпла: кожен наступний P-кадр доводить залишок. Невідомий QP
+	// (0) — зупинка: без виміру «до збіжності» не має сенсу.
+	Converge bool
+	// TargetQP — ціль збіжності (дефолт DefaultTargetQP).
+	TargetQP int
+	// MaxExtra — стеля додаткових кадрів на епізод (дефолт DefaultMaxExtra).
+	MaxExtra int
+	// ByteBudget — стеля байтів усіх refine-кадрів епізоду (0 — без стелі,
+	// лишається лише MaxExtra і пауза bytes/peak з Sent).
+	ByteBudget int
 }
+
+// Дефолти Converge.
+const (
+	DefaultTargetQP = 16
+	DefaultMaxExtra = 4
+)
 
 // DefaultIdle — 200 мс простою до першого refine.
 const DefaultIdle = 200 * time.Millisecond
@@ -40,6 +73,24 @@ type State struct {
 	done   int       // скільки refine-кадрів уже пішло після останнього руху
 	nextAt time.Time // не раніше цього моменту — наступний refine
 	dirty  bool      // енкодер зараз у refine-налаштуваннях, їх треба зняти
+	// worst — найгірший QP, що лишився на екрані після останнього IDR /
+	// refine (0 — невідомо). Для QPAware і Converge.
+	worst int
+	// bytes — байтів refine-кадрів за поточний епізод (Converge).
+	bytes int
+	// measured — worst узято з потоку (QPReader), а не з запитаного QP.
+	// Converge вірить лише виміру.
+	measured bool
+}
+
+// Frame — закодований кадр, як його бачить refine. Апаратний MFT конвеєрний:
+// AU повертається пізніше за свій кадр, тож агент зіставляє його з видом
+// кадру за PTS (agent/cmd/oo-agent, auKinds).
+type Frame struct {
+	Key    bool // AU — IDR
+	Refine int  // >0: refine-кадр, закодований із цим QP
+	Motion bool // новий вміст; false і Refine==0 — keepalive-повтор без змін
+	QP     int  // QP кадру з потоку (internal/h264.QPReader); 0 — невідомий
 }
 
 // New будує автомат; порожні поля Config беруть дефолти.
@@ -50,6 +101,12 @@ func New(cfg Config) *State {
 	if len(cfg.QPs) == 0 {
 		cfg.QPs = DefaultQPs
 	}
+	if cfg.TargetQP <= 0 {
+		cfg.TargetQP = DefaultTargetQP
+	}
+	if cfg.MaxExtra <= 0 {
+		cfg.MaxExtra = DefaultMaxExtra
+	}
 	return &State{cfg: cfg}
 }
 
@@ -58,7 +115,17 @@ func New(cfg Config) *State {
 func (s *State) Motion(now time.Time) {
 	s.armed = true
 	s.done = 0
+	s.bytes = 0
 	s.nextAt = now.Add(s.cfg.Idle)
+}
+
+// converging — Converge ще має що робити: кроки QPs вичерпано, виміряний QP
+// гірший за ціль, стеля кадрів і байтів не досягнута.
+func (s *State) converging() bool {
+	return s.cfg.Converge && s.done >= len(s.cfg.QPs) &&
+		s.done < len(s.cfg.QPs)+s.cfg.MaxExtra &&
+		s.measured && s.worst > s.cfg.TargetQP &&
+		(s.cfg.ByteBudget <= 0 || s.bytes < s.cfg.ByteBudget)
 }
 
 // Disarm — refine зараз не має сенсу (пауза гейта, втрачено кадр, зміна
@@ -81,13 +148,61 @@ func (s *State) Wait(now time.Time, def time.Duration) time.Duration {
 	return d
 }
 
-// Due повертає QP refine-кадру, якщо саме час його кодувати.
+// Due повертає QP refine-кадру, якщо саме час його кодувати. З QPAware
+// кроки, що не кращі за найгірший QP на екрані, тут же пропускаються (без
+// кадру); якщо пропущено всі — refine завершено (Complete).
 func (s *State) Due(now time.Time) (qp int, ok bool) {
-	if !s.armed || s.done >= len(s.cfg.QPs) || now.Before(s.nextAt) {
-		return 0, false
+	for s.armed && s.done < len(s.cfg.QPs) && !now.Before(s.nextAt) {
+		q := s.cfg.QPs[s.done]
+		if s.cfg.QPAware && s.worst > 0 && q >= s.worst {
+			s.done++
+			continue
+		}
+		return q, true
 	}
-	return s.cfg.QPs[s.done], true
+	if s.armed && s.done >= len(s.cfg.QPs) && !now.Before(s.nextAt) && s.converging() {
+		return s.cfg.TargetQP, true
+	}
+	if s.done >= len(s.cfg.QPs) && !s.converging() {
+		s.armed = false
+	}
+	return 0, false
 }
+
+// Coded — енкодер віддав AU кадру f. Оновлює найгірший QP на екрані і, з
+// AfterKeyframe, заводить refine після IDR від rate control.
+func (s *State) Coded(now time.Time, f Frame) {
+	switch {
+	case f.Key:
+		// IDR перезаписує весь екран: найгірший QP — його власний.
+		s.worst, s.measured = f.QP, f.QP > 0
+		if f.Refine > 0 && f.QP == 0 {
+			s.worst = f.Refine
+		}
+		if s.cfg.AfterKeyframe && f.Refine == 0 {
+			s.armed, s.done, s.bytes = true, 0, 0
+			s.nextAt = now.Add(s.cfg.Idle)
+		}
+	case f.Refine > 0:
+		q := f.Refine
+		if f.QP > 0 {
+			q = f.QP // MFT міг проігнорувати QP семпла — віримо потоку
+		}
+		if s.worst == 0 || q < s.worst {
+			s.worst, s.measured = q, f.QP > 0
+		}
+	case f.Motion:
+		// Нові ділянки не кращі за свій QP; невідомий QP — невідомий і екран.
+		if f.QP == 0 {
+			s.worst, s.measured = 0, false
+		} else if s.worst > 0 && f.QP > s.worst {
+			s.worst, s.measured = f.QP, true
+		}
+	}
+}
+
+// WorstQP — найгірший QP на екрані за оцінкою Coded (0 — невідомо).
+func (s *State) WorstQP() int { return s.worst }
 
 // Postpone відкладає refine (транспорт зайнятий) на d, не витрачаючи кадр.
 func (s *State) Postpone(now time.Time, d time.Duration) {
@@ -102,6 +217,7 @@ func (s *State) Postpone(now time.Time, d time.Duration) {
 func (s *State) Sent(now time.Time, bytes, peakBps int) {
 	s.done++
 	s.dirty = true
+	s.bytes += bytes
 	gap := s.cfg.MinGap
 	if peakBps > 0 {
 		if b := time.Duration(int64(bytes) * 8 * int64(time.Second) / int64(peakBps)); b > gap {
@@ -109,7 +225,9 @@ func (s *State) Sent(now time.Time, bytes, peakBps int) {
 		}
 	}
 	s.nextAt = now.Add(gap)
-	if s.done >= len(s.cfg.QPs) {
+	// З Converge автомат лишається зведеним: чи потрібен ще кадр, вирішить
+	// Due за виміряним QP (AU цього кадру ще може бути в конвеєрі MFT).
+	if s.done >= len(s.cfg.QPs) && !(s.cfg.Converge && s.converging()) {
 		s.armed = false
 	}
 }
@@ -124,7 +242,12 @@ func (s *State) NeedRestore() bool {
 
 // Complete — усі refine-кадри після останнього руху вже пішли: екран
 // нерухомий і дошліфований (тригер текстових тайлів, internal/tiles).
-func (s *State) Complete() bool { return s.done >= len(s.cfg.QPs) }
+func (s *State) Complete() bool {
+	return s.done >= len(s.cfg.QPs) && !(s.armed && s.converging())
+}
+
+// EpisodeBytes — байтів refine-кадрів після останнього руху / IDR.
+func (s *State) EpisodeBytes() int { return s.bytes }
 
 // Refining — чи пішов уже хоч один refine після останнього руху.
 func (s *State) Refining() bool { return s.done > 0 }

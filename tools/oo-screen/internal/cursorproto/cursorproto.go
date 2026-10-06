@@ -58,6 +58,12 @@ const (
 	Magic        byte = 'C'
 	KindPos      byte = 1
 	KindShape    byte = 2
+	// KindMode is the hub->agent grant (3 bytes: Magic,
+	// KindMode, 0|1). 1 = every viewer of the agent leg draws the cursor
+	// itself, so the agent may stop compositing it; 0 = composite again.
+	// Never relayed to viewers (Validate rejects it).
+	KindMode byte = 3
+	ModeSize      = 3
 
 	FormatRGBA byte = 0
 	FormatPNG  byte = 1
@@ -294,4 +300,21 @@ func ShapeID(w, h, hx, hy int, rgba []byte) uint32 {
 		id = 1
 	}
 	return id
+}
+
+// EncodeMode builds the hub->agent cursor-layer grant.
+func EncodeMode(on bool) []byte {
+	b := []byte{Magic, KindMode, 0}
+	if on {
+		b[2] = 1
+	}
+	return b
+}
+
+// DecodeMode parses a grant; ok=false for anything that is not exactly one.
+func DecodeMode(b []byte) (on, ok bool) {
+	if len(b) != ModeSize || b[0] != Magic || b[1] != KindMode || b[2] > 1 {
+		return false, false
+	}
+	return b[2] == 1, true
 }

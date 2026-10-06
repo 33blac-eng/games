@@ -208,3 +208,69 @@ func TestViewerTicketRoutingFailClosed(t *testing.T) {
 		t.Fatalf("viewer to nodeA (publisher present) rejected by node-binding: got %d, want to pass to SDP stage", code)
 	}
 }
+
+// TestApplyRevokeC5 — три форми запису черги відкликань (контракт C5) на двох
+// нодах, де дивляться u1 і u2. node_user рве лише u1 на A; user — u1 скрізь;
+// node — усю ноду A (і прибирає її з реєстру).
+func TestApplyRevokeC5(t *testing.T) {
+	type legs struct{ a1, a2, b1 *viewerLeg }
+	setup := func(t *testing.T) (nsA, nsB *nodeSession, l legs) {
+		nsA, nsB = reg.getOrCreate("c5-A"), reg.getOrCreate("c5-B")
+		t.Cleanup(func() { reg.remove("c5-A", nsA); reg.remove("c5-B", nsB) })
+		add := func(ns *nodeSession, user string) *viewerLeg {
+			vl := addViewer(ns, newPC(t), newViewerTrack(t), user)
+			t.Cleanup(func() { removeViewer(ns, vl) })
+			return vl
+		}
+		return nsA, nsB, legs{add(nsA, "u1"), add(nsA, "u2"), add(nsB, "u1")}
+	}
+	alive := func(ns *nodeSession, vl *viewerLeg) bool {
+		ns.mu.Lock()
+		defer ns.mu.Unlock()
+		return ns.viewers[vl.pc] == vl
+	}
+
+	t.Run("node_user", func(t *testing.T) {
+		nsA, nsB, l := setup(t)
+		applyRevoke(hub.RevokeKindNodeUser, hub.JoinNodeUser("c5-A", "u1"))
+		if alive(nsA, l.a1) {
+			t.Error("u1 на A не обірвано")
+		}
+		if !alive(nsA, l.a2) {
+			t.Error("u2 на A обірвано — node_user мав зачепити лише u1")
+		}
+		if !alive(nsB, l.b1) {
+			t.Error("u1 на B обірвано — node_user мав зачепити лише ноду A")
+		}
+		if reg.get("c5-A") != nsA {
+			t.Error("нода A зникла з реєстру — node_user не має класти ноду")
+		}
+	})
+
+	t.Run("user", func(t *testing.T) {
+		nsA, nsB, l := setup(t)
+		applyRevoke("user", "u1")
+		if alive(nsA, l.a1) || alive(nsB, l.b1) {
+			t.Error("u1 лишився хоч на одній ноді")
+		}
+		if !alive(nsA, l.a2) {
+			t.Error("u2 обірвано відкликанням u1")
+		}
+	})
+
+	t.Run("node", func(t *testing.T) {
+		_, nsB, l := setup(t)
+		applyRevoke("node", "c5-A")
+		if reg.get("c5-A") != nil {
+			t.Error("нода A лишилась у реєстрі")
+		}
+		for _, vl := range []*viewerLeg{l.a1, l.a2} {
+			if st := vl.pc.ConnectionState(); st != webrtc.PeerConnectionStateClosed {
+				t.Errorf("нога ноди A у стані %s, want closed", st)
+			}
+		}
+		if !alive(nsB, l.b1) || l.b1.pc.ConnectionState() == webrtc.PeerConnectionStateClosed {
+			t.Error("нода B зачеплена відкликанням ноди A")
+		}
+	})
+}

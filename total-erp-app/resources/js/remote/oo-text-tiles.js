@@ -270,8 +270,13 @@ export function createTileOverlay(o) {
         canvas,
         state,
         // place — той самий бокс, що syncGeometry ставить <video>.
-        place(left, top, width, height) {
+        // rendering (PLAYER-QUALITY P-3) — image-rendering відео: тайли мусять
+        // масштабуватись тим самим фільтром, що й кадр під ними.
+        place(left, top, width, height, rendering) {
             box = { left, top, width, height };
+            if (typeof rendering === 'string' && canvas.style.imageRendering !== rendering) {
+                canvas.style.imageRendering = rendering;
+            }
             layout();
         },
         // presentedFrames — з метаданих requestVideoFrameCallback (може

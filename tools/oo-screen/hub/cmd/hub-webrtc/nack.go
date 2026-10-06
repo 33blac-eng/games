@@ -25,10 +25,18 @@
 // жодної статистики — на промах він просто мовчки нічого не пише
 // (pkg/nack/responder_interceptor.go, resendPackets). Зате УМОВА, за якої він
 // віддасть пакет, детермінована й повністю відома: rtpbuffer.Get віддає seq
-// тоді й лише тоді, коли highestAdded-seq < size (internal/rtpbuffer). А
-// egress-нумерація хаба суцільна — кожен живий глядач отримує КОЖЕН пакет, а
-// хто не встигає, того рвуть цілком (dropViewer). Тому «лежить у буфері» ==
-// «потрапляє у вікно»: це не оцінка, а перерахунок тієї самої умови.
+// тоді й лише тоді, коли highestAdded-seq < size (internal/rtpbuffer). Для
+// ноги, що отримує кожен пакет суцільної egress-нумерації хаба, «лежить у
+// буфері» == «потрапляє у вікно»: це не оцінка, а перерахунок тієї самої умови.
+//
+// Межа цієї рівності: нога в drop-to-IDR (vl.discarding, H-12) і прихована
+// нога (F-39) пакети пропускають, і в кільці pion на їхньому місці дірки. NACK
+// на такий seq тут зарахується «задоволеним», хоча віддати нічого, — частка
+// завищена рівно на цьому розриві. Свідомо не виправляємо: точку входу для
+// декодера там уже дано й без NACK — на вході в drop-to-IDR forwardToViewers
+// замовляє keyframe, а на поверненні прихованої ноги setViewerHidden віддає їй
+// кеш GOP або теж замовляє keyframe. PLI звідси нічого б не додав; ціна —
+// пропущена ескалація саме тоді, коли вона й не потрібна.
 //
 // ЧОГО ЗРОБИТИ НЕ МОЖНА, і це чесна межа: вимкнути NACK для ОДНІЄЇ ноги В
 // РАНТАЙМІ. Ланцюг interceptor-ів фіксується при створенні PeerConnection, а
@@ -47,13 +55,14 @@ import (
 	"github.com/pion/rtcp"
 )
 
-const (
-	// nackBufferSize — розмір кільця ретрансмісії pion. 1024 — дефолт
-	// ResponderInterceptor, і RegisterDefaultInterceptors його не переозначає
-	// (webrtc/interceptor.go передає лише loggerFactory). Пакет, старший за це
-	// вікно, responder віддати НЕ може — цим і визначається «задоволено».
-	nackBufferSize = 1024
+// nackBufferSize — розмір кільця ретрансмісії. 1024 — дефолт pion
+// ResponderInterceptor (RegisterDefaultInterceptors його не переозначає) і
+// власного responder-а (nackresp.go); з OO_SCREEN_NACK_WINDOW — розмір кілець
+// ніг за бітрейтом (Q-12, до 8192). Пакет, старший за це вікно, responder
+// віддати НЕ може — цим і визначається «задоволено».
+var nackBufferSize = nackRingSlots
 
+const (
 	nackWindow     = 2 * time.Second // вікно, за яким рахуємо частку
 	nackMinSamples = 16              // менше запитів у вікні — статистики немає, не судимо
 	nackGoodRatio  = 0.5             // < 50% задоволених -> NACK більше не рятує
@@ -77,7 +86,7 @@ const (
 // nackRecoverable — точна умова pion rtpbuffer.Get: пакет ще в кільці, якщо
 // відстань від найновішого записаного seq менша за вікно. Арифметика uint16
 // сама відкидає «seq з майбутнього» (різниця обгортається у величезне число),
-// тож окремої перевірки половини діапазону не треба: window <= 1024 << 32768.
+// тож окремої перевірки половини діапазону не треба: window <= 8192 << 32768.
 func nackRecoverable(highest, seq, window uint16) bool {
 	return highest-seq < window
 }
@@ -86,10 +95,10 @@ func nackRecoverable(highest, seq, window uint16) bool {
 // кільця, старіших пакетів у ньому просто немає (нога підключилась посеред
 // потоку), і рахувати їх задоволеними означало б завищити частку.
 func nackWindowFor(sent uint64) uint16 {
-	if sent < nackBufferSize {
+	if sent < uint64(nackBufferSize) {
 		return uint16(sent)
 	}
-	return nackBufferSize
+	return uint16(nackBufferSize)
 }
 
 // nackStats — підсумок ОДНОГО закритого вікна: скільки seq запитано, скільки з
@@ -114,7 +123,12 @@ func onNack(ns *nodeSession, vl *viewerLeg, n *rtcp.TransportLayerNack, now time
 		return nackStats{}
 	}
 	highest := uint16(atomic.LoadUint32(&vl.lastSeq))
-	window := nackWindowFor(sent)
+	if h, ok := fecHighestSeq(n.MediaSSRC); ok {
+		highest = h // FEC (fec.go) зсунув вихідні seq уперед
+	}
+	// Вікно — у тому ж просторі seq, що й highest: з FEC буфер responder-а
+	// тримає і медіа, і FEC, тож міряємо вихідним лічильником, не vl.sent.
+	window := nackWindowFor(legOutSent(vl, n.MediaSSRC))
 
 	var req, hit uint64
 	var seqs []uint16
@@ -134,7 +148,11 @@ func onNack(ns *nodeSession, vl *viewerLeg, n *rtcp.TransportLayerNack, now time
 
 	ns.mu.Lock()
 	defer ns.mu.Unlock()
-	vl.noteNackSeqs(seqs) // B4: втрати до ретрансмісії (legCongestion)
+	// P1: NACK під час проби — наслідок нашого ж навантаження (probe.go); у
+	// preLoss B4 він не йде, інакше невдала проба різала б ціль відео.
+	if !vl.noteProbeNack(len(seqs), now) {
+		vl.noteNackSeqs(seqs) // B4: втрати до ретрансмісії (legCongestion)
+	}
 	if vl.nackWinAt.IsZero() {
 		vl.nackWinAt = now
 	}

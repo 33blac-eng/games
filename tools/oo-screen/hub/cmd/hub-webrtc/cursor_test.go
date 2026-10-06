@@ -233,7 +233,7 @@ func TestCursorRelayEndToEnd(t *testing.T) {
 	}
 	// Let the shape land in the relay before the viewer joins.
 	r := relayFor(ns, cursorRelayConfig())
-	if !waitFor(5*time.Second, func() bool {
+	if !waitForD(5*time.Second, func() bool {
 		r.mu.Lock()
 		defer r.mu.Unlock()
 		return r.sticky[cursorproto.KindShape] != nil
@@ -356,11 +356,11 @@ func TestCursorRelayClearsOnAgentClose(t *testing.T) {
 	}
 	rr := relayFor(ns, cursorRelayConfig())
 	sticky := func() int { rr.mu.Lock(); defer rr.mu.Unlock(); return len(rr.sticky) }
-	if !waitFor(5*time.Second, func() bool { return sticky() == 1 }) {
+	if !waitForD(5*time.Second, func() bool { return sticky() == 1 }) {
 		t.Fatal("shape never reached relay")
 	}
 	_ = adc.Close()
-	if !waitFor(10*time.Second, func() bool { return sticky() == 0 }) {
+	if !waitForD(10*time.Second, func() bool { return sticky() == 0 }) {
 		t.Fatal("relay kept the shape after the agent channel closed")
 	}
 

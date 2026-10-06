@@ -30,7 +30,7 @@ func TestSessionCapDropsForgottenViewer(t *testing.T) {
 
 	go watchSessionCap(ns, vl, sessionCap)
 
-	deadline := time.After(3 * time.Second)
+	deadline := time.After(eventGuard)
 	for {
 		ns.mu.Lock()
 		n := len(ns.viewers)
@@ -75,7 +75,7 @@ func TestSessionCapSilentWhenViewerLeavesEarly(t *testing.T) {
 
 	select {
 	case <-returned:
-	case <-time.After(time.Second):
+	case <-time.After(eventGuard):
 		t.Fatal("сторож не вийшов після зняття ноги — лишилась горутина до самої стелі")
 	}
 	ns.mu.Lock()
@@ -100,7 +100,7 @@ func TestSessionCapZeroDisables(t *testing.T) {
 	go func() { watchSessionCap(ns, vl, sessionCap); close(returned) }()
 	select {
 	case <-returned:
-	case <-time.After(time.Second):
+	case <-time.After(eventGuard):
 		t.Fatal("з вимкненою стелею сторож не вийшов — лишилась горутина")
 	}
 }
@@ -142,7 +142,7 @@ func TestAddViewerArmsSessionCap(t *testing.T) {
 	ns := &nodeSession{nodeID: "node-armed"}
 	addViewer(ns, pc, trk, "user-1")
 
-	deadline := time.After(3 * time.Second)
+	deadline := time.After(eventGuard)
 	for {
 		ns.mu.Lock()
 		n := len(ns.viewers)

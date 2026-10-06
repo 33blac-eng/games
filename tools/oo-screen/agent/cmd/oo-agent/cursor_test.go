@@ -41,3 +41,32 @@ func TestOutputRectCache(t *testing.T) {
 		t.Fatal("failed query must yield")
 	}
 }
+
+// F9 дефолт ON + вимикачі: без прапорця шар дозволено; env
+// OO_SCREEN_CURSOR_LAYER=0 вимикає; явний прапорець перекриває env.
+func TestResolveCursorLayerDefaultOn(t *testing.T) {
+	env := func(v string) func(string) string {
+		return func(k string) string {
+			if k == "OO_SCREEN_CURSOR_LAYER" {
+				return v
+			}
+			return ""
+		}
+	}
+	cases := []struct {
+		set, val bool
+		env      string
+		want     bool
+	}{
+		{false, false, "", true},
+		{false, false, "1", true},
+		{false, false, "0", false},
+		{true, false, "", false},
+		{true, true, "0", true},
+	}
+	for _, c := range cases {
+		if got := resolveCursorLayer(c.set, c.val, env(c.env)); got != c.want {
+			t.Errorf("set=%v val=%v env=%q: got %v want %v", c.set, c.val, c.env, got, c.want)
+		}
+	}
+}

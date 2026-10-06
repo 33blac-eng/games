@@ -1,10 +1,13 @@
 package hub
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"log"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -123,6 +126,10 @@ func TestSubscribeRevoke_UserKind(t *testing.T) {
 
 // TestSubscribeRevoke_HTTPErrorDoesNotKillLoop — ERP-стаб завжди 500;
 // поллінг має продовжувати без паніки/зависання (fail-soft).
+//
+// Чекаємо ПОДІЮ (другий запит), а не фіксований сон: під -race на Windows
+// таймер тікає по ~15,6 мс, і 60 мс сну давали лише один запит при справному
+// коді. Лічильник atomic — обробник httptest біжить у своїй горутині.
 func TestSubscribeRevoke_HTTPErrorDoesNotKillLoop(t *testing.T) {
 	// Лічильник атомарний: handler живе в горутинах httptest-сервера, а тест
 	// читає його зі своєї. Замість сну на «мабуть устигне» — чекаємо події:
@@ -151,6 +158,43 @@ func TestSubscribeRevoke_HTTPErrorDoesNotKillLoop(t *testing.T) {
 	}
 	cancel()
 	<-stopped
+}
+
+// C5: запис черги відкликань розбирається в один із трьох наказів. Обидва поля
+// — лише «ця людина на цьому ПК» (node_user), а не вся нода: старий розбір
+// кликав тут "node" і клав агента разом з усіма глядачами.
+func TestPollRevocationsOnce_KindByFields(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		entry revocationEntry
+		want  string
+	}{
+		{"both", revocationEntry{NodeID: "node//pc1", UserID: "7"}, RevokeKindNodeUser + ":" + JoinNodeUser("node//pc1", "7")},
+		{"node only", revocationEntry{NodeID: "node//pc1"}, "node:node//pc1"},
+		{"user only", revocationEntry{UserID: "7"}, "user:7"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			tc.entry.At = 1756500000001
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				_ = json.NewEncoder(w).Encode([]revocationEntry{tc.entry})
+			}))
+			defer srv.Close()
+
+			var calls []string
+			next, ok := pollRevocationsOnce(context.Background(), srv.Client(), srv.URL, "k", 1756500000000, func(kind, val string) {
+				calls = append(calls, kind+":"+val)
+			})
+			if !ok || next != tc.entry.At {
+				t.Fatalf("ok=%v next=%d, want true/%d", ok, next, tc.entry.At)
+			}
+			if len(calls) != 1 || calls[0] != tc.want {
+				t.Fatalf("onRevoke calls = %q, want [%q]", calls, tc.want)
+			}
+		})
+	}
+	if n, u := SplitNodeUser(JoinNodeUser("node//a/b", "42")); n != "node//a/b" || u != "42" {
+		t.Errorf("SplitNodeUser(JoinNodeUser) = %q,%q", n, u)
+	}
 }
 
 // ── staleGate: «м'яко спочатку, твердо згодом» ──────────────────────────────
@@ -296,6 +340,37 @@ func TestStaleAfterFromEnv(t *testing.T) {
 		t.Setenv(envStaleAfter, tc.env)
 		if got := staleAfterFromEnv(); got != tc.want {
 			t.Errorf("%s=%q -> %s, треба %s", envStaleAfter, tc.env, got, tc.want)
+		}
+	}
+}
+
+// TestPollRevocationsOnce_ErrorBodyTruncatedInLog — R6-G6: ERP на збої віддає
+// сторінку помилки, і рядок журналу пишеться на КОЖНОМУ тіку (раз на 3 с), поки
+// збій триває. У журнал — лише truncBody, а не до 1 МБ. Постав string(body)
+// назад — рядок вилізе за межу.
+func TestPollRevocationsOnce_ErrorBodyTruncatedInLog(t *testing.T) {
+	page := strings.Repeat("<div>Whoops</div>", 4096) // ~68 КБ
+	var buf bytes.Buffer
+	prev, prevFlags := log.Writer(), log.Flags()
+	log.SetOutput(&buf)
+	t.Cleanup(func() { log.SetOutput(prev); log.SetFlags(prevFlags) })
+
+	for _, c := range []struct {
+		status int
+		body   string
+	}{{http.StatusInternalServerError, page}, {http.StatusOK, page}} {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(c.status)
+			_, _ = w.Write([]byte(c.body))
+		}))
+		buf.Reset()
+		_, ok := pollRevocationsOnce(context.Background(), srv.Client(), srv.URL, "k", 1, func(string, string) {})
+		srv.Close()
+		if ok {
+			t.Fatalf("status %d: опитування з кривою відповіддю позначене успішним", c.status)
+		}
+		if buf.Len() == 0 || buf.Len() > 1024 {
+			t.Fatalf("status %d: рядок журналу %d байт — тіло ERP не обрізане", c.status, buf.Len())
 		}
 	}
 }

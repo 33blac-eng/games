@@ -48,29 +48,27 @@ import (
 
 	"github.com/pion/webrtc/v4"
 
+	"github.com/organicoils/oo-screen/internal/bwe"
 	"github.com/organicoils/oo-screen/internal/control"
 )
 
+// minBitrateBps — нижня межа цілі. 0,5 Мбіт/с на екрані з текстом — це мило, а
+// не картинка (журнал ctl 17-24.09: ціль тричі сідала на 0,5). 1,5 Мбіт/с
+// тримає 1080p-текст читабельним; env-ручка — для каналу, який і цього не тягне.
+var minBitrateBps = envUint("OO_SCREEN_MIN_BITRATE", 1_500_000)
+
 const (
-	// minBitrateBps — нижня межа. 500k -> 300k (TZ-GENERAL, мобільні канали):
-	// на 3G/перевантаженому LTE реальна смуга буває 0.4-0.5 Мбіт/с, і підлога
-	// 500k тримала потік НАД каналом — постійні втрати замість чіткого, хай і
-	// грубішого, кадру. Агент і так клампить до своєї підлоги 300k
-	// (agentlogic.go minBitrateBps), тож це вирівнювання, а не новий режим.
-	// Пастки jitter-а («ціль до підлоги при чистому каналі») це не повертає:
-	// jitter у рішенні не бере участі, а глибина ходу визначається сигналами.
-	minBitrateBps = 300_000
-	lossHighFrac  = 0.02  // >2% втрат — ріжемо
-	lossLowFrac   = 0.005 // <=0.5% — чисто, кандидат на підйом
-	downFactor    = 0.7   // крок вниз
-	upFactor      = 1.05  // крок вгору
+	lossHighFrac = bwe.LossHighFrac // >2% втрат — ріжемо
+	lossLowFrac  = bwe.LossLowFrac  // <=0.5% — чисто, кандидат на підйом
+	downFactor   = bwe.DownFactor   // крок вниз
+	upFactor     = bwe.UpFactor     // крок вгору
 
 	// Асиметрія вниз/вгору. Симетричний дебаунс на типових для UDP коливаннях
 	// втрат 1-3% дає пилку: контролер хитається між 100% і 70% і безперервно
 	// смикає GOP. Тому вниз — швидко, вгору — повільно й лише після серії.
-	goodStreak    = 5 * time.Second  // скільки поспіль має бути чисто до підйому
-	downDebounce  = 2 * time.Second  // не частіше однієї зміни вниз
-	upDebounce    = 10 * time.Second // не частіше одного підйому
+	goodStreak    = bwe.GoodStreak   // скільки поспіль має бути чисто до підйому (5 с)
+	downDebounce  = bwe.DownDebounce // не частіше однієї зміни вниз (2 с)
+	upDebounce    = bwe.UpDebounce   // не частіше одного підйому (10 с)
 	keyframeDebnc = 500 * time.Millisecond
 
 	// H-26. Скільки стан адаптації лишається дійсним після того, як пішов
@@ -494,6 +492,29 @@ type bitrateCtl struct {
 	// textMode — ЗАГЛУШКА під контентно-залежну стелю (contentCeiling). Нічим не
 	// виставляється й у step() не входить; агента не чіпаємо.
 	textMode bool
+
+	// --- P1: проба смуги дублікатами (probe.go) ---
+	// probeOn — режим увімкнено (OO_SCREEN_PROBE=1, дефолт вимкнено);
+	// probing/probeBps — проба йде і на яку швидкість; probeFails — невдалих
+	// поспіль (менший крок і довша пауза); probeNextAt — раніше не пробуємо;
+	// probeMuteUntil — до цього моменту сигнали затору (втрати/RTT/B4) — це
+	// наслідок НАШОЇ проби, а не відео: зрізів по них не робимо.
+	probeOn        bool
+	probing        bool
+	probeBps       uint64
+	probeFails     int
+	probeLastOK    bool // остання проба вдалась (наступна ×2); скидає зріз
+	probeNextAt    time.Time
+	probeMuteUntil time.Time
+
+	// --- N3: детектор градієнта затримки (delaybwe.go) ---
+	// delayOverAt — останній підтверджений OVERUSE; нуль = не було (або
+	// прапорець OO_SCREEN_DELAYBWE вимкнено) — тоді поведінка рівно як до N3.
+	delayOverAt time.Time
+	// twccAt — останній TWCC-фідбек (withDelay). Нуль або давно — детектор
+	// чергу не бачить (Chrome без transport-cc, прапорець вимкнено), і
+	// проба поводиться рівно як до N4-фіксу (див. delayLive).
+	twccAt time.Time
 }
 
 // Ручки швидкого відновлення. Свідомо консервативні щодо задокументованих
@@ -662,17 +683,82 @@ func contentCeiling(textMode bool, targetBps, ceilBps uint64, fps int) contentDe
 	return d
 }
 
+// floor — нижня межа цілі ЦІЄЇ ноди: minBitrateBps, але не вища за стелю
+// агента (startBps). Агент із -bitrate нижче підлоги інакше діставав би на
+// ЗРІЗІ ціль, вищу за ту, що була: втрати «підіймали» бітрейт. Агент таку ціль
+// однаково клампить до своєї стелі (agentlogic.go clampBitrate — те саме
+// правило «стеля виграє»), а хаб вважав би, що вже стоїть на підлозі.
+func (c bitrateCtl) floor() uint64 {
+	if c.startBps > 0 && c.startBps < minBitrateBps {
+		return c.startBps
+	}
+	return minBitrateBps
+}
+
 func newBitrateCtl(startBps uint64) bitrateCtl {
-	return bitrateCtl{target: startBps, startBps: startBps, fastUp: fastRecoveryDefault}
+	return bitrateCtl{target: startBps, startBps: startBps, fastUp: fastRecoveryDefault, probeOn: probeEnabled}
 }
 
 // ceilingBps — стеля адаптації ЦІЄЇ ноди: фактичний стартовий бітрейт агента з
-// offer, а якщо агент його не прислав — спільний фолбек. Кликати під ns.mu.
+// offer, а якщо агент його не прислав — спільний фолбек; поверх — стеля «Якості»
+// з тулбара (capBps, C1), якщо глядач її поставив. Кликати під ns.mu.
 func (ns *nodeSession) ceilingBps() uint64 {
+	c := startBitrateBps
 	if ns.startBps > 0 {
-		return ns.startBps
+		c = ns.startBps
 	}
-	return startBitrateBps
+	if ns.capBps > 0 && ns.capBps < c {
+		c = ns.capBps
+	}
+	return c
+}
+
+// setBitrateCap — C1: «Якість» з тулбара стає стелею контролера ноди замість
+// стартового бітрейту; 0 = зняти (стеля агента). Нижче minBitrateBps стелю не
+// пускаємо — це та сама підлога, під якою текст стає милом.
+//
+// Ціль стрибає на нову стелю ОДРАЗУ, в обидва боки: людина свідомо обрала
+// якість і має побачити її за секунду, а не за хвилину повзання по +5% раз на
+// 10 с. Якщо канал її не тягне — перший же RR зі втратами зріже, як і завжди.
+// lastSent НЕ чіпаємо: це вибір людини, а не вивчена адаптація, і H-26 не має
+// тримати його за «свіжий стан шляху».
+func setBitrateCap(ns *nodeSession, capBps uint64) {
+	capBps = clampBitrateCap(capBps)
+	ns.mu.Lock()
+	ns.capBps = capBps
+	ceil := ns.ceilingBps()
+	ns.bitrate.startBps, ns.bitrate.target = ceil, ceil
+	ns.mu.Unlock()
+	log.Printf("bitrate cap [node=%s]: стеля %d біт/с (запит %d, 0 = без стелі)", ns.nodeID, ceil, capBps)
+	sendBitrateTarget(ns, ceil, 0, 0, 0, false)
+}
+
+// clampBitrateCap — стеля так, як її зберігає ns.capBps: 0 = без стелі, інакше
+// не нижче minBitrateBps. Одна функція і для запису, і для порівняння «та сама
+// стеля» в handleControl — інакше повтор 100 кбіт/с виглядав би новою стелею.
+func clampBitrateCap(capBps uint64) uint64 {
+	if capBps > 0 && capBps < minBitrateBps {
+		return minBitrateBps
+	}
+	return capBps
+}
+
+// clearViewerCapsLocked — останній глядач пішов: стелі тулбара (C1) належали
+// йому, наступний глядач починає зі стелі агента. Повертає, чи була стеля fps —
+// тоді її треба зняти й в агента (після ns.mu). Кликати під ns.mu.
+//
+// Під стелею тулбара контролер «вчився» не на шляху, а на виборі людини: ціль
+// 1,5M після її «Якості 1» з RR-кроком у останні 30 с resetBitrate (H-26)
+// вважав би свіжою адаптацією і віддав наступному глядачеві мило, яке той
+// не обирав. Тому стеля знімається разом зі станом, що під нею набувся.
+func clearViewerCapsLocked(ns *nodeSession) (hadFps bool) {
+	hadFps = ns.maxFps > 0
+	hadCap := ns.capBps > 0
+	ns.capBps, ns.maxFps = 0, 0
+	if hadCap {
+		ns.bitrate = newBitrateCtl(ns.ceilingBps())
+	}
+	return hadFps
 }
 
 // setStartBitrate фіксує стелю ноди за полем "bitrate" з offer агента і скидає
@@ -681,7 +767,7 @@ func (ns *nodeSession) ceilingBps() uint64 {
 func setStartBitrate(ns *nodeSession, bps uint64) {
 	ns.mu.Lock()
 	ns.startBps = bps
-	ns.bitrate = newBitrateCtl(bps)
+	ns.bitrate = newBitrateCtl(ns.ceilingBps()) // стеля тулбара переживає реконект агента
 	ns.mu.Unlock()
 }
 
@@ -796,6 +882,15 @@ func (c bitrateCtl) stepSig(lossFrac float64, rttExcess time.Duration, sig congS
 		c.lossyRuns = 0
 	}
 	cong, congF := congestion(qx, sig, lowRising || c.lossyRuns >= congRises)
+	if now.Before(c.probeMuteUntil) {
+		// Проба (probe.go) щойно сама переповнила чергу: втрати, NACK і приріст
+		// RTT у цьому вікні — наші, не відео. Різати по них = платити за пробу
+		// двічі. Підйом теж не пускаємо (див. гілку «чисто» — lossFrac/excess).
+		cong, rttRising, rttHigh = false, false, false
+		if lossFrac > lossHighFrac {
+			lossFrac = lossLowFrac + 0.001 // сіра зона: тримаємо ціль
+		}
+	}
 	if cong {
 		c.congAt = now
 	}
@@ -830,7 +925,7 @@ func (c bitrateCtl) stepSig(lossFrac float64, rttExcess time.Duration, sig congS
 	// повзла назад до стелі просто тому, що втрат немає, хоч черга стояла на
 	// місці (заміряно на ramp5 і depth). Поріг звільнення rttUpClear свідомо
 	// нижчий за поріг зрізу — див. його коментар про пилку.
-	case lossFrac <= lossLowFrac && excess < rttUpClear && !queueLossy:
+	case lossFrac <= lossLowFrac && excess < rttUpClear && !queueLossy && !c.delayHeld(now):
 		if c.goodSince.IsZero() {
 			c.goodSince = now
 		}
@@ -868,8 +963,9 @@ func (c bitrateCtl) stepSig(lossFrac float64, rttExcess time.Duration, sig congS
 		c.cleanSince = time.Time{}
 	}
 
-	if next < minBitrateBps {
-		next = minBitrateBps
+	floor := c.floor()
+	if next < floor {
+		next = floor
 	}
 	if next > c.startBps {
 		next = c.startBps
@@ -881,8 +977,8 @@ func (c bitrateCtl) stepSig(lossFrac float64, rttExcess time.Duration, sig congS
 	if c.remb > 0 && next > c.remb {
 		next = c.remb
 	}
-	if next < minBitrateBps {
-		next = minBitrateBps
+	if next < floor {
+		next = floor
 	}
 	// B5: затор одразу після підйому — винен підйом. Відступаємо на рівень ДО
 	// нього (якщо це не мілкіше за вже вирахуваний зріз) і рахуємо невдалу пробу.
@@ -891,8 +987,8 @@ func (c bitrateCtl) stepSig(lossFrac float64, rttExcess time.Duration, sig congS
 		!c.lastUpAt.IsZero() && now.Sub(c.lastUpAt) < probeWindow
 	if backoff && c.probeFrom < next {
 		next = c.probeFrom
-		if next < minBitrateBps {
-			next = minBitrateBps
+		if next < floor {
+			next = floor
 		}
 	}
 	if next == c.target {
@@ -934,6 +1030,7 @@ func (c bitrateCtl) stepSig(lossFrac float64, rttExcess time.Duration, sig congS
 		}
 	} else if next < c.target {
 		c.upRun = 0
+		c.probeLastOK = false
 		c.cutFrom = c.target // рівень, де був затор: межа швидкого режиму
 		c.probeLvl = c.target
 		// Перший зріз епізоду: наступні в межах congRebaseAfter вікно не
@@ -988,8 +1085,8 @@ func (c bitrateCtl) withRemb(bps uint64, now time.Time) (bitrateCtl, bool) {
 	}
 	c.remb = bps
 	next := bps
-	if next < minBitrateBps {
-		next = minBitrateBps
+	if f := c.floor(); next < f {
+		next = f
 	}
 	if next >= c.target {
 		return c, false
@@ -1049,6 +1146,7 @@ func onReceiverReportSig(ns *nodeSession, lossFrac float64, jitterTicks uint32, 
 	ns.mu.Unlock()
 	if !send {
 		tryVideoBoost(ns, now)
+		maybeProbe(ns, now)
 		return
 	}
 	sendBitrateTarget(ns, next.target, lossFrac*100, jitterTicks, rttExcess, false)

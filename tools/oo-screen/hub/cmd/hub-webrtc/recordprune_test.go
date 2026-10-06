@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
 	"time"
 )
@@ -35,7 +36,7 @@ func TestPruneByAge(t *testing.T) {
 	old := mkRec(t, dir, "old.mkv", recordMaxAge+time.Hour, 1024, now)
 	fresh := mkRec(t, dir, "fresh.mkv", time.Hour, 1024, now)
 
-	pruneRecordings(dir, now)
+	pruneRecordings(dir, now, recordMaxBytes)
 
 	if exists(old) {
 		t.Error("запис, старший за граничний вік, лишився")
@@ -52,7 +53,7 @@ func TestPruneAgeBoundaryKeeps(t *testing.T) {
 	now := time.Now()
 
 	edge := mkRec(t, dir, "edge.mkv", recordMaxAge-time.Minute, 1024, now)
-	pruneRecordings(dir, now)
+	pruneRecordings(dir, now, recordMaxBytes)
 
 	if !exists(edge) {
 		t.Error("файл на межі віку прибрали, хоча він ще не застарів")
@@ -60,20 +61,18 @@ func TestPruneAgeBoundaryKeeps(t *testing.T) {
 }
 
 // Той самий закон обсягу, але на дрібних числах: файли справжні, ліміт
-// підмінений на час тесту.
+// дрібний, переданий параметром.
 func TestPruneBySizeSmallLimit(t *testing.T) {
 	dir := t.TempDir()
 	now := time.Now()
 
-	prev := recordMaxBytesVar
-	defer func() { recordMaxBytesVar = prev }()
-	recordMaxBytesVar = 2500 // трохи більше за два файли по 1000
+	const limit = 2500 // трохи більше за два файли по 1000
 
 	oldest := mkRec(t, dir, "a.mkv", 3*time.Hour, 1000, now)
 	middle := mkRec(t, dir, "b.mkv", 2*time.Hour, 1000, now)
 	newest := mkRec(t, dir, "c.mkv", time.Hour, 1000, now)
 
-	pruneRecordings(dir, now)
+	pruneRecordings(dir, now, limit)
 
 	if exists(oldest) {
 		t.Error("найстаріший запис лишився, хоча архів перевищував стелю")
@@ -92,7 +91,7 @@ func TestPruneTouchesOnlyMkv(t *testing.T) {
 	foreign := mkRec(t, dir, "important.db", recordMaxAge+time.Hour, 1024, now)
 	mine := mkRec(t, dir, "mine.mkv", recordMaxAge+time.Hour, 1024, now)
 
-	pruneRecordings(dir, now)
+	pruneRecordings(dir, now, recordMaxBytes)
 
 	if !exists(foreign) {
 		t.Fatal("прибирання видалило ЧУЖИЙ файл — це вихід за межі своєї теки")
@@ -104,7 +103,7 @@ func TestPruneTouchesOnlyMkv(t *testing.T) {
 
 // Відсутня тека — нормальний стан до першого запису, не помилка й не паніка.
 func TestPruneMissingDirIsQuiet(t *testing.T) {
-	pruneRecordings(filepath.Join(t.TempDir(), "ще-нема"), time.Now())
+	pruneRecordings(filepath.Join(t.TempDir(), "ще-нема"), time.Now(), recordMaxBytes)
 }
 
 // recordingsFit на порожній теці дозволяє писати (на цій машині вільного
@@ -119,20 +118,33 @@ func TestRecordingsFitAllowsOnEmptyDir(t *testing.T) {
 	}
 }
 
+// TestRecordingsFitMeasuresFirstRecordingDir — R6-G6: на першому записі теки
+// recordings ще нема. recordingsFit мусить створити її ДО виміру, інакше
+// Statfs (diskfree_unix.go) падає і запобіжник місця мовчки пропускається.
+// Зніми MkdirAll у recordingsFit — теки після виклику не буде.
+func TestRecordingsFitMeasuresFirstRecordingDir(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "recordings")
+	recordingsFit(dir)
+	if fi, err := os.Stat(dir); err != nil || !fi.IsDir() {
+		t.Fatalf("тека першого запису не створена до виміру місця: %v", err)
+	}
+	if _, ok := diskFreeBytes(dir); !ok && runtime.GOOS == "linux" {
+		t.Fatal("на Linux вільне місце теки першого запису не виміряно")
+	}
+}
+
 func TestPruneRemovesManyOverLimit(t *testing.T) {
 	dir := t.TempDir()
 	now := time.Now()
 
-	prev := recordMaxBytesVar
-	defer func() { recordMaxBytesVar = prev }()
-	recordMaxBytesVar = 3000
+	const limit = 3000
 
 	var paths []string
 	for i := 0; i < 10; i++ {
 		paths = append(paths, mkRec(t, dir, fmt.Sprintf("r%02d.mkv", i), time.Duration(10-i)*time.Hour, 1000, now))
 	}
 
-	pruneRecordings(dir, now)
+	pruneRecordings(dir, now, limit)
 
 	var left int
 	for _, p := range paths {

@@ -13,6 +13,7 @@ import (
 var (
 	ErrNoHardware = errors.New("encode: hardware H.264 MFT requires Windows")
 	ErrClosed     = errors.New("encode: closed")
+	ErrWedged     = errors.New("encode: encoder wedged, rebuild required")
 )
 
 type Config struct {
@@ -25,6 +26,7 @@ type Config struct {
 	SrcWidth      int
 	SrcHeight     int
 	ForceSoftware bool
+	IntraRefresh  int
 }
 
 type Frame struct {
@@ -59,4 +61,7 @@ func (e *Encoder) ForceIDR() error            { return ErrNoHardware }
 func (e *Encoder) SetBitrate(int) error       { return ErrNoHardware }
 func (e *Encoder) SetRefineQP(int) error      { return ErrNoHardware }
 func (e *Encoder) Flush() error               { return ErrNoHardware }
+func (e *Encoder) SetQPBounds(int, int) error { return ErrNoHardware }
+func (e *Encoder) IntraRefresh() bool         { return false }
+func (e *Encoder) CodecAPICaps() string       { return "" }
 func (e *Encoder) Close() error               { return nil }

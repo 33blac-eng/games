@@ -9,7 +9,7 @@ package main
 //
 // Три рубежі, від найдешевшого до найгрубішого:
 //  1. вік — старші за recordMaxAge зникають;
-//  2. обсяг — усе, що понад recordMaxBytesVar, зрізається з найстарішого;
+//  2. обсяг — усе, що понад recordMaxBytes, зрізається з найстарішого;
 //  3. вільне місце — якщо після (1) і (2) на розділі лишилось менше за
 //     recordMinFree, НОВИЙ запис просто не починається.
 //
@@ -23,6 +23,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"sync/atomic"
 	"time"
 )
 
@@ -33,7 +34,7 @@ const (
 	// сутністю, яку треба адмініструвати.
 	recordMaxAge = 14 * 24 * time.Hour
 
-	// Стеля всього архіву (recordMaxBytesVar нижче) — 8 ГБ проти 21 ГБ вільних на
+	// recordMaxBytes — стеля всього архіву: 8 ГБ проти 21 ГБ вільних на
 	// момент увімкнення: беремо помітно менше за вільне, щоб ліміт спрацював
 	// РАНІШЕ, ніж диск стане проблемою для сусідніх служб.
 	//
@@ -41,6 +42,7 @@ const (
 	// H.264 без перекодування — сотні мегабайтів, не гігабайти. 8 ГБ — це
 	// приблизно 20 годин запису, тобто тижні реального ужитку при 3-5
 	// сеансах на день.
+	recordMaxBytes int64 = 8 << 30
 
 	// recordMinFree — нижче цього новий запис не починається взагалі.
 	// Не нуль і не «скільки треба цьому файлу»: 5 ГБ лишаються сусідам
@@ -51,18 +53,30 @@ const (
 // recordMaxBytesVar — стеля всього архіву, змінна (не const) з тієї ж
 // причини, що й прапорці фіч: тест підміняє її дрібним числом і перевіряє
 // закон на справжніх файлах, замість писати на диск вісім гігабайтів.
-var recordMaxBytesVar int64 = 8 << 30
+var recordMaxBytesVar int64 = recordMaxBytes
+
+// recordMaxAgeVar — фактична межа віку (S5: OO_SCREEN_RECORD_MAX_AGE), типово
+// recordMaxAge. Атомарна: читає фонова горутина прибирання.
+var recordMaxAgeVar atomic.Int64
+
+func init() { recordMaxAgeVar.Store(int64(recordMaxAge)) }
 
 // recordingsFit прибирає застаріле й зайве, а тоді каже, чи можна починати
 // новий запис. false = місця немає; викликач мусить не починати.
 //
-// Помилки читання теки НЕ фатальні для прибирання, але фатальні для дозволу:
-// не зміг подивитись — не пиши. «Не виміряв» не те саме, що «вільно».
+// Теку створюємо ДО виміру: на першому записі її ще нема (open() створив би
+// її вже після дозволу), а Statfs на неіснуючому шляху падає — і запобіжник
+// місця мовчки пропускався б саме на першому записі. Не створилась — не пиши:
+// open() однаково не мав би куди.
 func recordingsFit(dir string) bool {
 	// H-21: прунінг ходить по диску (stat кожного файлу) — не в OnTrack, де
 	// він затримував перший кадр. Місце перевіряємо одразу, чистимо у фоні.
-	go pruneRecordings(dir, time.Now())
+	go pruneRecordings(dir, time.Now(), recordMaxBytesVar)
 
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		log.Printf("record: НЕ починаю запис — каталог %s не створився: %v", dir, err)
+		return false
+	}
 	free, ok := diskFreeBytes(dir)
 	if !ok {
 		// Платформа, де ми не вміємо питати про вільне місце (див.
@@ -80,11 +94,13 @@ func recordingsFit(dir string) bool {
 }
 
 // pruneRecordings видаляє записи, старші за recordMaxAge, а потім — найстаріші
-// з тих, що лишились, поки сумарний обсяг не влізе в recordMaxBytesVar.
+// з тих, що лишились, поки сумарний обсяг не влізе в maxBytes.
 //
 // now параметром, а не time.Now() всередині: інакше правило про вік неможливо
-// перевірити тестом, не чекаючи два тижні.
-func pruneRecordings(dir string, now time.Time) {
+// перевірити тестом, не чекаючи два тижні. maxBytes параметром, а не спільна
+// змінна: тест перевіряє закон на дрібному числі й справжніх файлах, а фоновий
+// прунінг (recordingsFit) іншого тесту в цей час читає своє — гонки нема.
+func pruneRecordings(dir string, now time.Time, maxBytes int64) {
 	entries, err := os.ReadDir(dir)
 	if err != nil {
 		// Теки ще нема — це нормальний стан до першого запису.
@@ -101,7 +117,7 @@ func pruneRecordings(dir string, now time.Time) {
 	}
 	var files []rec
 	for _, e := range entries {
-		if e.IsDir() || filepath.Ext(e.Name()) != ".mkv" {
+		if e.IsDir() || !isRecordingFile(e.Name()) {
 			continue
 		}
 		fi, err := e.Info()
@@ -113,10 +129,11 @@ func pruneRecordings(dir string, now time.Time) {
 
 	sort.Slice(files, func(i, j int) bool { return files[i].mod.Before(files[j].mod) })
 
+	maxAge := time.Duration(recordMaxAgeVar.Load())
 	var total int64
 	kept := files[:0]
 	for _, f := range files {
-		if now.Sub(f.mod) > recordMaxAge {
+		if now.Sub(f.mod) > maxAge {
 			if err := os.Remove(f.path); err != nil {
 				log.Printf("record: не зміг прибрати старий %s: %v", f.path, err)
 				continue
@@ -130,7 +147,7 @@ func pruneRecordings(dir string, now time.Time) {
 
 	// Найстаріші йдуть першими: kept уже відсортований за часом.
 	for _, f := range kept {
-		if total <= recordMaxBytesVar {
+		if total <= maxBytes {
 			break
 		}
 		if err := os.Remove(f.path); err != nil {

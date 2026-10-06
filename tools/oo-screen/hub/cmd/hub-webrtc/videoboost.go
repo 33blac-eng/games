@@ -1,11 +1,8 @@
 package main
 
 import (
-	"encoding/json"
 	"log"
 	"time"
-
-	"github.com/organicoils/oo-screen/internal/control"
 )
 
 // Режим «Відео» (агент -video-mode, internal/contentmode): агент шле
@@ -84,16 +81,4 @@ func tryVideoBoost(ns *nodeSession, now time.Time) {
 	}
 	log.Printf("content_mode [node=%s]: video boost %d -> %d bps (ceiling %d)", ns.nodeID, prev, next.target, next.startBps)
 	sendBitrateTarget(ns, next.target, 0, 0, 0, false)
-}
-
-// handleAgentCtl — повідомлення агента в oosc-ctl. Зараз розуміємо лише
-// content_mode; решту (і сміття) ігноруємо — форвардна сумісність.
-func handleAgentCtl(ns *nodeSession, data []byte, now time.Time) {
-	var m control.Msg
-	if err := json.Unmarshal(data, &m); err != nil || m.V != control.Version {
-		return
-	}
-	if m.Type == control.TypeContentMode {
-		onContentMode(ns, m.Mode, now)
-	}
 }

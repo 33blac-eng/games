@@ -421,6 +421,23 @@ static HRESULT open_client(oos_audio *audio, int *status,
     (void)converted_len;
     hr = IAudioClient_Initialize(client, AUDCLNT_SHAREMODE_SHARED, flags,
                                  0, 0, (WAVEFORMATEX *)converted, NULL);
+    if (FAILED(hr) && mix->nSamplesPerSec != 48000 &&
+        sizeof(WAVEFORMATEX) + mix->cbSize <= sizeof(converted)) {
+        /* Windows 7: no AUTOCONVERTPCM, a 48 kHz request on a 44.1 kHz device
+         * is AUDCLNT_E_UNSUPPORTED_FORMAT. Capture the device's own mix format;
+         * the Go side resamples to 48 kHz (agent wrapResample). */
+        uint32_t keep_rate = mix->nSamplesPerSec;
+        IAudioClient_Release(client);
+        client = NULL;
+        hr = IMMDevice_Activate(device, &oos_iid_audio_client, CLSCTX_ALL, NULL, (void **)&client);
+        if (SUCCEEDED(hr)) {
+            memcpy(converted, mix, sizeof(WAVEFORMATEX) + mix->cbSize);
+            hr = IAudioClient_Initialize(client, AUDCLNT_SHAREMODE_SHARED,
+                                         AUDCLNT_STREAMFLAGS_LOOPBACK | AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
+                                         0, 0, (WAVEFORMATEX *)converted, NULL);
+            if (SUCCEEDED(hr)) format.sample_rate = keep_rate;
+        }
+    }
     if (FAILED(hr)) {
         hresult_text(err, err_len, "IAudioClient::Initialize(loopback 48kHz)", hr);
         goto done;

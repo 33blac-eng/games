@@ -1,8 +1,10 @@
-// Package control реалізує версійований line-delimited JSON control-протокол,
-// спільний для двох ніг кандидата B: agent<->hub (raw QUIC, перший стрім
-// з'єднання) і browser<->hub (WebTransport bidi-стрім). Hub — авторитетний
-// транслятор між ними: control-повідомлення самі по собі МІЖ агентом і
-// браузером напряму не ходять.
+// Package control реалізує версійований line-delimited JSON control-протокол.
+// Ним ходить прод-нога кандидата A — DataChannel "oosc-ctl" agent<->hub
+// (heartbeat, keyframe_request, bitrate_target, max_fps, select_output,
+// fallback_reason, shutdown) — і обидві ноги легасі-кандидата B: agent<->hub
+// (raw QUIC, перший стрім з'єднання) і browser<->hub (WebTransport
+// bidi-стрім). Hub — авторитетний транслятор між ними: control-повідомлення
+// самі по собі МІЖ агентом і браузером напряму не ходять.
 //
 // Framing: один JSON-об'єкт на рядок, термінований '\n'. Кожне повідомлення
 // несе "v" (версія протоколу) і "type". Невідома версія — фатальна помилка
@@ -51,6 +53,7 @@ const (
 	TypeHeartbeat       = "heartbeat"
 	TypeBitrateTarget   = "bitrate_target"
 	TypeSelectOutput    = "select_output"
+	TypeMaxFps          = "max_fps"
 	TypeFallbackReason  = "fallback_reason"
 	TypeShutdown        = "shutdown"
 	TypeAck             = "ack"
@@ -58,6 +61,10 @@ const (
 	// "text", "normal"). У "video" hub може підняти ціль бітрейту, але лише в
 	// межах власної стелі ноди і поки мережа чиста (hub/cmd/hub-webrtc).
 	TypeContentMode = "content_mode"
+	// TypeEncStats — агент -> hub (C2, OO_SCREEN_ENC_TELEMETRY): ім'я MFT,
+	// звіт CODECAPI-властивостей (EncCaps, ParseEncCaps) і QP кадрів з потоку
+	// за вікно (QPLast/QPMin/QPMax; 0 — невідомо). Лише телеметрія.
+	TypeEncStats = "enc_stats"
 )
 
 var knownTypes = map[string]bool{
@@ -68,10 +75,12 @@ var knownTypes = map[string]bool{
 	TypeHeartbeat:       true,
 	TypeBitrateTarget:   true,
 	TypeSelectOutput:    true,
+	TypeMaxFps:          true,
 	TypeFallbackReason:  true,
 	TypeShutdown:        true,
 	TypeAck:             true,
 	TypeContentMode:     true,
+	TypeEncStats:        true,
 }
 
 // IsKnownType повідомляє, чи цей пакет розпізнає даний тип повідомлення.
@@ -94,8 +103,20 @@ type Msg struct {
 	// свідомо, а не випадково — окремого «не задано» цьому типу не потрібно:
 	// сам type і є наміром, а індекс без значення = основний вихід.
 	Output int `json:"output,omitempty"`
+	// Fps — стеля кадрів/с для max_fps (1..60). Нуля хаб не шле: «зняти стелю»
+	// — це Fps = верхній межі, агент однаково бере min(свій -fps, Fps).
+	Fps int `json:"fps,omitempty"`
 	// Mode — режим вмісту для content_mode ("video" | "text" | "normal").
 	Mode string `json:"mode,omitempty"`
+
+	// enc_stats (C2).
+	Encoder  string `json:"encoder,omitempty"`
+	Software bool   `json:"software,omitempty"`
+	EncCaps  string `json:"enc_caps,omitempty"`
+	QPLast   int    `json:"qp_last,omitempty"`
+	QPMin    int    `json:"qp_min,omitempty"`
+	QPMax    int    `json:"qp_max,omitempty"`
+	QPFrames int    `json:"qp_frames,omitempty"`
 }
 
 // --- Конструктори по одному на тип повідомлення ---
@@ -131,6 +152,13 @@ func BitrateTarget(seq, bitrateBps uint64) Msg {
 // моніторі, бо рвати живий потік через невдалий клік гірше, ніж його не змінити.
 func SelectOutput(seq uint64, output int) Msg {
 	return Msg{V: Version, Type: TypeSelectOutput, Seq: seq, Output: output}
+}
+
+// MaxFps — «не захоплюй/не кодуй частіше за fps кадрів/с» (стеля з тулбара
+// глядача, контракт C1). hub -> агент тим самим "oosc-ctl". Старий агент такого
+// типу не знає й ігнорує — форвардна сумісність, як і для всього іншого тут.
+func MaxFps(seq uint64, fps int) Msg {
+	return Msg{V: Version, Type: TypeMaxFps, Seq: seq, Fps: fps}
 }
 
 func FallbackReason(seq uint64, reason string) Msg {
@@ -175,18 +203,35 @@ func Write(w io.Writer, m Msg) error {
 	return err
 }
 
+// MaxLine — стеля одного control-рядка. Найдовше живе повідомлення — shutdown
+// з причиною, сотні байтів; 64 КБ — запас на порядки.
+const MaxLine = 64 << 10
+
 // Read читає рівно один рядок з br, розбирає JSON і валідує версію.
 // Невідома версія повертається як *ErrUnsupportedVersion (фатально для
 // виклику). Невідомий "type" НЕ є помилкою тут — Msg повертається як є;
 // рішення ігнорувати його — за ReadKnown або за самим викликом.
 func Read(br *bufio.Reader) (Msg, error) {
-	line, err := br.ReadString('\n')
-	if err != nil {
-		// EOF (or any read error) без завершального '\n' — запис неповний,
-		// навіть якщо те, що встигло прийти, саме по собі є валідним JSON.
-		// Приймати такий "хвіст" небезпечно: пірінг міг обірватись
-		// посередині наступного байта. Відкидаємо як помилку читання.
-		return Msg{}, err
+	// Рядок читається зі стелею MaxLine: ReadString росте без меж, і пірінг,
+	// що не шле '\n', тримав би в пам'яті скільки завгодно байтів.
+	var line []byte
+	for {
+		chunk, err := br.ReadSlice('\n')
+		line = append(line, chunk...)
+		if len(line) > MaxLine {
+			return Msg{}, fmt.Errorf("control: line longer than %d bytes", MaxLine)
+		}
+		if err == bufio.ErrBufferFull {
+			continue
+		}
+		if err != nil {
+			// EOF (or any read error) без завершального '\n' — запис неповний,
+			// навіть якщо те, що встигло прийти, саме по собі є валідним JSON.
+			// Приймати такий "хвіст" небезпечно: пірінг міг обірватись
+			// посередині наступного байта. Відкидаємо як помилку читання.
+			return Msg{}, err
+		}
+		break
 	}
 	var m Msg
 	if uerr := json.Unmarshal([]byte(line), &m); uerr != nil {

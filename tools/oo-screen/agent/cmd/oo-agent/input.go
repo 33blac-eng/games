@@ -15,16 +15,69 @@
 package main
 
 import (
+	"errors"
 	"log"
 	"os"
 	"sync/atomic"
 	"time"
 
+	"github.com/pion/webrtc/v4"
+
 	"github.com/organicoils/oo-screen/agent/input"
+	"github.com/organicoils/oo-screen/internal/consent"
 )
+
+// consentGate — S3 (internal/consent). nil = політика off, ввід як раніше.
+// Ставить main до першого dial; читає канал вводу.
+var consentGate *consent.Gate
+
+var errNoConsent = errors.New("input dropped: no local consent (S3)")
 
 // inputChannelLabel — та сама мітка, що в хабі. Один канал, одна назва.
 const inputChannelLabel = "oosc-input"
+
+// inputMoveChannelLabel — ДРУГИЙ канал вводу хаб -> агент (хвиля 10, затримка
+// миші): невпорядкований і без ретрансмісій ({Ordered:false,
+// MaxRetransmits:0}). Рух, загублений на нозі хаб-агент, не тримає в черзі
+// SCTP наступні (head-of-line у надійному впорядкованому "oosc-input": при
+// 1 % втрат кожен загублений пакет — +RTT·k до ВСІХ подальших рухів).
+// Приймаємо ЛИШЕ mouse_move: кнопка чи клавіша без ретрансмісії могла б
+// лишитися затиснутою. Старий хаб каналу не бере — рух іде "oosc-input".
+const inputMoveChannelLabel = "oosc-input-move"
+
+// inputMoveChannelInit — параметри move-каналу (ненадійний, невпорядкований).
+func inputMoveChannelInit() *webrtc.DataChannelInit {
+	ordered := false
+	var retr uint16
+	return &webrtc.DataChannelInit{Ordered: &ordered, MaxRetransmits: &retr}
+}
+
+// handleMoveMessage — повідомлення move-каналу: лише mouse_move, решта —
+// відкидається (захист від затиснутих кнопок/клавіш без ретрансмісії).
+func handleMoveMessage(data []byte, inj eventInjector) error {
+	if !consentGate.Allowed() {
+		return errNoConsent
+	}
+	ev, err := input.ParseEvent(data)
+	if err != nil {
+		return err
+	}
+	if ev.Kind != input.KindMouseMove {
+		return errMoveOnly
+	}
+	return inj.Inject(ev)
+}
+
+var errMoveOnly = errors.New("input dropped: у " + inputMoveChannelLabel + " дозволено лише mouse_move")
+
+// attachInputMoveChannel — move-канал на той самий інʼєктор.
+func attachInputMoveChannel(dc *webrtc.DataChannel, inj eventInjector) {
+	dc.OnMessage(func(msg webrtc.DataChannelMessage) {
+		if err := handleMoveMessage(msg.Data, inj); err != nil {
+			logInputProblem(time.Now(), err)
+		}
+	})
+}
 
 // inputEnabled — той самий прапорець, що в хабі. Змінна, а не os.Getenv на
 // місці: тест перемикає її напряму, як audioEnabled.
@@ -35,12 +88,34 @@ var inputEnabled = os.Getenv("OO_SCREEN_INPUT") == "1"
 // тестом: справжній Injector стріляє в живу мишу тієї машини, де йде тест.
 type eventInjector interface {
 	Inject(input.Event) error
+	ReleaseAll() error
+}
+
+// attachInputChannel вішає канал вводу на інʼєктор. На закритті каналу
+// (реконект, розрив, хаб закрив ногу) — ReleaseAll: key-up, який глядач так і
+// не надіслав, уже не прийде цим каналом ніколи, а клавіша на цьому ПК
+// лишилась би затиснутою, доки людина за ним не натисне її сама.
+func attachInputChannel(dc *webrtc.DataChannel, inj eventInjector) {
+	dc.OnMessage(func(msg webrtc.DataChannelMessage) {
+		if err := handleInputMessage(msg.Data, inj); err != nil {
+			logInputProblem(time.Now(), err)
+		}
+	})
+	dc.OnClose(func() {
+		if err := inj.ReleaseAll(); err != nil {
+			log.Printf("oo-agent: канал вводу закрито, відпустити клавіші не вдалось: %v", err)
+		}
+	})
 }
 
 // handleInputMessage — одне повідомлення каналу вводу. Помилку повертає, а не
 // логує: викликач глушить лог від флуду (logInputProblem), і робити це двічі
 // не треба.
 func handleInputMessage(data []byte, inj eventInjector) error {
+	// S3: без локальної згоди ввід не інʼєктується, що б не прислав хаб.
+	if !consentGate.Allowed() {
+		return errNoConsent
+	}
 	ev, err := input.ParseEvent(data)
 	if err != nil {
 		return err

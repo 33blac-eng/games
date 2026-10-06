@@ -31,8 +31,39 @@
 #include <mfobjects.h>
 #include <mftransform.h>
 #include <mferror.h>
+/* ICodecAPI is declared in strmif.h; the CI runner's mingw-w64 does not pull it in
+ * transitively through mfidl.h/d3d11.h, so include it explicitly. */
+#include <strmif.h>
 #include <codecapi.h>
 #include <d3d11.h>
+
+/* Windows 7: mfplat.dll has no MFCreateDXGIDeviceManager /
+ * MFCreateDXGISurfaceBuffer (Windows 8+). A static import makes the whole
+ * agent fail to load there (STATUS_ENTRYPOINT_NOT_FOUND), so resolve them at
+ * run time; when absent the zero-copy path reports an error and the caller
+ * falls back to the CPU NV12 path. */
+typedef HRESULT (WINAPI *pfnMFCreateDXGIDeviceManager)(UINT *, IMFDXGIDeviceManager **);
+typedef HRESULT (WINAPI *pfnMFCreateDXGISurfaceBuffer)(REFIID, IUnknown *, UINT, BOOL, IMFMediaBuffer **);
+static HRESULT oos_MFCreateDXGIDeviceManager(UINT *tok, IMFDXGIDeviceManager **mgr)
+{
+    static pfnMFCreateDXGIDeviceManager fn;
+    if (!fn) {
+        HMODULE m = GetModuleHandleW(L"mfplat.dll");
+        if (!m) m = LoadLibraryW(L"mfplat.dll");
+        if (m) fn = (pfnMFCreateDXGIDeviceManager)(void *)GetProcAddress(m, "MFCreateDXGIDeviceManager");
+    }
+    return fn ? fn(tok, mgr) : E_NOTIMPL;
+}
+static HRESULT oos_MFCreateDXGISurfaceBuffer(REFIID riid, IUnknown *surf, UINT idx, BOOL bottomUp, IMFMediaBuffer **out)
+{
+    static pfnMFCreateDXGISurfaceBuffer fn;
+    if (!fn) {
+        HMODULE m = GetModuleHandleW(L"mfplat.dll");
+        if (!m) m = LoadLibraryW(L"mfplat.dll");
+        if (m) fn = (pfnMFCreateDXGISurfaceBuffer)(void *)GetProcAddress(m, "MFCreateDXGISurfaceBuffer");
+    }
+    return fn ? fn(riid, surf, idx, bottomUp, out) : E_NOTIMPL;
+}
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -65,6 +96,23 @@ OOS_GUID(OOS_AVEncH264CABACEnable,        STATIC_CODECAPI_AVEncH264CABACEnable);
  * plain DEFINE_GUID in mfapi.h (storage allocated via INITGUID). Verified
  * against mingw-w64 headers. */
 OOS_GUID(OOS_AVEncVideoMaxQP,             STATIC_CODECAPI_AVEncVideoMaxQP);
+/* TASK.md крок 4: межі QP для екранного вмісту і поступове інтра-оновлення
+ * замість періодичного IDR. Обидва — Windows 8+/10+, best effort: MFT, що
+ * відмовив, лишається на старій поведінці, відмова видна в cfg_report. */
+OOS_GUID(OOS_AVEncVideoMinQP,             STATIC_CODECAPI_AVEncVideoMinQP);
+OOS_GUID(OOS_AVEncVideoGradualIntraRefresh, STATIC_CODECAPI_AVEncVideoGradualIntraRefresh);
+/* C2 (WORLD-COMPARISON-2026 §5 п. 2): лише ОПИТУВАННЯ ICodecAPI_IsSupported /
+ * IsModifiable — значення не ставляться. Це виклики через vtable вже
+ * отриманого ICodecAPI, жодного статичного імпорту Win8+: на Win7 MFT просто
+ * відповідає E_NOTIMPL / S_FALSE. */
+OOS_GUID(OOS_AVEncVideoROIEnabled,        STATIC_CODECAPI_AVEncVideoROIEnabled);
+OOS_GUID(OOS_AVEncVideoDirtyRectEnabled,  STATIC_CODECAPI_AVEncVideoDirtyRectEnabled);
+OOS_GUID(OOS_AVEncVideoLTRBufferControl,  STATIC_CODECAPI_AVEncVideoLTRBufferControl);
+OOS_GUID(OOS_AVEncVideoMarkLTRFrame,      STATIC_CODECAPI_AVEncVideoMarkLTRFrame);
+OOS_GUID(OOS_AVEncVideoUseLTRFrame,       STATIC_CODECAPI_AVEncVideoUseLTRFrame);
+OOS_GUID(OOS_AVEncVideoEncodeQP,          STATIC_CODECAPI_AVEncVideoEncodeQP);
+OOS_GUID(OOS_AVEncVideoEncodeFrameTypeQP, STATIC_CODECAPI_AVEncVideoEncodeFrameTypeQP);
+OOS_GUID(OOS_AVEncVideoContentType,       STATIC_CODECAPI_AVEncVideoContentType);
 
 /* IID_ICodecAPI: mingw declares it extern in strmif.h, but icodecapi.h (which
  * would define it) redefines struct CodecAPIEventData and cannot be included
@@ -154,6 +202,7 @@ struct oos_enc {
     int32_t  outq_dropped;
     int32_t  inflight;         /* A-16: frames handed to the MFT, not yet returned */
     char     cfg_report[512];  /* A-14: ICodecAPI knobs the MFT refused */
+    char     caps_report[384]; /* C2: що MFT каже про CODECAPI-властивості (probe_codecapi) */
 
     /* buffer handed to Go by the last poll; freed on release/close */
     uint8_t *held;
@@ -167,6 +216,11 @@ struct oos_enc {
     int32_t  mf_held;       /* this encoder holds a ref on the MTA anchor */
     int64_t  last_pts;
     int32_t  refine_qp;     /* >0: per-frame QP for the following submits (ТЗ P4) */
+    /* TASK.md крок 4: межі QP поза refine. 0 = не задано (MFT за дефолтом;
+     * refine відновлює MaxQP до 51, як раніше). */
+    int32_t  qp_min, qp_max;
+    int32_t  intra_refresh; /* >0: запитане інтра-оновлення, кадрів */
+    int32_t  intra_refresh_on; /* MFT прийняв GradualIntraRefresh */
 
     /* Timing of the last submit, split so the gate can tell the MFT's own cost
      * apart from back-pressure (waiting for METransformNeedInput). */
@@ -479,6 +533,16 @@ static void configure_codecapi(oos_enc *e)
      * нашому вмісті радше ЗМЕНШУЮТЬ потік. Більше двох не беремо: без B-кадрів
      * і при GOP=2с виграш згасає, а пошук дорожчає. */
     note_cfg(e, "MaxNumRefFrame", set_codec_u32(e, &OOS_AVEncVideoMaxNumRefFrame, 2));
+    /* TASK.md крок 4, OO_SCREEN_INTRA_REFRESH (типово вимкнено). Значення —
+     * тривалість оновлення в кадрах (MSDN: «number of frames over which the
+     * intra refresh is spread»). UNVERIFIED на залізі: який MFT це вміє і чи
+     * декодер Chrome стартує з такого потоку — keyframe_request усе одно дає
+     * справжній IDR. Відмова -> лишається періодичний IDR (GOP вище). */
+    if (e->intra_refresh > 0) {
+        HRESULT hr = set_codec_u32(e, &OOS_AVEncVideoGradualIntraRefresh, (ULONG)e->intra_refresh);
+        note_cfg(e, "GradualIntraRefresh", hr);
+        e->intra_refresh_on = SUCCEEDED(hr);
+    }
 
     if (!e->is_hardware) {
         /* ТЗ P8. Софтверний Microsoft H264 MFT без підказки бере ВСІ логічні
@@ -502,6 +566,41 @@ static void configure_codecapi(oos_enc *e)
 }
 
 const char *oos_enc_cfg_report(oos_enc *e) { return (e && e->cfg_report[0]) ? e->cfg_report : ""; }
+
+/* C2: «Ім'я=M» — підтримано й змінюється наживо, «=S» — підтримано, лише
+ * читається, «=-» — не підтримано (або MFT кинув помилку). Імена — ті самі,
+ * що internal/control.EncCapsProps (Go розбирає рядок, internal/control/enccaps.go).
+ * Best effort: будь-яка відмова — просто «-». */
+static void probe_codecapi(oos_enc *e)
+{
+    static const struct { const char *name; const GUID *g; } props[] = {
+        { "ROIEnabled",        &OOS_AVEncVideoROIEnabled },
+        { "DirtyRectEnabled",  &OOS_AVEncVideoDirtyRectEnabled },
+        { "GradualIntraRefresh", &OOS_AVEncVideoGradualIntraRefresh },
+        { "LTRBufferControl",  &OOS_AVEncVideoLTRBufferControl },
+        { "MarkLTRFrame",      &OOS_AVEncVideoMarkLTRFrame },
+        { "UseLTRFrame",       &OOS_AVEncVideoUseLTRFrame },
+        { "MinQP",             &OOS_AVEncVideoMinQP },
+        { "MaxQP",             &OOS_AVEncVideoMaxQP },
+        { "EncodeQP",          &OOS_AVEncVideoEncodeQP },
+        { "EncodeFrameTypeQP", &OOS_AVEncVideoEncodeFrameTypeQP },
+        { "ContentType",       &OOS_AVEncVideoContentType },
+    };
+    size_t n = 0;
+    e->caps_report[0] = 0;
+    for (size_t i = 0; i < sizeof props / sizeof props[0]; i++) {
+        char st = '-';
+        if (e->codec && ICodecAPI_IsSupported(e->codec, props[i].g) == S_OK)
+            st = ICodecAPI_IsModifiable(e->codec, props[i].g) == S_OK ? 'M' : 'S';
+        int w = _snprintf(e->caps_report + n, sizeof e->caps_report - n - 1,
+                          "%s%s=%c", n ? " " : "", props[i].name, st);
+        if (w < 0) break;
+        n += (size_t)w;
+    }
+    e->caps_report[sizeof e->caps_report - 1] = 0;
+}
+
+const char *oos_enc_caps_report(oos_enc *e) { return e ? e->caps_report : ""; }
 
 /* Cache the SPS/PPS the MFT publishes on the negotiated output type. Used to
  * prefix IDR AUs when the MFT does not repeat headers inband (plan §5.2). */
@@ -760,7 +859,8 @@ static HRESULT drain_one_output(oos_enc *e, int *got)
 /* Handles one MFT event. wait!=0 blocks in GetEvent. Returns:
  *   1  an event was handled
  *   0  no event pending (non-blocking only)
- *  -1  failure (err filled) */
+ *  -1  failure (err filled)
+ *  -2  wait timed out: the transform is wedged (err filled; blocking only) */
 /* A-12: an upper bound on how long a blocking pump may wait for the MFT.
  * A wedged transform (driver reset, device removed mid-encode, NVENC session
  * lost) never raises another event; GetEvent(0) then parked the frame loop
@@ -787,7 +887,7 @@ static int pump_event(oos_enc *e, int wait, char *err, int32_t err_len)
             if (hr != MF_E_NO_EVENTS_AVAILABLE) break;
             if (now_us(e) - t0 > OOS_EVENT_WAIT_US) {
                 set_msg(err, err_len, "MFT event wait timeout: encoder wedged, rebuild required");
-                return -1;
+                return -2; /* the caller reports OOS_ENC_WEDGED, not a plain error */
             }
             SwitchToThread();
         }
@@ -885,6 +985,7 @@ static int submit_sample(oos_enc *e, IMFSample *sample, char *err, int32_t err_l
          * produce output, which lands in the queue. */
         while (e->need_input == 0) {
             int r = pump_event(e, 1, err, err_len);
+            if (r == -2) return OOS_ENC_WEDGED;
             if (r < 0) return OOS_ENC_ERROR;
         }
         e->need_input--;
@@ -1075,6 +1176,7 @@ int oos_enc_open(const oos_enc_cfg *cfg, oos_enc **out, char *err, int32_t err_l
     e->fps     = cfg->fps > 0 ? cfg->fps : 30;
     e->bitrate = cfg->bitrate_bps > 0 ? cfg->bitrate_bps : 8000000;
     e->gop     = cfg->gop > 0 ? cfg->gop : e->fps * 2;
+    e->intra_refresh = cfg->intra_refresh > 0 ? cfg->intra_refresh : 0;
     e->src_w   = cfg->src_width  > 0 ? cfg->src_width  : e->width;
     e->src_h   = cfg->src_height > 0 ? cfg->src_height : e->height;
     e->in_id = 0; e->out_id = 0;
@@ -1172,9 +1274,14 @@ int oos_enc_open(const oos_enc_cfg *cfg, oos_enc **out, char *err, int32_t err_l
             SAFE_RELEASE(mt);
         }
 
-        hr = MFCreateDXGIDeviceManager(&e->reset_token, &e->devmgr);
+        hr = oos_MFCreateDXGIDeviceManager(&e->reset_token, &e->devmgr);
         if (FAILED(hr)) { set_err(err, err_len, "MFCreateDXGIDeviceManager", hr);
-                          oos_enc_close(e); return OOS_ENC_ERROR; }
+                          oos_enc_close(e);
+                          /* Windows 7: no DXGI device manager at all, so the
+                           * hardware (D3D11-aware) path cannot exist here —
+                           * NOHW makes the agent take the software MFT instead
+                           * of retrying the same hardware open forever. */
+                          return hr == E_NOTIMPL ? OOS_ENC_NOHW : OOS_ENC_ERROR; }
         hr = IMFDXGIDeviceManager_ResetDevice(e->devmgr, (IUnknown *)e->dev,
                                               e->reset_token);
         if (FAILED(hr)) { set_err(err, err_len, "ResetDevice", hr);
@@ -1219,6 +1326,7 @@ int oos_enc_open(const oos_enc_cfg *cfg, oos_enc **out, char *err, int32_t err_l
     if (SUCCEEDED(IMFTransform_QueryInterface(e->mft, &IID_ICodecAPI,
                                               (void **)&e->codec))) {
         configure_codecapi(e);
+        probe_codecapi(e);
     }
     /* A-18: причина, з якої машина з апаратним енкодером поїхала на софті,
      * мусить бути в лозі — інакше це шукатимуть замірами на живому парку.
@@ -1362,7 +1470,7 @@ int oos_enc_submit_texture(oos_enc *e, uintptr_t tex, uint64_t gen,
     }
 
     IMFMediaBuffer *mb = NULL;
-    HRESULT hr = MFCreateDXGISurfaceBuffer(&IID_ID3D11Texture2D,
+    HRESULT hr = oos_MFCreateDXGISurfaceBuffer(&IID_ID3D11Texture2D,
                                            (IUnknown *)slot, 0, FALSE, &mb);
     if (FAILED(hr)) { set_err(err, err_len, "MFCreateDXGISurfaceBuffer", hr);
                       return OOS_ENC_ERROR; }
@@ -1475,12 +1583,41 @@ int oos_enc_set_refine_qp(oos_enc *e, int32_t qp, char *err, int32_t err_len)
     if (!e->codec) return OOS_ENC_OK; /* sample attribute alone */
     /* MaxQP caps the rate controller from above, so the frame cannot come out
      * blurrier than qp even if the per-sample QP is ignored. 51 = no cap.
-     * MaxBitRate/BufferSize stay untouched: the HRD still bounds the burst. */
-    HRESULT hr = set_codec_u32(e, &OOS_AVEncVideoMaxQP, (ULONG)(qp > 0 ? qp : 51));
+     * MaxBitRate/BufferSize stay untouched: the HRD still bounds the burst.
+     * TASK.md крок 4: відновлення — до заданої стелі (oos_enc_set_qp_bounds),
+     * а MinQP на час refine опускається, щоб не затиснути QP семпла. */
+    HRESULT hr = set_codec_u32(e, &OOS_AVEncVideoMaxQP,
+                               (ULONG)(qp > 0 ? qp : (e->qp_max > 0 ? e->qp_max : 51)));
+    if (e->qp_min > 0 && (qp == 0 || qp < e->qp_min))
+        set_codec_u32(e, &OOS_AVEncVideoMinQP, (ULONG)(qp > 0 ? qp : e->qp_min));
     if (FAILED(hr)) { set_err(err, err_len, "AVEncVideoMaxQP", hr);
                       return OOS_ENC_ERROR; }
     return OOS_ENC_OK;
 }
+
+int oos_enc_set_qp_bounds(oos_enc *e, int32_t min_qp, int32_t max_qp, char *err, int32_t err_len)
+{
+    if (!e) return OOS_ENC_ERROR;
+    if (min_qp < 0 || min_qp > 51 || max_qp < 0 || max_qp > 51 ||
+        (min_qp > 0 && max_qp > 0 && min_qp > max_qp)) {
+        set_msg(err, err_len, "qp bounds out of range"); return OOS_ENC_ERROR;
+    }
+    if (!e->codec) { set_msg(err, err_len, "MFT has no ICodecAPI"); return OOS_ENC_ERROR; }
+    HRESULT hmin = S_OK, hmax = S_OK;
+    /* 0 = зняти межу: MinQP 0 / MaxQP 51 — повний діапазон H.264. */
+    if (min_qp != e->qp_min)
+        hmin = set_codec_u32(e, &OOS_AVEncVideoMinQP, (ULONG)min_qp);
+    /* Поки триває refine, стелю тримає він; нова застосується на restore. */
+    if (max_qp != e->qp_max && e->refine_qp == 0)
+        hmax = set_codec_u32(e, &OOS_AVEncVideoMaxQP, (ULONG)(max_qp > 0 ? max_qp : 51));
+    if (SUCCEEDED(hmin)) e->qp_min = min_qp;
+    if (SUCCEEDED(hmax)) e->qp_max = max_qp;
+    if (FAILED(hmin)) { set_err(err, err_len, "AVEncVideoMinQP", hmin); return OOS_ENC_ERROR; }
+    if (FAILED(hmax)) { set_err(err, err_len, "AVEncVideoMaxQP", hmax); return OOS_ENC_ERROR; }
+    return OOS_ENC_OK;
+}
+
+int32_t oos_enc_intra_refresh(oos_enc *e) { return e ? e->intra_refresh_on : 0; }
 
 int oos_enc_flush(oos_enc *e, char *err, int32_t err_len)
 {

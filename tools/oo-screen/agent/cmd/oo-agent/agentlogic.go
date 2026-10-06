@@ -9,6 +9,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"log"
 	"os"
 	"strconv"
 	"strings"
@@ -18,6 +19,7 @@ import (
 	"github.com/pion/interceptor"
 	"github.com/pion/webrtc/v4"
 
+	"github.com/organicoils/oo-screen/agent/encode"
 	"github.com/organicoils/oo-screen/internal/control"
 	"github.com/organicoils/oo-screen/internal/h264"
 	"github.com/organicoils/oo-screen/internal/pacer"
@@ -29,36 +31,6 @@ const (
 	// кашею з макроблоків.
 	minBitrateBps = 300_000
 
-	// keepaliveAfter — скільки чекати новий кадр, перш ніж переслати останній.
-	// На нерухомому екрані DXGI не віддає кадрів узагалі (dxgi.c: WAIT_TIMEOUT
-	// -> OOS_TIMEOUT, capture.NextFrame крутиться далі), а сторож у браузері рве
-	// сесію безповоротно, якщо кадру не було 3000 мс (web/desktop-oo.js:
-	// fallback() ставить finished=true). Тобто без keepalive людина, яка на три
-	// секунди прибрала руку з миші, гарантовано втрачає сесію.
-	//
-	// 1000 мс дає потрійний запас: два поспіль загублені keepalive ще не валять
-	// сесію. Ціна виміряна, а не на око: повторно закодований ІДЕНТИЧНИЙ кадр на
-	// NVIDIA H.264 MFT (1920x1080, CBR 8 Мбіт/с) важить 75–374 байти, у
-	// середньому 184 — це ≈1,5 кбіт/с, тобто ~0,02% від цільового бітрейту.
-	keepaliveAfter = 1000 * time.Millisecond
-
-	// admissionFloor — найдовша пауза, яку має право створити admission-дроп
-	// (§5.5). Дроп рахує лише queued і тому викидає й keepalive-кадр — тобто
-	// рівно те, що годує сторож у браузері. На насиченому транспорті захист від
-	// нерухомого екрана зникав саме тоді, коли він найпотрібніший, і платив за
-	// це не якістю, а сесією.
-	//
-	// Дроп коштує ЦІЛОГО keepaliveAfter, а не одного кадру: після continue
-	// NextFrame вичікує дедлайн наново. Тож двох дропів поспіль уже досить, щоб
-	// дійти до 3000 мс сторожа.
-	//
-	// Два keepaliveAfter — та сама межа, з якої виходить
-	// TestKeepaliveAfterLeavesRoomForWatchdog: два пропущені keepalive ще в
-	// запасі, третій мусить пройти. Окремої константи не заводимо навмисно:
-	// поріг зобовʼязаний рухатись разом із keepaliveAfter.
-	admissionFloor = 2 * keepaliveAfter
-
-	agentALPN = "oo-screen-agent"
 	// h264FmtpLine — фолбек, коли рівень енкодера ще невідомий (dial до
 	// відкриття MFT) або MFT його не назвав. Живий рядок дає h264Fmtp().
 	// Main 3.1 (4d001f) — рівно те, що Chrome оголошує в
@@ -67,14 +39,6 @@ const (
 	h264FmtpLine = "level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=4d001f"
 	dialTimeout  = 10 * time.Second // dial/HTTP таймаут: реконект/shutdown не мають зависати назавжди
 
-	// wtWriteTimeout — стеля на ОДИН запис кадру в QUIC-стрім (A-33).
-	//
-	// Не «скільки не шкода чекати», а «з якої миті чекати вже нема сенсу»:
-	// admissionFloor — найдовша пауза, яку ми взагалі дозволяємо потоку (два
-	// keepaliveAfter, далі сторож у браузері рве сесію). Запис, що не вклався в
-	// неї, вже нічого не рятує — картинка на тому боці однаково прострочена,
-	// тож дешевше визнати транспорт мертвим і перепідключитись.
-	wtWriteTimeout = admissionFloor
 )
 
 // encPLID — profile-level-id (6 hex-цифр), прочитаний із SPS ЖИВОГО енкодера.
@@ -143,15 +107,39 @@ type webrtcTransport struct {
 	// ctl — oosc-ctl (агент -> hub: content_mode, videomode.go); nil до
 	// створення каналу.
 	ctl *webrtc.DataChannel
+	// fmtp — рядок, з яким піднято ЦЮ ногу (offer). Див. fmtpStale.
+	fmtp string
 }
 
-func newWebRTCAPI() (*webrtc.API, error) {
+// fmtpStale — енкодер відкрився ПІСЛЯ dial з іншим profile-level-id, ніж той,
+// що ця нога оголосила. Типовий шлях: старт на заблокованому ПК (енкодера ще
+// нема -> фолбек 4d001f), перший глядач -> MFT на 2560x1440 з рівнем 5.1.
+// Хаб і глядач домовились про одне, кодується інше — рівно той режим, з якого
+// почався A-26. Лікується лише новим offer-ом, тобто реконектом.
+func (t *webrtcTransport) fmtpStale() bool {
+	return t.fmtp != h264Fmtp()
+}
+
+// sendFallbackReason — сказати хабу, чому картинки зараз не буде ("" = знову
+// буде). false = канал ще не відкритий, повторити пізніше.
+func (t *webrtcTransport) sendFallbackReason(seq uint64, reason string) bool {
+	if t.ctl == nil || t.ctl.ReadyState() != webrtc.DataChannelStateOpen {
+		return false
+	}
+	var b bytes.Buffer
+	if err := control.Write(&b, control.FallbackReason(seq, reason)); err != nil {
+		return false
+	}
+	return t.ctl.SendText(b.String()) == nil
+}
+
+func newWebRTCAPI(fmtp string) (*webrtc.API, error) {
 	m := &webrtc.MediaEngine{}
 	if err := m.RegisterCodec(webrtc.RTPCodecParameters{
 		RTPCodecCapability: webrtc.RTPCodecCapability{
 			MimeType:    webrtc.MimeTypeH264,
 			ClockRate:   90000,
-			SDPFmtpLine: h264Fmtp(),
+			SDPFmtpLine: fmtp,
 			RTCPFeedback: []webrtc.RTCPFeedback{
 				{Type: "nack"},
 				{Type: "nack", Parameter: "pli"},
@@ -296,6 +284,8 @@ func handleCtlMessage(data []byte, onKeyframeRequest func(), onGate func(bool), 
 			if onSelectOutput != nil {
 				onSelectOutput(m.Output)
 			}
+		case control.TypeMaxFps:
+			setMaxFps(m.Fps)
 		case control.TypeKeyframeRequest:
 			// Досі WebRTC-нога реагувала лише на RTCP PLI, тож запит хаба
 			// control-каналом нікуди не доходив.
@@ -310,12 +300,36 @@ func handleCtlMessage(data []byte, onKeyframeRequest func(), onGate func(bool), 
 		onGate(true)
 	case s == "pause" && onGate != nil:
 		onGate(false)
+	case s == "viewer-join":
+		// S3: новий глядач до вже наявних — згода попереднього на нього не
+		// поширюється (nil-safe: при політиці off — no-op).
+		consentGate.ViewerJoin()
 	default:
 		// ponytail: "bitrate <bps>" лишається терпимим псевдонімом заради
 		// сумісності; основний формат — JSON вище.
 		if bps, ok := parseBitrateLine(s); ok && onBitrateTarget != nil {
 			onBitrateTarget(bps)
 		}
+	}
+}
+
+// maxFpsWanted — остання стеля кадрів/с від хаба (control max_fps, C1); 0 = без
+// стелі. Глобальна, а не ще один колбек крізь dial*: її пише DataChannel-
+// горутина, читає лише кадровий цикл (maxFpsGap), і стан цей — рівно одне число.
+// Скидається на початку кожного dialWebRTC: стеля належить сесії хаба, а хаб
+// повторює її на oosc-ctl OnOpen лише тоді, коли вона в нього є. Після рестарту
+// хаба (кожна заливка) її в нього нема — і старе число інакше тримало б fps
+// для всіх наступних глядачів.
+var maxFpsWanted atomic.Int32
+
+// setMaxFps — стеля з хаба (1..60); усе поза межами = «без стелі», а не
+// «0 кадрів/с»: зависла картинка гірша за зайвий CPU.
+func setMaxFps(fps int) {
+	if fps < 1 || fps > 60 {
+		fps = 0
+	}
+	if int(maxFpsWanted.Swap(int32(fps))) != fps {
+		log.Printf("oo-agent: max_fps -> %d (0 = без стелі)", fps)
 	}
 }
 
@@ -348,6 +362,53 @@ func shouldKeepalive(waitErr error, paused, haveLast bool) bool {
 		return false // глядача нема: keepalive зʼїв би економію, заради якої робився гейтинг
 	}
 	return haveLast // без жодного захопленого кадру повторювати нема чого
+}
+
+// keepStillAU — чи годиться щойно закодований keepalive-AU на повтор під час
+// локу/UAC (sendStillKeepalive). Лише коли той самий кадр УЖЕ був закодований
+// перед цим: тоді P-кадр справді «нічого не змінилось». Кадр, який
+// max_fps/admission/mouse-only викинули ДО кодування, потрапляє в keepalive
+// першим — і його P-кадр несе реальну дельту. Повтор такої дельти поверх
+// референсу, де вона вже є, накладає її вдруге.
+func keepStillAU(still, sameFrameEncodedBefore bool, aus []encode.AU) bool {
+	return still && sameFrameEncodedBefore && len(aus) == 1 && !aus[0].Keyframe
+}
+
+// gopTimeEnabled — Q-11: OO_SCREEN_GOP_TIME=1 вмикає IDR за часом
+// (keyframe.TimeGOP, інтервал = -gop-seconds). Типово вимкнено.
+func gopTimeEnabled(getenv func(string) string) bool {
+	return getenv("OO_SCREEN_GOP_TIME") == "1"
+}
+
+// hasKeyframe — чи є серед AU хоч один IDR.
+func hasKeyframe(aus []encode.AU) bool {
+	for i := range aus {
+		if aus[i].Keyframe {
+			return true
+		}
+	}
+	return false
+}
+
+// nextStillAU — новий вміст кешу keepalive (sendStillKeepalive) після виходу
+// енкодера. Повертає cur, якщо кеш не змінюється.
+//
+// IDR завжди замінює кеш: закешований раніше still-P-кадр посилається на
+// референси ДО IDR, і глядач, що приєднався на цьому IDR, не декодує його
+// повтор на локу/UAC. Сам IDR декодовний для будь-кого; наступний still-P,
+// закодований уже після IDR, знову займе його місце (keepStillAU).
+func nextStillAU(cur *encode.AU, still, sameFrameEncodedBefore bool, aus []encode.AU) *encode.AU {
+	for i := range aus {
+		if aus[i].Keyframe {
+			cp := aus[i]
+			return &cp
+		}
+	}
+	if keepStillAU(still, sameFrameEncodedBefore, aus) {
+		cp := aus[0]
+		return &cp
+	}
+	return cur
 }
 
 // shouldAdmit вирішує, чи пускати щойно захоплений кадр далі — на кодування й
@@ -505,4 +566,18 @@ func (b *bitrateTarget) take() int { return int(b.pending.Swap(0)) }
 // повністю новому пайплайні. Покоління росте завжди, тож воно і є тотожністю.
 func encoderStale(dev uintptr, gen uint64, encDev uintptr, encGen uint64) bool {
 	return dev != encDev || gen != encGen
+}
+
+// captureRecovering — чи капчер, що розійшовся з енкодером (encoderStale), ще
+// БЕЗ пайплайна: дублікацію втрачено (лок/UAC), reinit її ще не підняв, кадру
+// нема. Тоді чекаємо, а сесію тримає keepalive (A-03).
+//
+// Нульовий девайс сам по собі цього НЕ означає. GDI-only капчер (Windows 7,
+// OO_SCREEN_FORCE_GDI) живе без D3D-девайса взагалі: Device() == 0 завжди, а
+// покоління росте на кожному відновленні після ACCESS_LOST. Перевірка «лише
+// dev == 0» викидала кожен його кадр після першого ж UAC — картинка
+// замерзала на keepalive назавжди, бо енкодер так і не перебудовувався.
+// Кадр, що прийшов, — доказ живого пайплайна: енкодер треба перебудувати.
+func captureRecovering(dev uintptr, frameErr error) bool {
+	return dev == 0 && frameErr != nil
 }

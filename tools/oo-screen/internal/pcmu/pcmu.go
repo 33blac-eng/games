@@ -1,5 +1,9 @@
 // Package pcmu — G.711 μ-law (RTP payload type 0, PCMU/8000).
 //
+// F1: ТЕПЕР ЦЕ ЗАПАСНИЙ КОДЕК (OO_SCREEN_AUDIO_CODEC=pcmu). Типовий — Opus 48
+// кГц стерео через internal/opusenc: знайшовся чистий-Go енкодер
+// (github.com/thesyncim/gopus), тож аргумент «libopus/cgo» нижче більше не діє.
+//
 // ЧОМУ САМЕ ЦЕЙ КОДЕК, А НЕ OPUS. Твердження «WebRTC іншого аудіокодека не
 // приймає» — неправда, і це перевірено живцем, а не за памʼяттю. Chrome
 // 148.0.7778.280 на цій машині, RTCRtpReceiver.getCapabilities('audio'):
@@ -88,14 +92,6 @@ func Decode(b byte) int16 {
 // як 0xFF, а 0x00 — це найгучніший відʼємний семпл. Заповнити пропуск нулями
 // означало б заповнити його тріском на повну гучність.
 const Silence = 0xFF
-
-// AppendSilence дописує n семплів тиші.
-func AppendSilence(dst []byte, n int) []byte {
-	for i := 0; i < n; i++ {
-		dst = append(dst, Silence)
-	}
-	return dst
-}
 
 // Duration — скільки звучить payload із n байтів. Один байт = один семпл 8 кГц,
 // тож це і є та тривалість, яку чекає media.Sample: саме з неї pion крутить
