@@ -123,23 +123,80 @@ export function orderCodecs(codecs, prefer) {
 }
 
 /**
+ * h264ProfileRank — PLAYER-QUALITY P-1: місце H.264-варіанта в offer-і.
+ * Повертає [packetizationRank, profileRank] — менше = раніше.
+ *
+ * ЧОМУ порядок усередині H.264 взагалі важливий. Хаб і агент (pion) шукають
+ * точний збіг fmtp: packetization-mode + profile_idc + profile_iop. Новий
+ * агент кодує Main 4d40xx (constraint_set1), а Chrome оголошує Main як 4d001f
+ * (iop 0x00) — точного збігу НЕМАЄ, і pion бере «частковий»: ПЕРШИЙ H.264-PT
+ * з offer-а браузера (rtpcodec.go codecParametersFuzzySearch, TrackLocal.Bind).
+ * У дефолтному порядку Chrome першим іде 42001f (Baseline), тож Main-потік
+ * їде під міткою Baseline: декодер браузера налаштовується під профіль із SDP
+ * і лише потім бачить справжній SPS. Ставимо Main першим — мітка збігається з
+ * потоком. Далі Constrained Baseline 42e0xx (сумісний з усіма декодерами),
+ * Baseline, невідомі, High 4:4:4 (f4) і High (64) — ОСТАННІМИ: Chrome НЕ
+ * приймає High від нашого хаба надійно (TASK.md), але й викидати 64xx не
+ * можна — старий агент 64002a домовляється саме точним збігом з 64001f.
+ * packetization-mode=1 — завжди перед 0: агент шле FU-A, а pm=0 їх не
+ * передбачає.
+ */
+export function h264ProfileRank(fmtp) {
+    const s = String(fmtp || '').toLowerCase();
+    const pm = /(?:^|;)\s*packetization-mode\s*=\s*(\d+)/.exec(s);
+    const pmRank = pm && pm[1] === '1' ? 0 : 1;
+    const m = /(?:^|;)\s*profile-level-id\s*=\s*([0-9a-f]{6})/.exec(s);
+    if (!m) return [pmRank, 3];
+    const idc = parseInt(m[1].slice(0, 2), 16);
+    const iop = parseInt(m[1].slice(2, 4), 16);
+    if (idc === 0x4d) return [pmRank, 0];                 // Main
+    if (idc === 0x42 && (iop & 0x40)) return [pmRank, 1]; // Constrained Baseline
+    if (idc === 0x42) return [pmRank, 2];                 // Baseline
+    if (idc === 0xf4) return [pmRank, 4];                 // High 4:4:4 Predictive
+    if (idc === 0x64) return [pmRank, 5];                 // High — лише для старого агента
+    return [pmRank, 3];
+}
+
+/**
+ * orderH264Profiles — P-1: переставляє ЛИШЕ H.264-записи між собою (за
+ * h264ProfileRank, стабільно), лишаючи кожен не-H.264 кодек на його місці.
+ * Нічого не викидає (див. orderCodecs). Записи без sdpFmtpLine мають
+ * однаковий ранг — їхній порядок не змінюється.
+ */
+export function orderH264Profiles(codecs) {
+    const list = Array.isArray(codecs) ? codecs.slice() : [];
+    const isH264 = (c) => /\/h264$/i.test(String((c && c.mimeType) || ''));
+    const slots = [];
+    const items = [];
+    list.forEach((c, i) => { if (isH264(c)) { slots.push(i); items.push({ c, i, r: h264ProfileRank(c.sdpFmtpLine) }); } });
+    if (items.length < 2) return list;
+    items.sort((a, b) => (a.r[0] - b.r[0]) || (a.r[1] - b.r[1]) || (a.i - b.i));
+    slots.forEach((slot, k) => { list[slot] = items[k].c; });
+    return list;
+}
+
+/**
  * applyCodecPreferences — F-13: просить браузер ставити H264 першим у offer.
  * Агент кодує саме H264 (NVENC/MFT), і якщо offer починається з VP8, хаб
  * зобов'язаний або перекодовувати, або домовлятись довше.
+ * P-1: усередині H264 — Main першим (orderH264Profiles); opts.h264Profiles
+ * === false — порядок профілів як у браузера (відкат).
  *
  * Усе всередині try: setCodecPreferences кидає на непідтримуваних наборах, а
  * помилка тут не сміє коштувати сесії — без преференцій просто трохи гірше.
  *
  * @returns {boolean} чи справді застосовано
  */
-export function applyCodecPreferences(transceiver, RTCRtpReceiverCtor, prefer) {
+export function applyCodecPreferences(transceiver, RTCRtpReceiverCtor, prefer, opts) {
     if (!transceiver || typeof transceiver.setCodecPreferences !== 'function') return false;
     const R = RTCRtpReceiverCtor;
     if (!R || typeof R.getCapabilities !== 'function') return false;
     try {
         const caps = R.getCapabilities('video');
         if (!caps || !Array.isArray(caps.codecs) || !caps.codecs.length) return false;
-        transceiver.setCodecPreferences(orderCodecs(caps.codecs, prefer || ['H264']));
+        let list = orderCodecs(caps.codecs, prefer || ['H264']);
+        if (!opts || opts.h264Profiles !== false) list = orderH264Profiles(list);
+        transceiver.setCodecPreferences(list);
         return true;
     } catch (e) {
         return false;
@@ -1999,6 +2056,7 @@ export function createOoWebrtcLayer(o) {
             videoTx,
             config.RTCRtpReceiver || (typeof RTCRtpReceiver !== 'undefined' ? RTCRtpReceiver : null),
             config.preferCodecs || ['H264'],
+            { h264Profiles: config.h264ProfileOrder !== false },
         );
         // Звук просимо ЛИШЕ коли сервер його справді віддає. Зайва звукова
         // доріжка в offer змусила б хаб домовлятись про те, чого він не
