@@ -602,14 +602,14 @@ func (vl *viewerLeg) pump(ns *nodeSession) {
 		ringN   int
 		pc      pacer
 		paceAt  time.Time
-		ticker  *time.Ticker
+		stopTk  func() // nil — тікер проби не запущено
 		tickC   <-chan time.Time
 		padNext int
 	)
 	pace := paceEnabled // знімок: тести перемикають глобаль до addViewer
 	defer func() {
-		if ticker != nil {
-			ticker.Stop()
+		if stopTk != nil {
+			stopTk()
 		}
 	}()
 	write := func(pkt *rtp.Packet) bool {
@@ -656,12 +656,11 @@ func (vl *viewerLeg) pump(ns *nodeSession) {
 	}
 	for {
 		probeOn := vl.probe.Load() != nil
-		if probeOn && ticker == nil {
-			ticker = time.NewTicker(probeTick)
-			tickC = ticker.C
-		} else if !probeOn && ticker != nil {
-			ticker.Stop()
-			ticker, tickC = nil, nil
+		if probeOn && stopTk == nil {
+			tickC, stopTk = newProbeTicker()
+		} else if !probeOn && stopTk != nil {
+			stopTk()
+			stopTk, tickC = nil, nil
 		}
 		select {
 		case <-vl.done:

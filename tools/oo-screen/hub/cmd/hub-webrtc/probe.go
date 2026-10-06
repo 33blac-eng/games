@@ -243,6 +243,15 @@ func (vl *viewerLeg) noteProbeNack(n int, now time.Time) bool {
 	return true
 }
 
+// newProbeTicker — джерело тиків pump-а під час проби. Тести підміняють його
+// керованим каналом: так вікно проби проходить детерміновано, а не залежить
+// від того, чи дав планувальник pump-у процесор (під навантаженням тики
+// губились, і проба ставала «inconclusive»).
+var newProbeTicker = func() (<-chan time.Time, func()) {
+	t := time.NewTicker(probeTick)
+	return t.C, t.Stop
+}
+
 // padOwed — ЧИСТА: скільки байтів дописати, щоб нога вийшла на bps від start.
 func padOwed(bps uint64, start, now time.Time, sent uint64) int64 {
 	want := float64(bps) / 8 * now.Sub(start).Seconds()
