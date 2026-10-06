@@ -921,9 +921,10 @@ export function containBox(boxW, boxH, srcW, srcH) {
     return { x: (boxW - width) / 2, y: (boxH - height) / 2, width, height };
 }
 
-// CSS-розмір для режиму 1:1. integer=true — dpr цілий (1, 2, 3), тобто кожен
-// піксель відео лягає рівно на N×N фізичних: тоді й тільки тоді вмикаємо
-// image-rendering:pixelated (на дробовому dpr воно дає «драбину»).
+// CSS-розмір для режиму 1:1. integer=true — dpr цілий (1, 2, 3). Увага
+// (PLAYER-QUALITY P-3): у 1:1 піксель відео = ОДИН фізичний піксель за будь-
+// якого dpr (CSS = videoW/dpr), тож N×N тут не буває; image-rendering тепер
+// обирає imageRenderingFor за фактичним масштабом, integer лишився для відкату.
 // absorbForeignStyles — 1:1 тримає знімок стилів Mesh, щоб повернути їх при
 // виході. Якщо поки діє 1:1 Mesh сам змінив якийсь стиль (значення вже не те,
 // що записали ми), це нова «оригінальна» величина — переносимо її в знімок,
@@ -945,6 +946,79 @@ export function oneToOneSize(videoW, videoH, dpr) {
         height: videoH / d,
         integer: Math.abs(d - Math.round(d)) < 1e-6,
     };
+}
+
+// ── P-3: HiDPI — прив'язка до сітки фізичних пікселів ─────────────────────
+// Навіть коли CSS-розмір відео дає рівно videoWidth фізичних пікселів (1:1 на
+// dpr 1.25: 1536 css = 1920 px), ДРОБОВИЙ зсув (left 10.4px → 13 px на dpr
+// 1.25, або Mesh-canvas, відцентрований margin:auto) змушує композитор
+// семплювати кадр зі зсувом на пів пікселя — білінійне «мило» на всьому
+// тексті. Тому краї боксу кладемо на цілі фізичні пікселі.
+// Допуск «майже 1:1»: бокс Mesh-canvas, що на ≤1.5 фізичного пікселя
+// відрізняється від розміру кадру (округлення layout, 1535.6 css замість 1536),
+// стає РІВНО videoW×videoH: інакше масштаб 0.9998 ресемплить увесь кадр
+// заради пів пікселя.
+// ПРАВИЙ/НИЖНІЙ край ніколи не виходить за край Mesh-canvas (floor): вихід
+// навіть на долю пікселя за контейнер з overflow:auto дає смугу прокрутки,
+// та міняє розмір контейнера → ResizeObserver → syncGeometry → петля. Тож
+// «майже 1:1» добирає пікселі ВЛІВО/ВГОРУ (від'ємний overflow не прокручується),
+// зсув відносно Mesh-canvas ≤ допуск + 1 фізичний піксель.
+export const NEAR_ONE_TO_ONE_DEVICE_PX = 1.5;
+const SNAP_EPS = 1e-3; // LayoutUnit Chrome = 1/64 px: 1365.9999 — це 1366
+
+/**
+ * snapToDeviceBox — бокс у координатах в'юпорту (CSS px) → бокс з краями на
+ * цілих фізичних пікселях, не ширший за вихідний праворуч/знизу.
+ * srcW×srcH — розмір кадру (0 = ще невідомо).
+ * @returns {{x, y, width, height, deviceWidth, deviceHeight, exact}}
+ *   exact — один піксель кадру = один фізичний піксель екрана.
+ */
+export function snapToDeviceBox(x, y, w, h, dpr, srcW, srcH, tolPx) {
+    const d = dpr > 0 ? dpr : 1;
+    const tol = typeof tolPx === 'number' ? tolPx : NEAR_ONE_TO_ONE_DEVICE_PX;
+    const bx = (x || 0) * d;
+    const by = (y || 0) * d;
+    const bw = Math.max(0, w || 0) * d;
+    const bh = Math.max(0, h || 0) * d;
+    const x1 = Math.floor(bx + bw + SNAP_EPS);
+    const y1 = Math.floor(by + bh + SNAP_EPS);
+    let x0 = Math.ceil(bx - SNAP_EPS);
+    let y0 = Math.ceil(by - SNAP_EPS);
+    if (srcW > 0 && srcH > 0 && Math.abs(bw - srcW) <= tol && Math.abs(bh - srcH) <= tol) {
+        x0 = x1 - srcW;
+        y0 = y1 - srcH;
+    }
+    const dw = Math.max(0, x1 - x0);
+    const dh = Math.max(0, y1 - y0);
+    if (!dw) x0 = x1;
+    if (!dh) y0 = y1;
+    return {
+        x: x0 / d, y: y0 / d, width: dw / d, height: dh / d,
+        deviceWidth: dw, deviceHeight: dh,
+        exact: srcW > 0 && dw === srcW && dh === srcH,
+    };
+}
+
+/** snapPx — одна координата в'юпорту (CSS px) на найближчий фізичний піксель. */
+export function snapPx(v, dpr) {
+    const d = dpr > 0 ? dpr : 1;
+    return Math.round(v * d) / d;
+}
+
+/**
+ * imageRenderingFor — P-3: 'pixelated' ЛИШЕ коли кадр збільшено в ЦІЛЕ число
+ * разів ≥2 по обох осях (1:1 на dpr 2, кадр 1280×720 у боксі 2560×1440): тоді
+ * кожен піксель кадру — рівний квадрат N×N, текст різкий, як на моніторі з
+ * меншим DPI. Дробове збільшення з pixelated дає «драбину» (стовпці різної
+ * ширини), зменшення — алiасинг, тож там 'auto' (білінійно).
+ */
+export function imageRenderingFor(deviceW, deviceH, srcW, srcH) {
+    if (!(srcW > 0) || !(srcH > 0) || !(deviceW > 0) || !(deviceH > 0)) return 'auto';
+    const sx = deviceW / srcW;
+    const sy = deviceH / srcH;
+    const k = Math.round(sx);
+    if (k >= 2 && Math.abs(sx - k) < 1e-6 && Math.abs(sy - k) < 1e-6) return 'pixelated';
+    return 'auto';
 }
 
 // clientX/clientY → піксель віддаленого екрана. rect — getBoundingClientRect()
@@ -1458,8 +1532,25 @@ export function createOoWebrtcLayer(o) {
         setStyle(meshCanvas, 'height', sz.height + 'px');
         setStyle(container, 'overflow', 'auto');
         meshWritten = readMesh(); // як браузер нормалізував наші значення
-        setStyle(video, 'imageRendering', sz.integer ? 'pixelated' : 'auto');
         return true;
+    }
+
+    // Старе правило image-rendering (до P-3) — для config.pixelSnap === false.
+    function legacyImageRendering() {
+        if (displayMode !== DISPLAY_1X1) return 'auto';
+        const vw = video.videoWidth | 0;
+        const vh = video.videoHeight | 0;
+        if (!(vw > 0 && vh > 0)) return 'auto';
+        return oneToOneSize(vw, vh, currentDpr()).integer ? 'pixelated' : 'auto';
+    }
+
+    // P-3: зсув блоку, від якого рахується position:absolute (padding-box
+    // контейнера), у координатах в'юпорту.
+    function containerOrigin(cr) {
+        return {
+            x: cr.left + (container.clientLeft || 0) - (container.scrollLeft || 0),
+            y: cr.top + (container.clientTop || 0) - (container.scrollTop || 0),
+        };
     }
 
     function restoreMesh() {
@@ -1482,7 +1573,6 @@ export function createOoWebrtcLayer(o) {
             applyOneToOne();
         } else {
             restoreMesh();
-            setStyle(video, 'imageRendering', 'auto');
         }
         // Mesh ще не намалював жодного кадру (canvas лишився дефолтним 300×150
         // за HTML-специфікацією) — тоді бокс canvas, а з ним і OO-відео, крихітні.
@@ -1506,15 +1596,38 @@ export function createOoWebrtcLayer(o) {
         const fit = (config.input || config.inputChannel || config.textTiles || config.cursorLayer)
             ? fitRect(mr.width, mr.height, video.videoWidth, video.videoHeight)
             : { left: 0, top: 0, width: mr.width, height: mr.height };
-        setStyle(video, 'left', (mr.left - cr.left + container.scrollLeft + fit.left) + 'px');
-        setStyle(video, 'top', (mr.top - cr.top + container.scrollTop + fit.top) + 'px');
-        setStyle(video, 'width', fit.width + 'px');
-        setStyle(video, 'height', fit.height + 'px');
-        // Оверлей тайлів — у тому самому боксі, що й картинка.
-        if (textTiles) {
-            textTiles.place(mr.left - cr.left + container.scrollLeft + fit.left, mr.top - cr.top + container.scrollTop + fit.top,
-                fit.width, fit.height);
+        let box;
+        let rendering;
+        if (config.pixelSnap === false) {
+            // Відкат P-3: геометрія й image-rendering як до прив'язки.
+            box = {
+                left: mr.left - cr.left + container.scrollLeft + fit.left,
+                top: mr.top - cr.top + container.scrollTop + fit.top,
+                width: fit.width,
+                height: fit.height,
+            };
+            rendering = legacyImageRendering();
+        } else {
+            // P-3: краї — на цілих фізичних пікселях; «майже 1:1» — рівно 1:1.
+            // Зсув рахуємо від padding-box контейнера (clientLeft — рамка;
+            // раніше її товщина зсувала відео відносно Mesh-canvas).
+            const dpr = currentDpr();
+            const vw = video.videoWidth | 0;
+            const vh = video.videoHeight | 0;
+            const s = snapToDeviceBox(mr.left + fit.left, mr.top + fit.top, fit.width, fit.height, dpr, vw, vh);
+            const org = containerOrigin(cr);
+            box = { left: s.x - org.x, top: s.y - org.y, width: s.width, height: s.height };
+            rendering = imageRenderingFor(s.deviceWidth, s.deviceHeight, vw, vh);
         }
+        setStyle(video, 'left', box.left + 'px');
+        setStyle(video, 'top', box.top + 'px');
+        setStyle(video, 'width', box.width + 'px');
+        setStyle(video, 'height', box.height + 'px');
+        setStyle(video, 'imageRendering', rendering);
+        // Оверлей тайлів — у тому самому боксі й з тим самим image-rendering,
+        // що й картинка: інакше lossless-тайл і відео під ним масштабуються
+        // різними фільтрами й «двоять» на краях літер.
+        if (textTiles) textTiles.place(box.left, box.top, box.width, box.height, rendering);
         if (cursorLayer) cursorLayer.relayout();
     }
 
@@ -2022,6 +2135,18 @@ export function createOoWebrtcLayer(o) {
                 const cr = container.getBoundingClientRect();
                 const m = mapRemoteToClient(p.x, p.y, vr, srcW, srcH);
                 if (!m) return null;
+                if (config.pixelSnap !== false) {
+                    // P-3: гаряча точка — на цілому фізичному пікселі (як і відео):
+                    // у 1:1 hotX·scale·dpr ціле, тож уся форма курсора лягає
+                    // на сітку без білінійного розмиття; рамка контейнера — clientLeft.
+                    const dpr = currentDpr();
+                    const org = containerOrigin(cr);
+                    return {
+                        x: snapPx(vr.left + m.x, dpr) - org.x,
+                        y: snapPx(vr.top + m.y, dpr) - org.y,
+                        scale: m.scale,
+                    };
+                }
                 return {
                     x: vr.left - cr.left + container.scrollLeft + m.x,
                     y: vr.top - cr.top + container.scrollTop + m.y,
