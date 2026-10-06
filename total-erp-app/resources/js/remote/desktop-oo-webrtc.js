@@ -37,7 +37,7 @@ import {
 } from './desktop-oo.js';
 import { createTileOverlay, TILES_LABEL } from './oo-text-tiles.js';
 import { INPUT_CHANNEL_LABEL, inputEnabledFor, createInputSender, attachInputDom } from './desktop-oo-input.js';
-import { createStatsOverlay } from './desktop-oo-stats.js';
+import { createStatsOverlay, createFrameTimingMeter } from './desktop-oo-stats.js';
 import {
     CURSOR_CHANNEL_LABEL,
     createCursorLayer,
@@ -1449,6 +1449,7 @@ export function createOoWebrtcLayer(o) {
     let inputChannel = null;      // F5: config.inputChannel — власний канал вводу (desktop-oo-input.js)
     let inputDom = null;
     let statsOverlay = null;      // getStats()-оверлей (Ctrl+Alt+S); config.statsOverlay === false — вимкнено
+    const frameTiming = createFrameTimingMeter(); // P-4: rVFC прийом→показ / декод для оверлею
     let transportPath = null;     // N6: 'direct' | 'relay' (| 'direct-connecting') — у стат-оверлеї
     let p2pTrialPeer = null;      // N6: peer, чий ICE ще пробує пряму ногу — його стани не фолбечать у Mesh
     const directRescue = createDirectRescue(); // N6: обрив зʼєднаної прямої ноги -> relay, не Mesh
@@ -1698,7 +1699,16 @@ export function createOoWebrtcLayer(o) {
         watchDpr();
         makeToggle();
         if (config.statsOverlay !== false && !statsOverlay) {
-            statsOverlay = createStatsOverlay({ container, doc, getPc: () => pc, getPath: () => transportPath });
+            statsOverlay = createStatsOverlay({
+                container, doc, getPc: () => pc, getPath: () => transportPath,
+                // P-4: таймінги кадрів з rVFC і фактичний масштаб показу.
+                getFrameTiming: () => frameTiming.snapshot(),
+                getRender: () => (video ? {
+                    videoW: video.videoWidth | 0, videoH: video.videoHeight | 0,
+                    cssW: parseFloat(video.style.width) || 0, cssH: parseFloat(video.style.height) || 0,
+                    dpr: currentDpr(), rendering: video.style.imageRendering,
+                } : null),
+            });
         }
     }
 
@@ -2058,10 +2068,12 @@ export function createOoWebrtcLayer(o) {
             video.addEventListener('resize', syncGeometry);
         }
         armHiddenKeepalive(gen);
+        frameTiming.reset(); // нова генерація — нова статистика кадрів
         if (typeof video.requestVideoFrameCallback === 'function') {
             const onFrame = (_now, meta) => {
                 if (!session.isCurrent(gen) || !video) return;
                 frameArrived(gen);
+                frameTiming.onFrame(_now, meta);
                 // Кадр іншої геометрії (інший монітор) — тайли до нього не стосуються;
                 // кадр без анонсу still-повтору — ховаємо тайли (oo-text-tiles.js TYPE_STILL).
                 if (textTiles) {
