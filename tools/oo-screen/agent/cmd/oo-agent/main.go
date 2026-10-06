@@ -1594,9 +1594,9 @@ func main() {
 		lastStillSentAt time.Time
 		// lastFrameEncoded — s.lastFrame уже пройшов через енкодер (keepStillAU).
 		lastFrameEncoded bool
-		reacqBackoff    = reacquireBackoffMin
-		suspended       bool      // A-17: дублікацію віддано на паузі
-		lastIDRAt       time.Time // A-31: дебаунс IDR за запитом
+		reacqBackoff     = reacquireBackoffMin
+		suspended        bool      // A-17: дублікацію віддано на паузі
+		lastIDRAt        time.Time // A-31: дебаунс IDR за запитом
 	)
 	sendStillKeepalive := func() {
 		if lastStillAU == nil || gatePaused.Load() || time.Since(lastStillSentAt) < keepaliveAfter {

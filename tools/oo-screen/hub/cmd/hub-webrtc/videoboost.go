@@ -3,7 +3,6 @@ package main
 import (
 	"log"
 	"time"
-
 )
 
 // Режим «Відео» (агент -video-mode, internal/contentmode): агент шле
@@ -83,4 +82,3 @@ func tryVideoBoost(ns *nodeSession, now time.Time) {
 	log.Printf("content_mode [node=%s]: video boost %d -> %d bps (ceiling %d)", ns.nodeID, prev, next.target, next.startBps)
 	sendBitrateTarget(ns, next.target, 0, 0, 0, false)
 }
-

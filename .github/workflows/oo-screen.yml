@@ -111,7 +111,7 @@ jobs:
       - name: node --check
         run: for f in *.js; do echo "check $f"; node --check "$f"; done
       - name: Run tests
-        run: for t in __tests__/*.mjs; do echo "== $t"; node "$t"; done
+        run: for t in __tests__/*.test.mjs; do echo "== $t"; node --import ./__tests__/erp-stubs.mjs "$t"; done
 
   bench-python:
     runs-on: ubuntu-latest
