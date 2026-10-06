@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/hex"
 	"encoding/json"
 	"os"
@@ -93,6 +94,35 @@ func TestEncoderStale(t *testing.T) {
 			t.Errorf("%s: encoderStale(%#x,%d,%#x,%d)=%v, чекали %v",
 				c.name, c.dev, c.gen, c.encDev, c.encGen, got, c.want)
 		}
+	}
+}
+
+// GDI-only капчер (Windows 7) не має D3D-девайса: Device() == 0 завжди, а
+// покоління росте на кожному відновленні після UAC/локу. Кадр, що прийшов від
+// такого капчера, мусить перебудувати енкодер, а не пропасти як «капчер ще
+// відновлюється» — інакше після першого ж UAC картинка замерзала назавжди.
+// Поверни в кадровому циклі перевірку «лише dev == 0» — цей тест її описує.
+func TestCaptureRecoveringGDIOnly(t *testing.T) {
+	cases := []struct {
+		name string
+		dev  uintptr
+		err  error
+		want bool
+	}{
+		{"DXGI: дублікацію втрачено, кадру нема", 0, context.DeadlineExceeded, true},
+		{"GDI-only: пайплайн відновився, кадр є", 0, nil, false},
+		{"DXGI: новий девайс, кадр є", 0x1000, nil, false},
+		{"DXGI: новий девайс, кадру ще нема", 0x1000, context.DeadlineExceeded, false},
+	}
+	for _, c := range cases {
+		if got := captureRecovering(c.dev, c.err); got != c.want {
+			t.Errorf("%s: captureRecovering(%#x, %v) = %v, чекали %v", c.name, c.dev, c.err, got, c.want)
+		}
+	}
+	// Наскрізь: GDI-only після відновлення — stale за поколінням, але НЕ
+	// «відновлюється», тож цикл іде в syncEncoderToCapture.
+	if !encoderStale(0, 2, 0, 1) || captureRecovering(0, nil) {
+		t.Fatal("GDI-only кадр після відновлення не веде до перебудови енкодера")
 	}
 }
 

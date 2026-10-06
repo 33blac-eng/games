@@ -679,6 +679,18 @@ func contentCeiling(textMode bool, targetBps, ceilBps uint64, fps int) contentDe
 	return d
 }
 
+// floor — нижня межа цілі ЦІЄЇ ноди: minBitrateBps, але не вища за стелю
+// агента (startBps). Агент із -bitrate нижче підлоги інакше діставав би на
+// ЗРІЗІ ціль, вищу за ту, що була: втрати «підіймали» бітрейт. Агент таку ціль
+// однаково клампить до своєї стелі (agentlogic.go clampBitrate — те саме
+// правило «стеля виграє»), а хаб вважав би, що вже стоїть на підлозі.
+func (c bitrateCtl) floor() uint64 {
+	if c.startBps > 0 && c.startBps < minBitrateBps {
+		return c.startBps
+	}
+	return minBitrateBps
+}
+
 func newBitrateCtl(startBps uint64) bitrateCtl {
 	return bitrateCtl{target: startBps, startBps: startBps, fastUp: fastRecoveryDefault, probeOn: probeEnabled}
 }
@@ -947,8 +959,9 @@ func (c bitrateCtl) stepSig(lossFrac float64, rttExcess time.Duration, sig congS
 		c.cleanSince = time.Time{}
 	}
 
-	if next < minBitrateBps {
-		next = minBitrateBps
+	floor := c.floor()
+	if next < floor {
+		next = floor
 	}
 	if next > c.startBps {
 		next = c.startBps
@@ -960,8 +973,8 @@ func (c bitrateCtl) stepSig(lossFrac float64, rttExcess time.Duration, sig congS
 	if c.remb > 0 && next > c.remb {
 		next = c.remb
 	}
-	if next < minBitrateBps {
-		next = minBitrateBps
+	if next < floor {
+		next = floor
 	}
 	// B5: затор одразу після підйому — винен підйом. Відступаємо на рівень ДО
 	// нього (якщо це не мілкіше за вже вирахуваний зріз) і рахуємо невдалу пробу.
@@ -970,8 +983,8 @@ func (c bitrateCtl) stepSig(lossFrac float64, rttExcess time.Duration, sig congS
 		!c.lastUpAt.IsZero() && now.Sub(c.lastUpAt) < probeWindow
 	if backoff && c.probeFrom < next {
 		next = c.probeFrom
-		if next < minBitrateBps {
-			next = minBitrateBps
+		if next < floor {
+			next = floor
 		}
 	}
 	if next == c.target {
@@ -1068,8 +1081,8 @@ func (c bitrateCtl) withRemb(bps uint64, now time.Time) (bitrateCtl, bool) {
 	}
 	c.remb = bps
 	next := bps
-	if next < minBitrateBps {
-		next = minBitrateBps
+	if f := c.floor(); next < f {
+		next = f
 	}
 	if next >= c.target {
 		return c, false

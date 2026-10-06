@@ -530,3 +530,17 @@ func (b *bitrateTarget) take() int { return int(b.pending.Swap(0)) }
 func encoderStale(dev uintptr, gen uint64, encDev uintptr, encGen uint64) bool {
 	return dev != encDev || gen != encGen
 }
+
+// captureRecovering — чи капчер, що розійшовся з енкодером (encoderStale), ще
+// БЕЗ пайплайна: дублікацію втрачено (лок/UAC), reinit її ще не підняв, кадру
+// нема. Тоді чекаємо, а сесію тримає keepalive (A-03).
+//
+// Нульовий девайс сам по собі цього НЕ означає. GDI-only капчер (Windows 7,
+// OO_SCREEN_FORCE_GDI) живе без D3D-девайса взагалі: Device() == 0 завжди, а
+// покоління росте на кожному відновленні після ACCESS_LOST. Перевірка «лише
+// dev == 0» викидала кожен його кадр після першого ж UAC — картинка
+// замерзала на keepalive назавжди, бо енкодер так і не перебудовувався.
+// Кадр, що прийшов, — доказ живого пайплайна: енкодер треба перебудувати.
+func captureRecovering(dev uintptr, frameErr error) bool {
+	return dev == 0 && frameErr != nil
+}

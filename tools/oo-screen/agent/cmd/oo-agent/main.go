@@ -1876,7 +1876,7 @@ loop:
 		// A-01: капчер міг пережити ACCESS_LOST і жити вже на іншому девайсі.
 		if dev, gen := s.cap.Device(), s.cap.Generation(); encoderStale(dev, gen, s.encDev, s.encGen) {
 			s.lastFrame = nil // аліасив буфери/текстуру старого девайса
-			if dev == 0 {
+			if captureRecovering(dev, err) {
 				// Дублікацію втрачено, капчер ще відновлює її (лок/UAC):
 				// кадру нема, сесію тримає повтор keepalive (A-03).
 				sendStillKeepalive()
