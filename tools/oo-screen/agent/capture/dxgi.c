@@ -386,6 +386,17 @@ int oos_output_rect(int32_t idx, int32_t *left, int32_t *top, int32_t *right, in
 
 static int gdi_draw_cursor(oos_cap *c, HDC dc, const RECT *desk);
 
+/* F9 (дефолт ON): чи справді прибирати вказівник із картинки. Шар курсора
+ * має сенс лише тоді, коли є ДЖЕРЕЛО ФОРМИ (DXGI pointer shape). На
+ * GDI-only (Windows 7, без DXGI-дуплікації) і до першої форми DXGI форми
+ * нема — глядач із шаром не мав би ЖОДНОГО вказівника. Тож тоді малюємо
+ * вказівник у кадр, як без шару (DrawIconEx / composite), навіть коли хаб
+ * дозволив шар. */
+static int layer_hides_pointer(const oos_cap *c)
+{
+    return c->cursor_layer && !c->gdi_only && c->have_shape;
+}
+
 /* BT.709 limited range, the same colorimetry the DXGI video processor path
  * advertises, so a Windows 7 PC does not look different from the others. */
 static void gdi_bgra_to_nv12(oos_cap *c)
@@ -471,7 +482,7 @@ static int gdi_grab(oos_cap *c, char *err, int32_t err_len)
         old = (HBITMAP)SelectObject(mem, bmp);
         if (BitBlt(mem, 0, 0, c->width, c->height, screen,
                    c->gdi_desk.left, c->gdi_desk.top, SRCCOPY | CAPTUREBLT)) {
-            if (!c->cursor_layer) gdi_draw_cursor(c, mem, &c->gdi_desk);
+            if (!layer_hides_pointer(c)) gdi_draw_cursor(c, mem, &c->gdi_desk);
             GdiFlush();
             memcpy(c->gdi_bgra, bits, (size_t)c->width * (size_t)c->height * 4);
             ok = 1;
@@ -921,7 +932,7 @@ int oos_next(oos_cap *c, uint32_t timeout_ms, oos_frame *frame,
      * unchanged pointer (position, visibility, shape) is a real no-op. */
     noop = c->have_image && rects.valid &&
            rects.dirty_count == 0 && rects.move_count == 0 &&
-           (c->cursor_layer ||   /* pointer is not in the image: ignore it */
+           (layer_hides_pointer(c) ||   /* pointer is not in the image: ignore it */
             (fi.PointerShapeBufferSize == 0 &&
              c->cur_visible == prev_visible &&
              (!c->cur_visible || (c->cur_x == prev_x && c->cur_y == prev_y))));
@@ -985,7 +996,7 @@ static int convert_out(oos_cap *c, oos_frame *frame, int32_t mouse_only,
     int composited;
 
     /* A-24: the pointer may already be in c->bgra (GDI path drew it). */
-    if (c->cursor_layer) {
+    if (layer_hides_pointer(c)) {
         composited = 0;          /* cursor layer: pointer travels separately */
         c->cursor_in_bgra = 0;
     } else if (c->cursor_in_bgra) {
@@ -1154,7 +1165,7 @@ int oos_gdi_next(oos_cap *c, oos_frame *frame, char *err, int32_t err_len)
      * is the FIRST frame of a session on a still desktop, and a remote desktop
      * without a mouse pointer reads as "frozen". Draw it with the same GDI we
      * already hold the DC for. */
-    if (!c->cursor_layer) gdi_draw_cursor(c, mem, &od.DesktopCoordinates);
+    if (!layer_hides_pointer(c)) gdi_draw_cursor(c, mem, &od.DesktopCoordinates);
     GdiFlush();  /* the DIB bits are written by GDI asynchronously */
 
     c->ctx->lpVtbl->UpdateSubresource(c->ctx, (ID3D11Resource *)c->bgra, 0,

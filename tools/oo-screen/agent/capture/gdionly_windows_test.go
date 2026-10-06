@@ -59,3 +59,30 @@ func TestGDIOnlyPipeline(t *testing.T) {
 		t.Fatalf("GDIFrame у GDI-режимі: %v", err)
 	}
 }
+
+// F9 (шар курсора типово ON): на GDI-only (Windows 7) форми DXGI нема, тож
+// навіть із дозволеним шаром вказівник МУСИТЬ лишитися в кадрі — інакше
+// глядач із шаром не бачить жодного курсора. Без фіксу (dxgi.c
+// layer_hides_pointer) CursorComposited=false при видимому вказівнику.
+func TestGDIOnlyCursorLayerKeepsPointer(t *testing.T) {
+	t.Setenv("OO_SCREEN_FORCE_GDI", "1")
+	SetCursorLayer(true)
+	defer SetCursorLayer(false)
+	c, err := New(0)
+	if err != nil {
+		t.Fatalf("New(0) у GDI-режимі: %v", err)
+	}
+	defer c.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	f, err := c.NextFrame(ctx)
+	if err != nil {
+		t.Fatalf("NextFrame: %v", err)
+	}
+	if !f.CursorVisible {
+		t.Skip("вказівник не видно на цьому виході (сервісна сесія / інший монітор)")
+	}
+	if !f.CursorComposited {
+		t.Fatal("GDI-only + шар курсора: вказівник не вмальовано в кадр, а форми для шару нема")
+	}
+}
