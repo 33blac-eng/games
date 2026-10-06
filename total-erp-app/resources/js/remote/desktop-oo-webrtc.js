@@ -414,6 +414,39 @@ export function adaptiveJitterTargetMs(lossPct, baseMs) {
     return lossPct >= LOSSY_LOSS_PCT ? Math.max(base, LOSSY_JITTER_TARGET_MS) : base;
 }
 
+// P-2: скільки ПОСПІЛЬ чистих семплів (крок startQualityMonitor, 5 с) треба,
+// щоб зняти буфер втрат назад до бази. Вгору — одразу.
+const JITTER_CLEAN_HOLD_SAMPLES = 3;
+
+/**
+ * createJitterTargetController — PLAYER-QUALITY P-2: adaptiveJitterTargetMs з
+ * гістерезисом. Раніше ціль перераховувалась з ОДНОГО 5-секундного семпла:
+ * втрати 1.2 % → 0.8 % → 1.1 % давали 60 → 0 → 60 мс кожні 5 с, а кожна
+ * зміна мінімальної затримки змушує jitter-буфер Chrome перерахувати час
+ * показу (видно як прискорення/пригальмовування картинки). Тепер угору —
+ * на першому ж семплі з втратами (ривки від NACK на нулі гірші за +60 мс),
+ * униз — лише після holdSamples чистих поспіль.
+ *
+ * @returns {{next: (lossPct:number) => number, current: () => number}}
+ */
+export function createJitterTargetController(o) {
+    const opts = o || {};
+    const base = opts.baseMs > 0 ? opts.baseMs : 0;
+    const hold = opts.holdSamples > 0 ? opts.holdSamples : JITTER_CLEAN_HOLD_SAMPLES;
+    let target = base;
+    let clean = 0;
+    return {
+        next(lossPct) {
+            const want = adaptiveJitterTargetMs(lossPct, base);
+            if (want >= target) { target = want; clean = 0; return target; }
+            clean += 1;
+            if (clean >= hold) { target = want; clean = 0; }
+            return target;
+        },
+        current: () => target,
+    };
+}
+
 /**
  * createHiddenFrameKeepalive — §MAJOR-7: поки вкладка hidden, frame-age watchdog
  * тротлиться (rVFC не викликається у фоні) і завалив би живу сесію. Поки hidden
@@ -1631,6 +1664,12 @@ export function createOoWebrtcLayer(o) {
         const onQuality = typeof config.onQuality === 'function' ? config.onQuality : null;
         prevSample = null;
         badSinceTs = 0;
+        // P-2: config.lowLatency === false — буфер браузера НЕ чіпаємо зовсім
+        // (раніше адаптивна петля за 5 с усе одно ставила 0 і зводила прапорець
+        // нанівець). Інакше — ціль із гістерезисом, база з playoutDelaySeconds.
+        const jitterCtl = config.lowLatency === false ? null : createJitterTargetController({
+            baseMs: typeof config.playoutDelaySeconds === 'number' ? config.playoutDelaySeconds * 1000 : 0,
+        });
 
         const setI = config.setInterval || (typeof setInterval === 'function' ? setInterval : null);
         if (!setI || !pc || typeof pc.getStats !== 'function') return;
@@ -1671,9 +1710,9 @@ export function createOoWebrtcLayer(o) {
                 // мусить ловити frame-age, як і раніше.
                 if (decodedBefore !== null && m.nextPrev.framesDecoded > decodedBefore) frameArrived(gen);
                 // №14: адаптивний jitter-буфер — нуль на чистому каналі, ~60 мс на втратах.
-                if (videoReceiver && 'jitterBufferTarget' in videoReceiver) {
-                    const base = typeof config.playoutDelaySeconds === 'number' ? config.playoutDelaySeconds * 1000 : 0;
-                    const want = adaptiveJitterTargetMs(m.lossPct, base);
+                // P-2: з гістерезисом і лише коли lowLatency не вимкнено.
+                if (jitterCtl && videoReceiver && 'jitterBufferTarget' in videoReceiver) {
+                    const want = jitterCtl.next(m.lossPct);
                     try { if (videoReceiver.jitterBufferTarget !== want) videoReceiver.jitterBufferTarget = want; } catch (e) { /* hint */ }
                 }
                 // №5: прихована вкладка — хаб не шле відео (F-39), кожен семпл
