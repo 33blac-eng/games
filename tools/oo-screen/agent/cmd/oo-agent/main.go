@@ -208,6 +208,14 @@ func dialWebRTC(hubURL string, frameInterval time.Duration, onKeyframeRequest fu
 		}
 		// SEC #37: на закритті каналу attachInputChannel відпускає затиснуте.
 		attachInputChannel(in, inj)
+		// Хвиля 10: рух миші — окремим ненадійним невпорядкованим каналом
+		// (без head-of-line за загубленим пакетом). Старий хаб його ігнорує.
+		mv, mvErr := pc.CreateDataChannel(inputMoveChannelLabel, inputMoveChannelInit())
+		if mvErr != nil {
+			_ = pc.Close()
+			return nil, fmt.Errorf("create input-move datachannel: %w", mvErr)
+		}
+		attachInputMoveChannel(mv, inj)
 		// Поверхня вводу лишається ВСІМ віртуальним робочим столом (дефолт
 		// input.Injector), і це точно лише поки монітор один: DXGI-виходи не
 		// віддають свій Left/Top через capture.OutputInfo, тож звузити її нема з

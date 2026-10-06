@@ -704,3 +704,19 @@ func TestRepeatedSubMinQualityIsNoop(t *testing.T) {
 		}
 	}
 }
+
+// Хвиля 10: до агента рух миші йде move-каналом, а кнопки/клавіші — ні.
+func TestIsMouseMoveRouting(t *testing.T) {
+	if !isMouseMove([]byte(`{"v":1,"type":"mouse_move","x":0.1,"y":0.2}`)) {
+		t.Fatal("mouse_move мав іти move-каналом")
+	}
+	for _, s := range []string{
+		`{"v":1,"type":"mouse_button","button":"left","down":true}`,
+		`{"v":1,"type":"key","down":true,"scancode":30}`,
+		`{"v":1,"type":"key","down":true,"unicode":109,"note":"mouse_move"}`,
+	} {
+		if isMouseMove([]byte(s)) {
+			t.Fatalf("%s не мусить іти ненадійним каналом", s)
+		}
+	}
+}

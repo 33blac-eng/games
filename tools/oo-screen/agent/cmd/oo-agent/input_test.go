@@ -152,3 +152,22 @@ func TestInputChannelCloseReleasesAll(t *testing.T) {
 		t.Fatal("канал вводу закрито, а ReleaseAll не викликано — клавіша лишиться затиснутою")
 	}
 }
+
+// Хвиля 10 (затримка миші): move-канал хаб->агент невпорядкований і без
+// ретрансмісій, і в ньому живе ЛИШЕ mouse_move.
+func TestInputMoveChannel(t *testing.T) {
+	init := inputMoveChannelInit()
+	if init.Ordered == nil || *init.Ordered || init.MaxRetransmits == nil || *init.MaxRetransmits != 0 {
+		t.Fatalf("move-канал мусить бути {Ordered:false, MaxRetransmits:0}, маємо %+v", init)
+	}
+	inj := &recordingInjector{}
+	if err := handleMoveMessage([]byte(`{"v":1,"type":"mouse_move","x":0.5,"y":0.25}`), inj); err != nil {
+		t.Fatalf("рух мав пройти: %v", err)
+	}
+	if err := handleMoveMessage([]byte(`{"v":1,"type":"mouse_button","button":"left","down":true}`), inj); !errors.Is(err, errMoveOnly) {
+		t.Fatalf("кнопка в move-каналі мала бути відкинута, err=%v", err)
+	}
+	if len(inj.got) != 1 || inj.got[0].Kind != input.KindMouseMove {
+		t.Fatalf("до інʼєктора мав дійти лише рух: %+v", inj.got)
+	}
+}

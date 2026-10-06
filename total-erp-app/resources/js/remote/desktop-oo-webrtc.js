@@ -37,7 +37,10 @@ import {
 } from './desktop-oo.js';
 import { createTileOverlay, TILES_LABEL } from './oo-text-tiles.js';
 import { rtpVideoCaps } from './desktop-oo-codec444.js';
-import { INPUT_CHANNEL_LABEL, inputEnabledFor, createInputSender, attachInputDom } from './desktop-oo-input.js';
+import {
+    INPUT_CHANNEL_LABEL, INPUT_MOVE_CHANNEL_LABEL, INPUT_MOVE_CHANNEL_INIT,
+    inputEnabledFor, createInputSender, attachInputDom,
+} from './desktop-oo-input.js';
 import { createStatsOverlay, createFrameTimingMeter } from './desktop-oo-stats.js';
 import {
     CURSOR_CHANNEL_LABEL,
@@ -1489,6 +1492,7 @@ export function createOoWebrtcLayer(o) {
     let tilesChannel = null;
     let cursorLayer = null;       // config.cursorLayer: окремий курсор (desktop-oo-cursor.js)
     let inputChannel = null;      // F5: config.inputChannel — власний канал вводу (desktop-oo-input.js)
+    let inputMoveChannel = null;  // хвиля 10: ненадійний канал лише для mouse_move
     let inputDom = null;
     let statsOverlay = null;      // getStats()-оверлей (Ctrl+Alt+S); config.statsOverlay === false — вимкнено
     const frameTiming = createFrameTimingMeter(); // P-4: rVFC прийом→показ / декод для оверлею
@@ -2237,6 +2241,10 @@ export function createOoWebrtcLayer(o) {
             try { inputChannel.onopen = null; inputChannel.onclose = null; inputChannel.close(); } catch (e) { /* ignore */ }
             inputChannel = null;
         }
+        if (inputMoveChannel) {
+            try { inputMoveChannel.close(); } catch (e) { /* ignore */ }
+            inputMoveChannel = null;
+        }
     }
 
     // armInput — після квитка: grant не control => канал закриваємо, ввід
@@ -2250,6 +2258,13 @@ export function createOoWebrtcLayer(o) {
             const sender = createInputSender({
                 ticket,
                 send: (s) => { if (dc.readyState === 'open') dc.send(s); else throw new Error('closed'); },
+                // Рух — ненадійним невпорядкованим каналом, поки він відкритий.
+                sendMove: (s) => {
+                    const mv = inputMoveChannel;
+                    if (!mv || mv.readyState !== 'open') return false;
+                    mv.send(s);
+                    return true;
+                },
                 allowed: typeof config.inputAllowed === 'function' ? config.inputAllowed : null,
             });
             inputDom = attachInputDom({
@@ -2321,6 +2336,12 @@ export function createOoWebrtcLayer(o) {
         // карає: judgeInput судить повідомлення, а не сам факт відкриття.
         if (inputEnabledFor(config, resolveCursorRole(config), config.inputGrant ?? 'control')) { // мовчазний канал; DOM лише при явному grant (armInput)
             try { inputChannel = peer.createDataChannel(INPUT_CHANNEL_LABEL, { ordered: true }); } catch (e) { inputChannel = null; }
+            // Хвиля 10: рух миші окремо, {ordered:false, maxRetransmits:0} —
+            // без head-of-line за загубленим пакетом. Вимикач —
+            // config.inputMoveChannel=false (тоді рух іде надійним каналом).
+            if (inputChannel && config.inputMoveChannel !== false) {
+                try { inputMoveChannel = peer.createDataChannel(INPUT_MOVE_CHANNEL_LABEL, { ...INPUT_MOVE_CHANNEL_INIT }); } catch (e) { inputMoveChannel = null; }
+            }
         }
 
         // Власний ввід (oo-input.js) — ЛИШЕ під прапорцем. Створюємо ДО

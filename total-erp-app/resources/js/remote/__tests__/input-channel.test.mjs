@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import {
     INPUT_CHANNEL_LABEL, keyEvent, normPoint, wheelNotches, buttonName, createTokenBucket,
     createInputSender, inputEnabledFor, attachInputDom, CLIENT_RATE_PER_SEC,
+    INPUT_MOVE_CHANNEL_LABEL, INPUT_MOVE_CHANNEL_INIT,
 } from '../desktop-oo-input.js';
 import { containBox } from '../desktop-oo-webrtc.js';
 
@@ -46,14 +47,17 @@ function rig(extra) {
 {
     const r = rig();
     for (let i = 0; i < 50; i++) r.s.move(i / 100, 0.5);
+    // Хвиля 10: передній фронт — перший рух після паузи йде БЕЗ таймера.
+    assert.equal(r.out.length, 1, 'перший рух — одразу');
+    assert.deepEqual(r.out[0].event, { v: 1, type: 'mouse_move', x: 0, y: 0.5 });
     r.tick(12);
-    assert.equal(r.out.length, 1, '50 рухів за 12 мс -> 1 подія');
-    assert.equal(r.out[0].ticket, 'T');
-    assert.deepEqual(r.out[0].event, { v: 1, type: 'mouse_move', x: 0.49, y: 0.5 });
-    assert.equal(r.s.stats.coalesced, 49);
+    assert.equal(r.out.length, 2, '50 рухів за 12 мс -> перший + хвіст');
+    assert.equal(r.out[1].ticket, 'T');
+    assert.deepEqual(r.out[1].event, { v: 1, type: 'mouse_move', x: 0.49, y: 0.5 });
+    assert.equal(r.s.stats.coalesced, 48);
     // рух перед кліком доходить першим
     r.s.move(0.1, 0.1); r.s.button('left', true, { x: 0.1, y: 0.1 });
-    assert.deepEqual(r.out.slice(1).map((m) => m.event.type), ['mouse_move', 'mouse_button']);
+    assert.deepEqual(r.out.slice(2).map((m) => m.event.type), ['mouse_move', 'mouse_button']);
     r.s.key('KeyA', 'a', true);
     assert.equal(r.s.held(), 2);
     r.s.releaseAll();
@@ -84,6 +88,23 @@ function rig(extra) {
         { v: 1, type: 'key', down: false, scancode: 0x2a },
     ]);
     assert.ok(r.s.stats.denied >= 1);
+}
+
+{
+    // Хвиля 10: рух — move-каналом (ненадійним), кнопки — лише надійним.
+    const moves = []; const rel = [];
+    let t = 100;
+    const s = createInputSender({
+        ticket: 'T', send: (m) => rel.push(JSON.parse(m).event.type), now: () => t,
+        sendMove: (m) => { moves.push(JSON.parse(m).event.type); return true; },
+        setTimer: () => 1, clearTimer: () => {},
+    });
+    s.move(0.3, 0.3);
+    s.button('left', true, { x: 0.3, y: 0.3 });
+    assert.deepEqual(moves, ['mouse_move']);
+    assert.deepEqual(rel, ['mouse_button']);
+    assert.deepEqual(INPUT_MOVE_CHANNEL_INIT, { ordered: false, maxRetransmits: 0 });
+    assert.equal(INPUT_MOVE_CHANNEL_LABEL, 'oosc-input-move');
 }
 
 // ── симуляція: 10 с чесної роботи (миша 1000 Гц + друк 10 симв/с) ──────────

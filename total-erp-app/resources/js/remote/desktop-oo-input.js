@@ -30,6 +30,12 @@ export const INPUT_VERSION = 1;
 export const CLIENT_RATE_PER_SEC = 150;
 export const CLIENT_BURST = 30;
 export const MOVE_COALESCE_MS = 12;
+// Хвиля 10 (затримка миші): рух — ще й окремим ненадійним невпорядкованим
+// каналом (контракт C2 хаба): загублений рух не тримає в черзі SCTP наступні.
+// Кнопки/клавіші — лише надійним INPUT_CHANNEL_LABEL. Вимикач —
+// config.inputMoveChannel=false.
+export const INPUT_MOVE_CHANNEL_LABEL = 'oosc-input-move';
+export const INPUT_MOVE_CHANNEL_INIT = Object.freeze({ ordered: false, maxRetransmits: 0 });
 
 // KeyboardEvent.code -> PS/2 set 1 make code; 0xE0xx = extended.
 export const SCANCODES = Object.freeze({
@@ -120,12 +126,20 @@ export function createInputSender(o) {
     const heldButtons = new Set();
     let pendingMove = null;
     let moveTimer = null;
+    let lastMoveAt = -Infinity;   // коли востаннє пішов рух (передній фронт)
     const stats = { sent: 0, coalesced: 0, limited: 0, denied: 0 };
 
     function raw(ev, force) {
         // force — відпускання: стеля не сміє лишити клавішу затиснутою на ПК.
         if (!force && !bucket.allow()) { stats.limited++; return false; }
-        try { o.send(JSON.stringify({ ticket: o.ticket, event: ev })); } catch (e) { return false; }
+        const msg = JSON.stringify({ ticket: o.ticket, event: ev });
+        // Рух — move-каналом, якщо він відкритий (sendMove -> true); інакше
+        // надійним, як раніше.
+        let viaMove = false;
+        if (ev.type === 'mouse_move' && typeof o.sendMove === 'function') {
+            try { viaMove = o.sendMove(msg) === true; } catch (e) { viaMove = false; }
+        }
+        if (!viaMove) { try { o.send(msg); } catch (e) { return false; } }
         stats.sent++;
         return true;
     }
@@ -135,13 +149,20 @@ export function createInputSender(o) {
     }
     function flushMove() {
         if (moveTimer !== null) { clrT(moveTimer); moveTimer = null; }
-        if (pendingMove) { const m = pendingMove; pendingMove = null; raw(m); }
+        if (pendingMove) { const m = pendingMove; pendingMove = null; lastMoveAt = now(); raw(m); }
     }
+    // Коалесинг з ПЕРЕДНІМ фронтом: перший рух після паузи ≥ вікна йде одразу
+    // (раніше кожен рух чекав таймер 12 мс — +12 мс на старті кожного руху і
+    // ~6 мс у середньому), далі — не частіше одного на вікно (хвіст).
     function move(x, y) {
         if (!allowed()) return;
+        const win = o.coalesceMs || MOVE_COALESCE_MS;
         if (pendingMove) stats.coalesced++;
         pendingMove = { v: INPUT_VERSION, type: 'mouse_move', x, y };
-        if (moveTimer === null) moveTimer = setT(() => { moveTimer = null; flushMove(); }, o.coalesceMs || MOVE_COALESCE_MS);
+        if (moveTimer !== null) return;
+        const since = now() - lastMoveAt;
+        if (since >= win) { flushMove(); return; }
+        moveTimer = setT(() => { moveTimer = null; flushMove(); }, win - since);
     }
     function button(name, down, pt) {
         if (!name) return;

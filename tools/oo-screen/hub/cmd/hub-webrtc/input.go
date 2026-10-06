@@ -31,6 +31,7 @@
 package main
 
 import (
+	"bytes"
 	"crypto/subtle"
 	"encoding/json"
 	"log"
@@ -224,6 +225,18 @@ func viewerInputHandler(ns *nodeSession, vl *viewerLeg, ticket, grant string) fu
 	}
 }
 
+// isMouseMove — чи подія лише рух миші (її можна слати без ретрансмісії).
+// Швидкий префільтр без JSON-розбору: кнопки/клавіші не містять "mouse_move".
+func isMouseMove(ev []byte) bool {
+	if !bytes.Contains(ev, []byte("mouse_move")) {
+		return false
+	}
+	var e struct {
+		Type string `json:"type"`
+	}
+	return json.Unmarshal(ev, &e) == nil && e.Type == "mouse_move"
+}
+
 // releaseAllEvent — подія протоколу вводу агента (agent/input.KindReleaseAll).
 // Старий агент її відкине як невідомий тип — рівно як і до неї.
 var releaseAllEvent = []byte(`{"v":1,"type":"release_all"}`)
@@ -240,8 +253,15 @@ var releaseAllEvent = []byte(`{"v":1,"type":"release_all"}`)
 // єдиний, хто знав правду, нічого про неї не сказав.
 func sendInputToAgent(ns *nodeSession, ev []byte) bool {
 	ns.mu.Lock()
-	dc := ns.agentInput
+	dc, mv := ns.agentInput, ns.agentInputMove
 	ns.mu.Unlock()
+	// Хвиля 10: рух — ненадійним невпорядкованим каналом агента, коли він
+	// відкритий (інакше — надійним, як раніше).
+	if mv != nil && mv.ReadyState() == webrtc.DataChannelStateOpen && isMouseMove(ev) {
+		if err := mv.Send(ev); err == nil {
+			return true
+		}
+	}
 	// H-09: закритий канал (агент саме перепідключається) — теж «нема куди».
 	if dc == nil {
 		return false

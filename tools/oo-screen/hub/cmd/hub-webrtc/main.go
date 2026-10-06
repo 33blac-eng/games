@@ -296,6 +296,10 @@ type nodeSession struct {
 	// агента без цього каналу — тоді ввід просто нікуди не йде, а Mesh працює
 	// як працював.
 	agentInput *webrtc.DataChannel
+	// agentInputMove — хвиля 10: ненадійний невпорядкований канал агента
+	// "oosc-input-move" лише для mouse_move (без head-of-line за загубленим
+	// пакетом). nil у старого агента — рух іде agentInput, як раніше.
+	agentInputMove *webrtc.DataChannel
 	// agentChanPC — PeerConnection, якому належать agentCtrl/agentInput (H-09):
 	// на Failed/Closed канали обнуляються лише якщо вони ще його.
 	agentChanPC *webrtc.PeerConnection
@@ -1316,6 +1320,14 @@ func setupAgentLeg(ns *nodeSession, pc *webrtc.PeerConnection) error {
 			ns.agentInput, ns.agentChanPC = dc, pc
 			ns.mu.Unlock()
 			log.Printf("input: agent channel open [node=%s]", ns.nodeID)
+		case inputMoveChannelLabel:
+			if !inputEnabled {
+				return
+			}
+			ns.mu.Lock()
+			ns.agentInputMove = dc
+			ns.mu.Unlock()
+			log.Printf("input: agent move channel open [node=%s]", ns.nodeID)
 		case tilesLabel:
 			// Текстові тайли (tiles.go) — лише під OO_SCREEN_TILES.
 			if !tilesOn {
@@ -1512,6 +1524,7 @@ func setupAgentLeg(ns *nodeSession, pc *webrtc.PeerConnection) error {
 			ns.mu.Lock()
 			if ns.agentChanPC == pc {
 				ns.agentCtrl, ns.agentInput, ns.agentChanPC = nil, nil, nil
+				ns.agentInputMove = nil
 			}
 			ns.mu.Unlock()
 		}

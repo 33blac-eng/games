@@ -36,6 +36,49 @@ var errNoConsent = errors.New("input dropped: no local consent (S3)")
 // inputChannelLabel — та сама мітка, що в хабі. Один канал, одна назва.
 const inputChannelLabel = "oosc-input"
 
+// inputMoveChannelLabel — ДРУГИЙ канал вводу хаб -> агент (хвиля 10, затримка
+// миші): невпорядкований і без ретрансмісій ({Ordered:false,
+// MaxRetransmits:0}). Рух, загублений на нозі хаб-агент, не тримає в черзі
+// SCTP наступні (head-of-line у надійному впорядкованому "oosc-input": при
+// 1 % втрат кожен загублений пакет — +RTT·k до ВСІХ подальших рухів).
+// Приймаємо ЛИШЕ mouse_move: кнопка чи клавіша без ретрансмісії могла б
+// лишитися затиснутою. Старий хаб каналу не бере — рух іде "oosc-input".
+const inputMoveChannelLabel = "oosc-input-move"
+
+// inputMoveChannelInit — параметри move-каналу (ненадійний, невпорядкований).
+func inputMoveChannelInit() *webrtc.DataChannelInit {
+	ordered := false
+	var retr uint16
+	return &webrtc.DataChannelInit{Ordered: &ordered, MaxRetransmits: &retr}
+}
+
+// handleMoveMessage — повідомлення move-каналу: лише mouse_move, решта —
+// відкидається (захист від затиснутих кнопок/клавіш без ретрансмісії).
+func handleMoveMessage(data []byte, inj eventInjector) error {
+	if !consentGate.Allowed() {
+		return errNoConsent
+	}
+	ev, err := input.ParseEvent(data)
+	if err != nil {
+		return err
+	}
+	if ev.Kind != input.KindMouseMove {
+		return errMoveOnly
+	}
+	return inj.Inject(ev)
+}
+
+var errMoveOnly = errors.New("input dropped: у " + inputMoveChannelLabel + " дозволено лише mouse_move")
+
+// attachInputMoveChannel — move-канал на той самий інʼєктор.
+func attachInputMoveChannel(dc *webrtc.DataChannel, inj eventInjector) {
+	dc.OnMessage(func(msg webrtc.DataChannelMessage) {
+		if err := handleMoveMessage(msg.Data, inj); err != nil {
+			logInputProblem(time.Now(), err)
+		}
+	})
+}
+
 // inputEnabled — той самий прапорець, що в хабі. Змінна, а не os.Getenv на
 // місці: тест перемикає її напряму, як audioEnabled.
 var inputEnabled = os.Getenv("OO_SCREEN_INPUT") == "1"
