@@ -96,3 +96,35 @@ def text_sharpness(ref, dist, mask=None):
     es = float(np.mean(smap[mm])) if mm.any() else float("nan")
     er = float(np.sum(gd[mask] ** 2) / max(np.sum(gr[mask] ** 2), 1e-12))
     return es, er
+
+
+def local_range(y):
+    """3x3 max-min of a 2-D array (edge-replicated)."""
+    p = np.pad(y, 1, mode="edge")
+    h, w = y.shape
+    win = [p[i:i + h, j:j + w] for i in range(3) for j in range(3)]
+    return np.max(win, axis=0) - np.min(win, axis=0)
+
+
+def text_contrast(ref, dist, mask=None):
+    """OCR-free stroke-contrast retention inside the text mask.
+
+    mean(3x3 luma range of dist) / mean(3x3 luma range of ref) over masked pixels:
+    1.0 = glyph strokes keep their full black/white swing, <1 = washed out / smeared into the
+    background (what makes 8-9 px text unreadable), >1 = ringing/overshoot."""
+    if mask is None:
+        mask = text_mask(ref)
+    if not mask.any():
+        return float("nan")
+    rr = local_range(luma(ref))[mask]
+    rd = local_range(luma(dist))[mask]
+    return float(np.mean(rd) / max(np.mean(rr), 1e-12))
+
+
+def masked_psnr(ref, dist, mask, peak=255.0):
+    """PSNR over the pixels selected by a 2-D mask (works on HxW or HxWxC)."""
+    if not mask.any():
+        return float("nan")
+    a = np.asarray(ref, dtype=np.float64)[mask]
+    b = np.asarray(dist, dtype=np.float64)[mask]
+    return psnr(a, b, peak)
