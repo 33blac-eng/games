@@ -17,6 +17,8 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+
+	"github.com/organicoils/oo-screen/internal/control"
 )
 
 var capsTelemetryEnabled = os.Getenv("OO_SCREEN_CAPS_TELEMETRY") == "1"
@@ -137,4 +139,88 @@ func (c *capsCounters) write(p *promWriter) {
 	writeCapsMap(p, "oo_hub_viewer_h264_profile_total", "Viewers whose browser advertises this H.264 profile-level-id for receive.", c.h264)
 	writeCapsMap(p, "oo_hub_viewer_vp9_profile_total", "Viewers whose browser advertises this VP9 profile-id for receive.", c.vp9)
 	writeCapsMap(p, "oo_hub_viewer_av1_profile_total", "Viewers whose browser advertises this AV1 profile for receive.", c.av1)
+}
+
+// --- C2: можливості й QP енкодера агента (control enc_stats) ---
+
+// agentEnc — останній enc_stats кожної ноди. Ключ — node id; записи нод,
+// яких уже нема в реєстрі, просто не потрапляють в експозицію (writeMetrics
+// ходить по живих нодах), а місце обмежене кількістю нод.
+type agentEnc struct {
+	encoder  string
+	software bool
+	caps     map[string]string
+	qpLast   int
+	qpMin    int
+	qpMax    int
+	qpFrames uint64 // накопичено за всі вікна
+}
+
+var (
+	agentEncMu sync.Mutex
+	agentEncBy = map[string]*agentEnc{}
+)
+
+func validQP(q int) int {
+	if q < 0 || q > 51 {
+		return 0
+	}
+	return q
+}
+
+// onAgentEncStats — enc_stats від агента (unavailable.go: handleAgentCtl).
+func onAgentEncStats(ns *nodeSession, m control.Msg) {
+	if !capsTelemetryEnabled || ns == nil {
+		return
+	}
+	name := m.Encoder
+	if len(name) > 64 {
+		name = name[:64]
+	}
+	agentEncMu.Lock()
+	defer agentEncMu.Unlock()
+	a := agentEncBy[ns.nodeID]
+	if a == nil {
+		a = &agentEnc{}
+		agentEncBy[ns.nodeID] = a
+	}
+	a.encoder, a.software = name, m.Software
+	a.caps = control.ParseEncCaps(m.EncCaps)
+	a.qpLast, a.qpMin, a.qpMax = validQP(m.QPLast), validQP(m.QPMin), validQP(m.QPMax)
+	if m.QPFrames > 0 {
+		a.qpFrames += uint64(m.QPFrames)
+	}
+}
+
+func writeAgentEncMetrics(p *promWriter, nodes []string) {
+	agentEncMu.Lock()
+	defer agentEncMu.Unlock()
+	for _, n := range nodes {
+		a := agentEncBy[n]
+		if a == nil {
+			continue
+		}
+		sw := "0"
+		if a.software {
+			sw = "1"
+		}
+		p.sample("oo_hub_agent_encoder_info", "gauge", "Agent encoder (MFT friendly name); value is always 1.", 1, "node", n, "encoder", a.encoder, "software", sw)
+		props := make([]string, 0, len(a.caps))
+		for k := range a.caps {
+			props = append(props, k)
+		}
+		sort.Strings(props)
+		for _, k := range props {
+			p.sample("oo_hub_agent_codecapi", "gauge", "Agent MFT CODECAPI property state (ICodecAPI IsSupported/IsModifiable); value is always 1.", 1, "node", n, "prop", k, "state", a.caps[k])
+		}
+		for _, q := range []struct {
+			stat string
+			v    int
+		}{{"last", a.qpLast}, {"min", a.qpMin}, {"max", a.qpMax}} {
+			if q.v > 0 {
+				p.sample("oo_hub_agent_frame_qp", "gauge", "Agent frame QP parsed from the bitstream over the last report window (last/min/max).", float64(q.v), "node", n, "stat", q.stat)
+			}
+		}
+		p.sample("oo_hub_agent_qp_frames_total", "counter", "Agent frames whose QP was parsed from the bitstream.", float64(a.qpFrames), "node", n)
+	}
 }

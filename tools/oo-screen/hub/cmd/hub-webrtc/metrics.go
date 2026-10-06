@@ -401,6 +401,11 @@ func writeMetrics(out io.Writer, nodes []*nodeSession, now time.Time) error {
 
 	if capsTelemetryEnabled {
 		viewerCapsStats.write(p)
+		names := make([]string, 0, len(snaps))
+		for _, s := range snaps {
+			names = append(names, s.node)
+		}
+		writeAgentEncMetrics(p, names)
 	}
 
 	// egress (egress.go): спільний на процес, без мітки ноди.

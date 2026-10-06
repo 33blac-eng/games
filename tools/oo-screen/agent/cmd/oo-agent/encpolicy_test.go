@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/organicoils/oo-screen/agent/encode"
+	"github.com/organicoils/oo-screen/internal/control"
 	"github.com/organicoils/oo-screen/internal/h264"
 	"github.com/organicoils/oo-screen/internal/keyframe"
 	"github.com/organicoils/oo-screen/internal/refine"
@@ -81,9 +82,9 @@ func TestObserveAUsDrivesRefine(t *testing.T) {
 	// Кадр 0 (IDR, QP 24) подали як рух, AU повертається з наступним Encode.
 	r.Motion(t0)
 	k.note(0, refine.Frame{Motion: true})
-	observeAUs(nil, &k, qpr, r, nil, t0)
+	observeAUs(nil, &k, qpr, r, nil, t0, nil)
 	k.note(time.Second, refine.Frame{})
-	observeAUs([]encode.AU{{Data: h[0].Data, Keyframe: h[0].Keyframe, PTS: 0}}, &k, qpr, r, kf, t0)
+	observeAUs([]encode.AU{{Data: h[0].Data, Keyframe: h[0].Keyframe, PTS: 0}}, &k, qpr, r, kf, t0, nil)
 	if r.WorstQP() != 24 {
 		t.Fatalf("worst %d після IDR QP 24", r.WorstQP())
 	}
@@ -93,7 +94,7 @@ func TestObserveAUsDrivesRefine(t *testing.T) {
 	}
 	// AU 5 — P-кадр із примусовим QP 18, поданий як refine 18.
 	k.note(5, refine.Frame{Refine: 18})
-	observeAUs([]encode.AU{{Data: h[1].Data, PTS: 99}, {Data: h[5].Data, PTS: 5}}, &k, qpr, r, kf, t0)
+	observeAUs([]encode.AU{{Data: h[1].Data, PTS: 99}, {Data: h[5].Data, PTS: 5}}, &k, qpr, r, kf, t0, nil)
 	// Невідомий PTS (99, QP 31) — рух: worst 31, далі refine 18 -> 18.
 	if r.WorstQP() != 18 {
 		t.Fatalf("worst %d після refine 18", r.WorstQP())
@@ -125,4 +126,43 @@ func TestRCPolicyGOPAndBounds(t *testing.T) {
 	if !p.IdleIDR || p.QPMin != 16 || p.QPMax != 38 || p.IntraRefresh != 90 {
 		t.Fatalf("env: %+v", p)
 	}
+}
+
+// C2: QP кадрів з потоку доходять до enc_stats; типово телеметрію вимкнено.
+func TestEncStatsQPWindow(t *testing.T) {
+	if rcPolicyFromEnv(func(string) string { return "" }).EncTelemetry {
+		t.Fatal("OO_SCREEN_ENC_TELEMETRY має бути типово вимкнено")
+	}
+	if !rcPolicyFromEnv(func(k string) string {
+		if k == "OO_SCREEN_ENC_TELEMETRY" {
+			return "1"
+		}
+		return ""
+	}).EncTelemetry {
+		t.Fatal("OO_SCREEN_ENC_TELEMETRY=1 не ввімкнуло")
+	}
+
+	b, err := os.ReadFile(filepath.Join("..", "..", "..", "internal", "h264", "testdata", "qp-abr-main.h264"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := h264.SplitAUs(b)
+	var k auKinds
+	qpr := h264.NewQPReader()
+	r := refine.New(refine.Config{})
+	w := &qpWindow{}
+	observeAUs([]encode.AU{{Data: h[0].Data, Keyframe: h[0].Keyframe}}, &k, qpr, r, nil, time.Now(), w)
+	if w.n != 1 || w.last <= 0 || w.min != w.last || w.max != w.last {
+		t.Fatalf("вікно QP: %+v", *w)
+	}
+	q := w.last
+	m := w.encStatsMsg(7, "NVIDIA H.264 Encoder MFT", false, "ROIEnabled=M")
+	if m.Type != control.TypeEncStats || m.QPLast != q || m.QPMin != q || m.QPMax != q || m.QPFrames != 1 || m.EncCaps != "ROIEnabled=M" {
+		t.Fatalf("msg %+v", m)
+	}
+	if w.n != 0 || w.last != q {
+		t.Fatalf("після звіту вікно не скинуто: %+v", *w)
+	}
+	var nilW *qpWindow
+	nilW.add(20) // вимкнено — без паніки
 }

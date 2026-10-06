@@ -5,6 +5,7 @@ import (
 	"time"
 
 	"github.com/organicoils/oo-screen/agent/encode"
+	"github.com/organicoils/oo-screen/internal/control"
 	"github.com/organicoils/oo-screen/internal/h264"
 	"github.com/organicoils/oo-screen/internal/keyframe"
 	"github.com/organicoils/oo-screen/internal/refine"
@@ -41,6 +42,10 @@ type rcPolicy struct {
 	// — справжнім IDR. Типово вимкнено: чи вміє це конкретний MFT і як Chrome
 	// стартує з такого потоку — UNVERIFIED.
 	IntraRefresh int
+	// EncTelemetry — C2: раз на вікно статистики слати хабу enc_stats (ім'я
+	// MFT, підтримка CODECAPI-властивостей, QP кадрів з потоку).
+	// OO_SCREEN_ENC_TELEMETRY, типово вимкнено.
+	EncTelemetry bool
 }
 
 // envBool: "1"/"true"/"on" — так, "0"/"false"/"off" — ні, інше — def.
@@ -74,6 +79,7 @@ func rcPolicyFromEnv(getenv func(string) string) rcPolicy {
 		QPMin:          envInt(getenv, "OO_SCREEN_QP_MIN", 0, 0, 51),
 		QPMax:          envInt(getenv, "OO_SCREEN_QP_MAX", 0, 0, 51),
 		IntraRefresh:   envInt(getenv, "OO_SCREEN_INTRA_REFRESH", 0, 0, 3600),
+		EncTelemetry:   envBool(getenv, "OO_SCREEN_ENC_TELEMETRY", false),
 	}
 }
 
@@ -141,7 +147,7 @@ func (k *auKinds) take(pts time.Duration) (refine.Frame, bool) {
 // (за PTS), чи це IDR і його QP з потоку. Невідомий PTS (кадр до перебудови
 // енкодера) рахується рухом — так безпечніше: невідомий QP не дає
 // QPAware пропустити refine.
-func observeAUs(aus []encode.AU, kinds *auKinds, qpr *h264.QPReader, r *refine.State, kf *keyframe.Policy, now time.Time) {
+func observeAUs(aus []encode.AU, kinds *auKinds, qpr *h264.QPReader, r *refine.State, kf *keyframe.Policy, now time.Time, qpw *qpWindow) {
 	for _, au := range aus {
 		if kf != nil {
 			kf.Coded(au.Keyframe)
@@ -153,7 +159,38 @@ func observeAUs(aus []encode.AU, kinds *auKinds, qpr *h264.QPReader, r *refine.S
 		f.Key = au.Keyframe
 		if q, ok := qpr.Observe(au.Data); ok {
 			f.QP = q
+			qpw.add(q)
 		}
 		r.Coded(now, f)
 	}
+}
+
+// qpWindow — QP кадрів з потоку (h264.QPReader) за вікно статистики (C2).
+// nil — телеметрію вимкнено, add нічого не робить.
+type qpWindow struct {
+	last, min, max, n int
+}
+
+func (w *qpWindow) add(q int) {
+	if w == nil || q <= 0 {
+		return
+	}
+	if w.n == 0 || q < w.min {
+		w.min = q
+	}
+	if q > w.max {
+		w.max = q
+	}
+	w.last = q
+	w.n++
+}
+
+// encStatsMsg — enc_stats за вікно і скидання вікна (last лишається:
+// нерухомий екран без нових AU усе одно показує QP, що на ньому стоїть).
+func (w *qpWindow) encStatsMsg(seq uint64, encoder string, software bool, caps string) control.Msg {
+	m := control.Msg{V: control.Version, Type: control.TypeEncStats, Seq: seq,
+		Encoder: encoder, Software: software, EncCaps: caps,
+		QPLast: w.last, QPMin: w.min, QPMax: w.max, QPFrames: w.n}
+	w.min, w.max, w.n = 0, 0, 0
+	return m
 }

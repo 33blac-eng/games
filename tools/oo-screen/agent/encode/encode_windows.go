@@ -149,6 +149,9 @@ type Encoder struct {
 
 	intraRefresh bool // MFT accepted GradualIntraRefresh
 
+	// codecAPICaps — C2: сирий звіт probe_codecapi (mft.c), control.ParseEncCaps.
+	codecAPICaps string
+
 	headers []byte // cached SPS/PPS, Annex-B
 
 	// headersInjected counts IDR AUs that did NOT carry an inband SPS and had
@@ -224,6 +227,7 @@ func New(cfg Config) (*Encoder, error) {
 		profile:  int(C.oos_enc_profile(handle)),
 
 		intraRefresh: C.oos_enc_intra_refresh(handle) != 0,
+		codecAPICaps: C.GoString(C.oos_enc_caps_report(handle)),
 	}
 	var hp *C.uint8_t
 	var hl C.int32_t
@@ -239,6 +243,10 @@ func New(cfg Config) (*Encoder, error) {
 	runtime.SetFinalizer(enc, func(x *Encoder) { x.Close() })
 	return enc, nil
 }
+
+// CodecAPICaps — C2: які CODECAPI-властивості MFT підтримує, "Ім'я=M|S|-"
+// (див. control.ParseEncCaps). Кешовано в New.
+func (e *Encoder) CodecAPICaps() string { return e.codecAPICaps }
 
 // Name is the MFT's friendly name, e.g. "NVIDIA H.264 Encoder MFT".
 // Cached at New, so it stays valid (and lock-free) after Close.

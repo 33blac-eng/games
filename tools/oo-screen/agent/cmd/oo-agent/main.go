@@ -1450,6 +1450,9 @@ func main() {
 		// щоб refine знав, що лишилось на екрані (encpolicy.go).
 		auKind = &auKinds{}
 		auQP   = h264.NewQPReader()
+		// C2: QP кадрів за вікно статистики -> enc_stats хабу (nil — вимкнено).
+		encQPW      *qpWindow
+		encStatsSeq uint64
 		// OO_SCREEN_IDLE_IDR: періодичний IDR — у тиші, а не посеред руху
 		// (internal/keyframe). nil — вимкнено, IDR ставить GOP MFT як раніше.
 		kfPol *keyframe.Policy
@@ -1497,6 +1500,10 @@ func main() {
 		tpMu        sync.Mutex // guards tp across reconnects; the single ordered sender goroutine reads it under this lock
 		sendQueue   = make(chan sendJob, 8)
 	)
+	if rcPol.EncTelemetry {
+		encQPW = &qpWindow{}
+		log.Printf("oo-agent: enc telemetry on: CODECAPI %s", s.encoder().CodecAPICaps())
+	}
 	if rcPol.IdleIDR {
 		kfPol = keyframe.New(keyframe.Config{GOPFrames: gopFrames(s.gopSeconds, s.fps)})
 	}
@@ -2179,7 +2186,7 @@ loop:
 		auKind.note(encFrame.PTS, refine.Frame{Refine: refineQP, Motion: !still && refineQP == 0})
 		encStart := time.Now()
 		aus, err := s.encoder().Encode(encFrame)
-		observeAUs(aus, auKind, auQP, refiner, kfPol, time.Now())
+		observeAUs(aus, auKind, auQP, refiner, kfPol, time.Now(), encQPW)
 		if err == nil && !still {
 			encSecEWMA = encEWMA(encSecEWMA, time.Since(encStart))
 		}
@@ -2239,6 +2246,16 @@ loop:
 		}
 
 		if time.Since(lastLog) >= 5*time.Second {
+			if encQPW != nil {
+				encStatsSeq++
+				m := encQPW.encStatsMsg(encStatsSeq, s.encoder().Name(), s.software, s.encoder().CodecAPICaps())
+				tpMu.Lock()
+				cur := tp
+				tpMu.Unlock()
+				if cs, ok := cur.(ctlSender); ok {
+					_ = cs.sendCtl(m)
+				}
+			}
 			log.Printf("oo-agent: sent=%d dropped=%d keepalives=%d refines=%d throttled=%d", sent.Load(), dropped.Load(), keepalives, refines, throttled)
 			dropped.Store(0)
 			lastLog = time.Now()

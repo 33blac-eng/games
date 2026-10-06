@@ -60,5 +60,7 @@ func handleAgentCtl(ns *nodeSession, data []byte, now time.Time) {
 		setAgentUnavailable(ns, m.Reason)
 	case control.TypeContentMode:
 		onContentMode(ns, m.Mode, now)
+	case control.TypeEncStats:
+		onAgentEncStats(ns, m)
 	}
 }

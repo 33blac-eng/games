@@ -101,6 +101,18 @@ OOS_GUID(OOS_AVEncVideoMaxQP,             STATIC_CODECAPI_AVEncVideoMaxQP);
  * відмовив, лишається на старій поведінці, відмова видна в cfg_report. */
 OOS_GUID(OOS_AVEncVideoMinQP,             STATIC_CODECAPI_AVEncVideoMinQP);
 OOS_GUID(OOS_AVEncVideoGradualIntraRefresh, STATIC_CODECAPI_AVEncVideoGradualIntraRefresh);
+/* C2 (WORLD-COMPARISON-2026 §5 п. 2): лише ОПИТУВАННЯ ICodecAPI_IsSupported /
+ * IsModifiable — значення не ставляться. Це виклики через vtable вже
+ * отриманого ICodecAPI, жодного статичного імпорту Win8+: на Win7 MFT просто
+ * відповідає E_NOTIMPL / S_FALSE. */
+OOS_GUID(OOS_AVEncVideoROIEnabled,        STATIC_CODECAPI_AVEncVideoROIEnabled);
+OOS_GUID(OOS_AVEncVideoDirtyRectEnabled,  STATIC_CODECAPI_AVEncVideoDirtyRectEnabled);
+OOS_GUID(OOS_AVEncVideoLTRBufferControl,  STATIC_CODECAPI_AVEncVideoLTRBufferControl);
+OOS_GUID(OOS_AVEncVideoMarkLTRFrame,      STATIC_CODECAPI_AVEncVideoMarkLTRFrame);
+OOS_GUID(OOS_AVEncVideoUseLTRFrame,       STATIC_CODECAPI_AVEncVideoUseLTRFrame);
+OOS_GUID(OOS_AVEncVideoEncodeQP,          STATIC_CODECAPI_AVEncVideoEncodeQP);
+OOS_GUID(OOS_AVEncVideoEncodeFrameTypeQP, STATIC_CODECAPI_AVEncVideoEncodeFrameTypeQP);
+OOS_GUID(OOS_AVEncVideoContentType,       STATIC_CODECAPI_AVEncVideoContentType);
 
 /* IID_ICodecAPI: mingw declares it extern in strmif.h, but icodecapi.h (which
  * would define it) redefines struct CodecAPIEventData and cannot be included
@@ -190,6 +202,7 @@ struct oos_enc {
     int32_t  outq_dropped;
     int32_t  inflight;         /* A-16: frames handed to the MFT, not yet returned */
     char     cfg_report[512];  /* A-14: ICodecAPI knobs the MFT refused */
+    char     caps_report[384]; /* C2: що MFT каже про CODECAPI-властивості (probe_codecapi) */
 
     /* buffer handed to Go by the last poll; freed on release/close */
     uint8_t *held;
@@ -553,6 +566,41 @@ static void configure_codecapi(oos_enc *e)
 }
 
 const char *oos_enc_cfg_report(oos_enc *e) { return (e && e->cfg_report[0]) ? e->cfg_report : ""; }
+
+/* C2: «Ім'я=M» — підтримано й змінюється наживо, «=S» — підтримано, лише
+ * читається, «=-» — не підтримано (або MFT кинув помилку). Імена — ті самі,
+ * що internal/control.EncCapsProps (Go розбирає рядок, internal/control/enccaps.go).
+ * Best effort: будь-яка відмова — просто «-». */
+static void probe_codecapi(oos_enc *e)
+{
+    static const struct { const char *name; const GUID *g; } props[] = {
+        { "ROIEnabled",        &OOS_AVEncVideoROIEnabled },
+        { "DirtyRectEnabled",  &OOS_AVEncVideoDirtyRectEnabled },
+        { "GradualIntraRefresh", &OOS_AVEncVideoGradualIntraRefresh },
+        { "LTRBufferControl",  &OOS_AVEncVideoLTRBufferControl },
+        { "MarkLTRFrame",      &OOS_AVEncVideoMarkLTRFrame },
+        { "UseLTRFrame",       &OOS_AVEncVideoUseLTRFrame },
+        { "MinQP",             &OOS_AVEncVideoMinQP },
+        { "MaxQP",             &OOS_AVEncVideoMaxQP },
+        { "EncodeQP",          &OOS_AVEncVideoEncodeQP },
+        { "EncodeFrameTypeQP", &OOS_AVEncVideoEncodeFrameTypeQP },
+        { "ContentType",       &OOS_AVEncVideoContentType },
+    };
+    size_t n = 0;
+    e->caps_report[0] = 0;
+    for (size_t i = 0; i < sizeof props / sizeof props[0]; i++) {
+        char st = '-';
+        if (e->codec && ICodecAPI_IsSupported(e->codec, props[i].g) == S_OK)
+            st = ICodecAPI_IsModifiable(e->codec, props[i].g) == S_OK ? 'M' : 'S';
+        int w = _snprintf(e->caps_report + n, sizeof e->caps_report - n - 1,
+                          "%s%s=%c", n ? " " : "", props[i].name, st);
+        if (w < 0) break;
+        n += (size_t)w;
+    }
+    e->caps_report[sizeof e->caps_report - 1] = 0;
+}
+
+const char *oos_enc_caps_report(oos_enc *e) { return e ? e->caps_report : ""; }
 
 /* Cache the SPS/PPS the MFT publishes on the negotiated output type. Used to
  * prefix IDR AUs when the MFT does not repeat headers inband (plan §5.2). */
@@ -1278,6 +1326,7 @@ int oos_enc_open(const oos_enc_cfg *cfg, oos_enc **out, char *err, int32_t err_l
     if (SUCCEEDED(IMFTransform_QueryInterface(e->mft, &IID_ICodecAPI,
                                               (void **)&e->codec))) {
         configure_codecapi(e);
+        probe_codecapi(e);
     }
     /* A-18: причина, з якої машина з апаратним енкодером поїхала на софті,
      * мусить бути в лозі — інакше це шукатимуть замірами на живому парку.
