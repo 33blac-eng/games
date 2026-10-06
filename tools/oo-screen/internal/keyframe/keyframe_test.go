@@ -71,3 +71,40 @@ func TestRequestedIDRResets(t *testing.T) {
 		t.Fatal("IDR одразу після запитаного")
 	}
 }
+
+// Q-11: VFR-таймлайн — 3 с тексту на 15 fps, далі keepalive 1 кадр/с.
+// GOP у кадрах (300 = 10 с × 30 fps) за 12 с не набирається ніколи; TimeGOP
+// просить IDR рівно після 10 с від останнього IDR.
+func TestTimeGOPVariableFrameRate(t *testing.T) {
+	t0 := time.Unix(1000, 0)
+	frames := New(Config{GOPFrames: 300})
+	tg := NewTime(10 * time.Second)
+	tg.Coded(t0, true)
+	frames.Coded(true)
+	var at []time.Duration
+	step := func(d time.Duration) {
+		now := t0.Add(d)
+		if frames.Due(now, true) {
+			t.Fatalf("GOP у кадрах спрацював на %v — таймлайн не VFR", d)
+		}
+		if tg.Due(now) {
+			at = append(at, d)
+			tg.Coded(now, true)
+			return
+		}
+		tg.Coded(now, false)
+		frames.Coded(false)
+	}
+	for d := time.Duration(0); d < 3*time.Second; d += time.Second / 15 {
+		step(d)
+	}
+	for d := 3 * time.Second; d <= 12*time.Second; d += time.Second {
+		step(d)
+	}
+	if len(at) != 1 || at[0] < 10*time.Second || at[0] > 11*time.Second {
+		t.Fatalf("TimeGOP: IDR на %v, хочу один у [10 с, 11 с]", at)
+	}
+	if NewTime(0).Due(t0.Add(time.Hour)) {
+		t.Fatal("NewTime(0) мусить бути вимкненим")
+	}
+}

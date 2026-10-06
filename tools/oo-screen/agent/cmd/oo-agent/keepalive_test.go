@@ -326,3 +326,12 @@ func TestNextStillAUReplacedByIDR(t *testing.T) {
 		t.Fatal("рухомий P-кадр змінив кеш")
 	}
 }
+
+// Q-11 типово вимкнено: лише точне "1" вмикає IDR за часом.
+func TestGopTimeEnabled(t *testing.T) {
+	for v, want := range map[string]bool{"": false, "0": false, "true": false, "1": true} {
+		if got := gopTimeEnabled(func(string) string { return v }); got != want {
+			t.Fatalf("OO_SCREEN_GOP_TIME=%q: %v, хочу %v", v, got, want)
+		}
+	}
+}

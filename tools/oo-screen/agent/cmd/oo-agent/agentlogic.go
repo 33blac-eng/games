@@ -374,6 +374,12 @@ func keepStillAU(still, sameFrameEncodedBefore bool, aus []encode.AU) bool {
 	return still && sameFrameEncodedBefore && len(aus) == 1 && !aus[0].Keyframe
 }
 
+// gopTimeEnabled — Q-11: OO_SCREEN_GOP_TIME=1 вмикає IDR за часом
+// (keyframe.TimeGOP, інтервал = -gop-seconds). Типово вимкнено.
+func gopTimeEnabled(getenv func(string) string) bool {
+	return getenv("OO_SCREEN_GOP_TIME") == "1"
+}
+
 // hasKeyframe — чи є серед AU хоч один IDR.
 func hasKeyframe(aus []encode.AU) bool {
 	for i := range aus {

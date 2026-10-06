@@ -1453,6 +1453,10 @@ func main() {
 		// OO_SCREEN_IDLE_IDR: періодичний IDR — у тиші, а не посеред руху
 		// (internal/keyframe). nil — вимкнено, IDR ставить GOP MFT як раніше.
 		kfPol *keyframe.Policy
+		// Q-11 (OO_SCREEN_GOP_TIME=1): IDR кожні -gop-seconds за ЧАСОМ —
+		// GOP у кадрах на VFR (текст 15 fps, keepalive 1 кадр/с) тягнеться
+		// хвилинами. nil — вимкнено.
+		timeGOP *keyframe.TimeGOP
 		// Gap #2: сигнал «текстовий режим» з площі dirty/move rects. Споживач —
 		// стеля FPS (-text-fps, textfps.go): у текстовому режимі кодуємо не
 		// частіше за textModeGap; затриманий кадр дошлемо, щойно щілина
@@ -1499,6 +1503,9 @@ func main() {
 	)
 	if rcPol.IdleIDR {
 		kfPol = keyframe.New(keyframe.Config{GOPFrames: gopFrames(s.gopSeconds, s.fps)})
+	}
+	if gopTimeEnabled(os.Getenv) {
+		timeGOP = keyframe.NewTime(time.Duration(s.gopSeconds) * time.Second)
 	}
 
 	// onContentMode — новий стан автомата Text / Normal / Video. textOn —
@@ -2176,10 +2183,23 @@ loop:
 				lastIDRAt = time.Now()
 			}
 		}
+		// Q-11: IDR за часом — на будь-якому кадрі, лише апаратному MFT (той
+		// самий запобіжник, що й вище). Невдача вимикає політику.
+		if timeGOP != nil && !s.software && refineQP == 0 && timeGOP.Due(time.Now()) {
+			if ierr := s.encoder().ForceIDR(); ierr != nil {
+				log.Printf("oo-agent: time GOP IDR: %v — політику вимкнено, IDR ставить GOP MFT", ierr)
+				timeGOP = nil
+			} else {
+				lastIDRAt = time.Now()
+			}
+		}
 		auKind.note(encFrame.PTS, refine.Frame{Refine: refineQP, Motion: !still && refineQP == 0})
 		encStart := time.Now()
 		aus, err := s.encoder().Encode(encFrame)
 		observeAUs(aus, auKind, auQP, refiner, kfPol, time.Now())
+		if timeGOP != nil {
+			timeGOP.Coded(time.Now(), hasKeyframe(aus))
+		}
 		if err == nil && !still {
 			encSecEWMA = encEWMA(encSecEWMA, time.Since(encStart))
 		}
