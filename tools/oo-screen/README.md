@@ -21,6 +21,8 @@
   (симуляція): [`bench/quality/RESULTS-final.md`](bench/quality/RESULTS-final.md).
 - 4:4:4 / VP9 / тайли — дослідження: [`bench/quality/STAGE3-444.md`](bench/quality/STAGE3-444.md).
 - ПК без GPU: [`bench/SOFTWARE-ENCODER.md`](bench/SOFTWARE-ENCODER.md).
+- Rate control енкодера (крок 4): refine після IDR на нерухомому екрані (типово ввімкнено), opt-in межі QP,
+  IDR у тиші, інтра-оновлення — [`bench/quality/RESULTS-ratecontrol.md`](bench/quality/RESULTS-ratecontrol.md).
 - Безпека: [`SECURITY-AUDIT.md`](SECURITY-AUDIT.md).
 - Викочування хаба й агента: [`deploy/DEPLOY.md`](deploy/DEPLOY.md).
 

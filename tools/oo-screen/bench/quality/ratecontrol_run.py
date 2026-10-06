@@ -117,7 +117,8 @@ def scan(kind, n, corpus):
 
 
 def run_variant(args):
-    name, v, kind, kbps, n, corpus, tool = args
+    name, v, kind, kbps, n, corpus, tool = args[:7]
+    joins_s = args[7] if len(args) > 7 else JOINS_S
     wl = WL.make(kind, WL.Sources(corpus))
     changed = scan(kind, n, corpus)
     td = tempfile.mkdtemp()
@@ -130,7 +131,7 @@ def run_variant(args):
                          stdin=subprocess.PIPE, stdout=subprocess.PIPE)
     a = Agent(v)
     peak = kbps * 1500
-    joins = {int(t * FPS) for t in JOINS_S if t * FPS < n}
+    joins = {int(t * FPS) for t in joins_s if t * FPS < n}
     last_sent, have_pix = -10 ** 9, False
     sizes, types, qps, still_samples = [0] * n, ["-"] * n, [0] * n, []
     samples = list(range(SAMPLE // 2, n, SAMPLE))
@@ -210,6 +211,8 @@ def run_variant(args):
         "still_edge": float(q[st, 2].mean()) if st.any() else float("nan"),
         "still_edge_min": float(q[st, 2].min()) if st.any() else float("nan"),
     }
+    res["samples"] = [(i, bool(x), round(float(r[0]), 2), round(float(r[2]), 4)) for i, x, r in zip(samples, st, q)]
+    res["frames"] = [(i, types[i], qps[i], sizes[i]) for i in range(n) if types[i] != "-" and (types[i] == "I" or not changed[i])]
     os.remove(dump)
     return res
 
@@ -229,10 +232,13 @@ def main():
     ap.add_argument("--variants", default=",".join(VARIANTS))
     ap.add_argument("--jobs", type=int, default=os.cpu_count() or 2)
     ap.add_argument("--json", default="")
+    ap.add_argument("--joins", default=",".join(map(str, JOINS_S)),
+                    help="секунди keyframe_request нових глядачів через кому; порожньо — без них")
     a = ap.parse_args()
     tool = build(tempfile.mkdtemp())
     n = a.seconds * FPS
-    jobs = [(name, VARIANTS[name], k, int(r), n, a.corpus, tool)
+    joins = tuple(float(x) for x in a.joins.split(",") if x)
+    jobs = [(name, VARIANTS[name], k, int(r), n, a.corpus, tool, joins)
             for k in a.kinds.split(",") for r in a.rates.split(",") for name in a.variants.split(",")]
     with ProcessPoolExecutor(a.jobs) as ex:
         res = list(ex.map(run_variant, jobs))
@@ -245,6 +251,7 @@ def main():
     print("| " + " | ".join(cols) + " |")
     print("|" + "---|" * len(cols))
     for r in res:
+        r.pop("samples", None), r.pop("frames", None)
         print("| " + " | ".join(f"{r[c]:.4g}" if isinstance(r[c], float) else str(r[c]) for c in cols) + " |")
 
 

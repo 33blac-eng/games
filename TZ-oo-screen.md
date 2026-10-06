@@ -157,6 +157,11 @@ Chrome через WebRTC не приймає H.264 High 4:4:4, тому потр
 | `OO_AGENT_INPUT_BLOCK_KEYS` | порожньо | за політикою (напр. Win-клавіші) | блок-лист клавіш віддаленого вводу |
 | `OO_SCREEN_AUDIO` | 0 | за потребою | звук ПК (на агенті і хабі) |
 | `OO_SCREEN_INPUT` | 0 | 1 там, де потрібне керування | ввід (на агенті і хабі) |
+| `OO_SCREEN_REFINE_AFTER_IDR` | 1 | 1 | refine (QP 22→18) і після IDR від rate control на нерухомому екрані (новий глядач, PLI, GOP); `0` — як раніше |
+| `OO_SCREEN_REFINE_QP_AWARE` | 0 | 0 (пілот) | пропускати кроки refine, не кращі за найгірший QP на екрані (QP із заголовка слайса) |
+| `OO_SCREEN_IDLE_IDR` | 0 | 0 | періодичний IDR агент ставить сам у тиші; GOP MFT 2× як запобіжник (симуляція — без виграшу) |
+| `OO_SCREEN_QP_MIN` / `OO_SCREEN_QP_MAX` | не задано | `QP_MAX=40` лише для пілоту на ставці ≤ 3 Мбіт/с | межі QP rate control MFT поза refine (читабельність ціною ривка за HRD) |
+| `OO_SCREEN_INTRA_REFRESH` | 0 | 0 (UNVERIFIED) | поступове інтра-оновлення MFT на N кадрів |
 
 ### 9.3 Змінні середовища хаба `hub-webrtc`
 
